@@ -13,6 +13,6 @@ Things that need to be built for this:
 - A tool to write results and a simple mechanism for checking if we are repeating experiments. This can probably be fully deterministic.
 - A tool to call out anomalies and store them in a seperate file, which is user-friendly.
 - Potentially a seperate api call to go over all results, and check for anomalies.
-- A simple SQLite DB to store basic information, and probably also agent trace. So we store anomalies, and experiments, each as seperate tables.
+- A simple SQLite DB to store basic information, and probably also agent trace. So we store `anomalies`, `experiments`, and `runs`, each as seperate tables.
 
 We will probably write this in either python or rust. I haven't messed around w/ Rust that much, so maybe rust, just for kicks.
