@@ -44,11 +44,6 @@ def init_db(conn: sqlite3.Connection) -> None:
   conn.executescript(schema_path.read_text(encoding="utf-8"))
 
 
-def utc_now() -> str:
-  """Return a compact UTC timestamp for persisted rows."""
-  return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def encode_embedding(embedding: Sequence[float]) -> str:
   """Store embeddings as deterministic JSON until a vector extension is needed."""
   values = [float(value) for value in embedding]
@@ -77,6 +72,7 @@ def create_agent(
   attempt_cap: int | None = None,
 ) -> int:
   """Allocate the next deterministic agent id and save its cap settings."""
+  created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
   with conn:
     row = conn.execute(
       """
@@ -84,7 +80,7 @@ def create_agent(
       SELECT COALESCE(MAX(agent_id) + 1, 0), ?, ?, ?, ?, ? FROM agents
       RETURNING agent_id
       """,
-      (kind, goal, experiment_cap, attempt_cap, utc_now()),
+      (kind, goal, experiment_cap, attempt_cap, created_at),
     ).fetchone()
   return int(row["agent_id"])
 
@@ -121,11 +117,12 @@ def log_experiment(
   placeholders = ", ".join("?" for _ in METRIC_COLUMNS)
   values = [metrics.get(column) for column in METRIC_COLUMNS]
   intent_embedding = embed_intent(intent_key)
+  finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
   with conn:
     cursor = conn.execute(
       "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL",
-      (utc_now(), agent_id, run_id),
+      (finished_at, agent_id, run_id),
     )
     if cursor.rowcount != 1:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
@@ -168,13 +165,14 @@ def log_anomaly(
   summary: str,
 ) -> int:
   """Save a human-readable anomaly tied to a benchmark run."""
+  date = datetime.now(timezone.utc).isoformat(timespec="seconds")
   with conn:
     cursor = conn.execute(
       """
       INSERT INTO anomalies(agent_id, run_id, date, summary)
       VALUES (?, ?, ?, ?)
       """,
-      (agent_id, run_id, utc_now(), summary),
+      (agent_id, run_id, date, summary),
     )
   return int(cursor.lastrowid)
 
@@ -190,6 +188,7 @@ def upsert_doc_chunk(
   url: str = "",
 ) -> int:
   """Insert or update one SGLang docs chunk and its embedding."""
+  updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
   with conn:
     row = conn.execute(
       """
@@ -203,6 +202,6 @@ def upsert_doc_chunk(
         updated_at = excluded.updated_at
       RETURNING doc_chunk_id
       """,
-      (source, chunk_id, title, url, text, encode_embedding(embedding), utc_now()),
+      (source, chunk_id, title, url, text, encode_embedding(embedding), updated_at),
     ).fetchone()
   return int(row["doc_chunk_id"])
