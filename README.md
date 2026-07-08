@@ -1,7 +1,9 @@
 <h1 align="center">perferox</h1>
 
 <p align="center">
-  <video src="perferox/perferox-tui-demo.mp4" autoplay muted loop playsinline controls width="900"></video>
+  <a href="perferox/perferox-tui-demo.mp4">
+    <img src="perferox/perferox-tui-demo.gif" alt="Perferox TUI demo" width="900">
+  </a>
 </p>
 
 This project is meant to be something on the order of a fuzzer, except for inference engines and ML sys perf stuff. The initial target is SGLang.
