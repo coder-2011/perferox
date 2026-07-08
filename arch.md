@@ -18,6 +18,7 @@ For `experiments`, the important things are:
 
 - agent #
 - run #
+- gpu
 - date
 - intent_key
 - intent_embedding
@@ -44,17 +45,16 @@ For `runs`, we probably only need:
 
 - agent #
 - run #
+- gpu
 - started_at
 - finished_at
-- status
 - trace_path
-- stdout_path
-- stderr_path
 
 For `anomalies`, we need:
 
 - agent #
 - run #
+- gpu
 - date
 - summary
 - command
