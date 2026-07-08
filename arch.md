@@ -63,10 +63,6 @@ For `anomalies`, we need:
 
 The anomaly summary should be human readable. ex. "GLM-5.2 generated garbled output after cache hits with MTP enabled, when we use DSpark w/ batch=1 and triton backend".
 
-We should not store both command and normalized_command. Just store one canonical command string. If the agent wants to keep the messy original thing it wrote, that can live in the trace. The DB should hold the stable command we actually ran.
-
-I think we do still want an id-ish thing, but it does not have to be a fake global id. Since run no is per agent, `(agent_no, run_no)` can be the natural key for now. SQLite has rowids anyway. If this gets annoying later, adding explicit ids is easy.
-
 The experiment repeat check should have two layers:
 
 - exact_hash, which catches the same exact experiment spec
