@@ -1,0 +1,19 @@
+[project]
+name = "perferox"
+version = "0.1.0"
+description = "Agentic benchmark explorer for SGLang."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "langchain",
+  "langgraph",
+  "langchain-openai",
+  "textual",
+  "paramiko",
+  "pydantic",
+  "numpy",
+  "sentence-transformers>=5.6.0",
+]
+
+[tool.uv]
+package = false
