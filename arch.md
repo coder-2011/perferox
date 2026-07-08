@@ -1,4 +1,4 @@
-This is the rough architecture for the first version.
+This is the rough architecture for the first version (doc is primarily hand-written).
 
 The basic shape is probably:
 
