@@ -16,3 +16,5 @@ Things that need to be built for this:
 - A simple SQLite DB to store basic information, and probably also agent trace. So we store `anomalies`, `experiments`, and `runs`, each as seperate tables.
 
 We will probably write this in either python or rust. I haven't messed around w/ Rust that much, so maybe rust, just for kicks.
+
+Goal is < 5 kLOC
