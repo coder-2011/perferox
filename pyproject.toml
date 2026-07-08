@@ -17,3 +17,12 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+preview = true
+target-version = "py311"
+line-length = 150
+indent-width = 2
+
+[tool.ruff.format]
+exclude = ["*"]
