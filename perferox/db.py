@@ -12,15 +12,6 @@ from typing import Iterator, Mapping, Sequence
 
 
 AGENT_RUNNING = "running"
-AGENT_STOPPING = "stopping"
-AGENT_DONE = "done"
-AGENT_FAILED = "failed"
-AGENT_STATUSES = frozenset({
-  AGENT_RUNNING,
-  AGENT_STOPPING,
-  AGENT_DONE,
-  AGENT_FAILED,
-})
 
 RUN_STARTED = "started"
 RUN_FINISHED = "finished"
@@ -214,12 +205,6 @@ def create_agent(
   attempt_cap: int | None = None,
 ) -> int:
   """Allocate the next deterministic agent id and save its cap settings."""
-  if experiment_cap < 0:
-    raise ValueError("experiment_cap must be >= 0")
-  if attempt_cap is not None and attempt_cap < 0:
-    raise ValueError("attempt_cap must be >= 0")
-
-  now = utc_now()
   with write_tx(conn):
     row = conn.execute(
       "SELECT COALESCE(MAX(agent_id) + 1, 0) AS agent_id FROM agents"
@@ -230,41 +215,29 @@ def create_agent(
       INSERT INTO agents(agent_id, kind, goal, experiment_cap, attempt_cap, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       """,
-      (agent_id, kind, goal, experiment_cap, attempt_cap, AGENT_RUNNING, now),
+      (agent_id, kind, goal, experiment_cap, attempt_cap, AGENT_RUNNING, utc_now()),
     )
   return agent_id
 
 
 def request_stop(conn: sqlite3.Connection, agent_id: int | None = None) -> int:
   """Set stop_requested so future run reservations are refused."""
-  if agent_id is None:
-    sql = """
-      UPDATE agents
-      SET stop_requested = 1,
-        status = CASE WHEN status = 'running' THEN 'stopping' ELSE status END
-      WHERE status IN ('running', 'stopping')
-    """
-    params: tuple[object, ...] = ()
-  else:
-    sql = """
-      UPDATE agents
-      SET stop_requested = 1,
-        status = CASE WHEN status = 'running' THEN 'stopping' ELSE status END
-      WHERE agent_id = ? AND status IN ('running', 'stopping')
-    """
-    params = (agent_id,)
-
   with write_tx(conn):
-    cursor = conn.execute(sql, params)
+    cursor = conn.execute(
+      """
+      UPDATE agents
+      SET stop_requested = 1,
+        status = CASE WHEN status = 'running' THEN 'stopping' ELSE status END
+      WHERE (? IS NULL OR agent_id = ?) AND status IN ('running', 'stopping')
+      """,
+      (agent_id, agent_id),
+    )
   return cursor.rowcount
 
 
 def set_agent_status(conn: sqlite3.Connection, agent_id: int, status: str) -> None:
   """Update an agent lifecycle status."""
-  if status not in AGENT_STATUSES:
-    raise ValueError(f"unknown agent status: {status}")
-
-  finished_at = utc_now() if status in {AGENT_DONE, AGENT_FAILED} else None
+  finished_at = utc_now() if status in {"done", "failed"} else None
   stop_requested = 0 if status == AGENT_RUNNING else 1
   with write_tx(conn):
     cursor = conn.execute(
@@ -289,7 +262,10 @@ def reserve_run(
   trace_ref: str | None = None,
 ) -> RunReservation:
   """Reserve the next run id if stop state and caps allow a benchmark to start."""
-  now = utc_now()
+  def blocked(reason: str) -> RunReservation:
+    """Return a refusal result with the current cap counters."""
+    return RunReservation(False, agent_id, None, reason, successes, attempts, experiment_cap, attempt_cap)
+
   with write_tx(conn):
     agent = conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
     if agent is None:
@@ -300,26 +276,15 @@ def reserve_run(
     attempt_cap = agent["attempt_cap"]
 
     if agent["status"] != AGENT_RUNNING:
-      return RunReservation(
-        False, agent_id, None, f"agent is {agent['status']}", successes, attempts, experiment_cap, attempt_cap
-      )
+      return blocked(f"agent is {agent['status']}")
     if int(agent["stop_requested"]):
-      return RunReservation(
-        False, agent_id, None, "stop requested", successes, attempts, experiment_cap, attempt_cap
-      )
-    existing = find_run_by_hash(conn, exact_hash)
-    if existing is not None:
-      return RunReservation(
-        False, agent_id, None, "exact repeat", successes, attempts, experiment_cap, attempt_cap
-      )
+      return blocked("stop requested")
+    if find_run_by_hash(conn, exact_hash) is not None:
+      return blocked("exact repeat")
     if successes + in_flight >= experiment_cap:
-      return RunReservation(
-        False, agent_id, None, "success cap reached", successes, attempts, experiment_cap, attempt_cap
-      )
+      return blocked("success cap reached")
     if attempt_cap is not None and attempts >= int(attempt_cap):
-      return RunReservation(
-        False, agent_id, None, "attempt cap reached", successes, attempts, experiment_cap, int(attempt_cap)
-      )
+      return blocked("attempt cap reached")
 
     # Count and insert under the same writer lock so two workers cannot share a run id.
     row = conn.execute(
@@ -332,7 +297,7 @@ def reserve_run(
       INSERT INTO runs(agent_id, run_id, gpu, started_at, status, trace_ref, command, exact_hash)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       """,
-      (agent_id, run_id, gpu, now, RUN_STARTED, trace_ref, command, exact_hash),
+      (agent_id, run_id, gpu, utc_now(), RUN_STARTED, trace_ref, command, exact_hash),
     )
   return RunReservation(
     True, agent_id, run_id, "started", successes, attempts + 1, experiment_cap, attempt_cap
@@ -352,7 +317,6 @@ def finish_run(
   if status not in {RUN_FAILED, RUN_STOPPED}:
     raise ValueError(f"finish_run cannot mark successful runs: {status}")
 
-  now = utc_now()
   with write_tx(conn):
     cursor = conn.execute(
       """
@@ -360,7 +324,7 @@ def finish_run(
       SET status = ?, finished_at = ?, error = ?, trace_ref = COALESCE(?, trace_ref)
       WHERE agent_id = ? AND run_id = ? AND status = 'started'
       """,
-      (status, now, error, trace_ref, agent_id, run_id),
+      (status, utc_now(), error, trace_ref, agent_id, run_id),
     )
   if cursor.rowcount != 1:
     raise ValueError(f"run is not started: agent_id={agent_id} run_id={run_id}")
@@ -432,7 +396,7 @@ def find_experiments_by_intent_key(
   limit: int = 20,
 ) -> list[sqlite3.Row]:
   """Return recent experiments with the same human-readable intent key."""
-  rows = conn.execute(
+  return list(conn.execute(
     """
     SELECT experiments.*, runs.exact_hash, runs.gpu, runs.command, runs.finished_at
     FROM experiments
@@ -442,8 +406,7 @@ def find_experiments_by_intent_key(
     LIMIT ?
     """,
     (intent_key, limit),
-  ).fetchall()
-  return list(rows)
+  ))
 
 
 def log_anomaly(
@@ -452,7 +415,6 @@ def log_anomaly(
   agent_id: int,
   run_id: int,
   summary: str,
-  date: str | None = None,
 ) -> int:
   """Save a human-readable anomaly tied to a benchmark run."""
   cursor = conn.execute(
@@ -460,7 +422,7 @@ def log_anomaly(
     INSERT INTO anomalies(agent_id, run_id, date, summary)
     VALUES (?, ?, ?, ?)
     """,
-    (agent_id, run_id, date or utc_now(), summary),
+    (agent_id, run_id, utc_now(), summary),
   )
   return int(cursor.lastrowid)
 
