@@ -1,3 +1,9 @@
+<h1 align="center">perferox</h1>
+
+<p align="center">
+  <video src="perferox/perferox-tui-demo.mp4" autoplay muted loop playsinline controls width="900"></video>
+</p>
+
 This project is meant to be something on the order of a fuzzer, except for inference engines and ML sys perf stuff. The initial target is SGLang.
 
 The goal is to run a custom, minimal agent in a loop, to make it stress test the extents of a program. This will be done by making the agent spin up different (w/ often odd setups) cloud GPUs and clusters, and trying to see how perf and parity regressed across git commits, how it performs on odd or ill-maintained settings, how it performs on AMD chips, the difference between backends and so forth. Similar to how engineers woud write programs of all sorts, or run vLLM/SGlang configs of all different types, we emulate that.
