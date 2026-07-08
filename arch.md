@@ -51,8 +51,6 @@ For `runs`, we probably only need:
 - stdout_path
 - stderr_path
 
-The trace should be a JSONL file, not a giant blob in SQLite. The TUI can render the trace live, but the file should be readable after the fact. This matters a lot because these runs will be weird and the agent will do a lot of small things. If we cannot read the trace cleanly, the project will be annoying to debug.
-
 For `anomalies`, we need:
 
 - agent #
