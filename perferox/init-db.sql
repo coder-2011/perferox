@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS anomalies (
   FOREIGN KEY(agent_id, run_id) REFERENCES runs(agent_id, run_id)
 );
 
+CREATE TABLE IF NOT EXISTS explorer_state_lines (
+  line_id INTEGER PRIMARY KEY,
+  agent_id INTEGER,
+  created_at TEXT NOT NULL,
+  line TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS doc_chunks (
   doc_chunk_id INTEGER PRIMARY KEY,
   source TEXT NOT NULL,
@@ -60,4 +67,5 @@ CREATE TABLE IF NOT EXISTS doc_chunks (
 CREATE INDEX IF NOT EXISTS idx_runs_exact_hash ON runs(exact_hash);
 CREATE INDEX IF NOT EXISTS idx_experiments_intent_key ON experiments(intent_key);
 CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
+CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
 CREATE INDEX IF NOT EXISTS idx_doc_chunks_source ON doc_chunks(source);

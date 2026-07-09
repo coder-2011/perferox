@@ -36,6 +36,7 @@ class SubagentState(TypedDict, total=False):
   summary: str
 
 def trace_jsonable(value: Any) -> Any:
+  """Convert trace payload leftovers into JSON-safe values."""
   if isinstance(value, Path):
     return str(value)
   if hasattr(value, "model_dump"):
@@ -95,53 +96,14 @@ def _message_text(message: BaseMessage) -> str:
   return repr(content)
 
 
-def _route_after_basic_setup(state: SubagentState) -> str:
-  """Choose whether setup needs tools, intervention, or benchmarking."""
-  last_message = state["messages"][-1]
-  if getattr(last_message, "tool_calls", None):
-    return "basic_setup_tools"
-  if "setup_failed" in _message_text(last_message).lower():
-    return "setup_intervention"
-  return "benchmark_loop"
-
-
-def _route_after_create_pod(state: SubagentState) -> str:
-  last_message = state["messages"][-1]
-  if getattr(last_message, "tool_calls", None):
-    return "create_pod_tools"
-  return "basic_setup"
-
-
-def _route_after_setup_intervention(state: SubagentState) -> str:
-  """Route setup intervention back to setup or out to wrap-up."""
-  last_message = state["messages"][-1]
-  if getattr(last_message, "tool_calls", None):
-    return "setup_intervention_tools"
-  if "setup_failed" in _message_text(last_message).lower():
-    return "wrap_up"
-  return "basic_setup"
-
-
-def _route_after_benchmark(state: SubagentState) -> str:
-  last_message = state["messages"][-1]
-  if getattr(last_message, "tool_calls", None):
-    return "benchmark_tools"
-  return "wrap_up"
-
-
-def _logged_successes(state: SubagentState) -> int:
-  """Count successful experiment-log tool outputs for cap routing."""
+def _started_attempts(state: SubagentState) -> int:
+  """Count benchmark attempts that actually started."""
   return sum(
     getattr(message, "type", "") == "tool"
-    and getattr(message, "name", "") == "log_experiment"
-    and str(getattr(message, "content", "")).startswith("logged experiment")
+    and getattr(message, "name", "") == "sglang_bench_serving"
+    and str(getattr(message, "content", "")).startswith("run_id=")
     for message in state.get("messages", [])
   )
-
-
-def _wrap_up(state: SubagentState) -> dict[str, str]:
-  summary = _message_text(state["messages"][-1])
-  return {"summary": summary}
 
 
 def build_subagent_graph(
@@ -149,7 +111,7 @@ def build_subagent_graph(
   agent_id: int,
   session_registry: SessionRegistry,
   db_path: str | Path,
-  experiment_cap: int = 1,
+  attempt_cap: int = 1,
   trace_ref: str = "",
   create_pod_tools: Sequence[BaseTool] = (local_terminal,),
   setup_tools: Sequence[BaseTool] = (),
@@ -163,26 +125,55 @@ def build_subagent_graph(
   benchmark_tool_list = list(benchmark_tools)
   benchmark_prompt = (
     BENCHMARK_SYSTEM_PROMPT
-    + f"\nHard cap: log at most {experiment_cap} successful benchmark experiment(s), then summarize."
+    + f"\nHard cap: start at most {attempt_cap} benchmark attempt(s), then summarize."
   )
   remote_tool = remote_terminal(session_registry, session_id)
   create_tool_list.append(connect_remote_session(session_registry, session_id))
   setup_tool_list.append(remote_tool)
   benchmark_tool_list.append(remote_tool)
-  benchmark_tool_list.append(sglang_bench_serving(session_registry, session_id, db_path, agent_id, experiment_cap, trace_ref))
+  benchmark_tool_list.append(sglang_bench_serving(session_registry, session_id, db_path, agent_id, trace_ref, attempt_cap))
   benchmark_tool_list.append(log_experiment_tool(db_path, agent_id))
   benchmark_tool_list.append(log_anomaly_tool(db_path, agent_id))
 
+  def route_after_create_pod(state: SubagentState) -> str:
+    """Route pod creation through tools until SSH details are ready."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+      return "create_pod_tools"
+    return "basic_setup"
+
   def route_after_basic_setup(state: SubagentState) -> str:
-    route = _route_after_basic_setup(state)
-    if route == "benchmark_loop" and _logged_successes(state) >= experiment_cap:
+    """Choose setup tools, intervention, benchmark, or wrap-up."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+      return "basic_setup_tools"
+    if "setup_failed" in _message_text(last_message).lower():
+      return "setup_intervention"
+    if _started_attempts(state) >= attempt_cap:
       return "wrap_up"
-    return route
+    return "benchmark_loop"
+
+  def route_after_setup_intervention(state: SubagentState) -> str:
+    """Route setup intervention back to setup or out to wrap-up."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+      return "setup_intervention_tools"
+    if "setup_failed" in _message_text(last_message).lower():
+      return "wrap_up"
+    return "basic_setup"
 
   def route_after_benchmark(state: SubagentState) -> str:
-    if _logged_successes(state) >= experiment_cap:
+    """Keep benchmarking until the started-attempt cap is reached."""
+    if _started_attempts(state) >= attempt_cap:
       return "wrap_up"
-    return _route_after_benchmark(state)
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+      return "benchmark_tools"
+    return "wrap_up"
+
+  def wrap_up(state: SubagentState) -> dict[str, str]:
+    """Save the final worker summary into graph state."""
+    return {"summary": _message_text(state["messages"][-1])}
 
   for name, tool_node, tools, prompt, description in (
     ("create_pod", "create_pod_tools", create_tool_list, CREATE_POD_SYSTEM_PROMPT, "Create one temporary pod and wait for SSH details."),
@@ -194,14 +185,14 @@ def build_subagent_graph(
     graph.add_node(tool_node, ToolNode(tools, name=tool_node), metadata={"description": f"Run tools requested by {name}."})
   graph.add_node(
     "wrap_up",
-    _wrap_up,
+    wrap_up,
     metadata={"description": "Save the final worker summary into graph state."},
   )
 
   graph.add_edge(START, "create_pod")
   graph.add_conditional_edges(
     "create_pod",
-    _route_after_create_pod,
+    route_after_create_pod,
     {
       "create_pod_tools": "create_pod_tools",
       "basic_setup": "basic_setup",
@@ -221,7 +212,7 @@ def build_subagent_graph(
   graph.add_edge("basic_setup_tools", "basic_setup")
   graph.add_conditional_edges(
     "setup_intervention",
-    _route_after_setup_intervention,
+    route_after_setup_intervention,
     {
       "setup_intervention_tools": "setup_intervention_tools",
       "basic_setup": "basic_setup",

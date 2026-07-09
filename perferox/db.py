@@ -57,25 +57,46 @@ def embed_intent(intent_key: str) -> list[float]:
   return list(map(float, _EMBEDDER.encode(intent_key, normalize_embeddings=True)))
 
 
+def read_explorer_state(conn: sqlite3.Connection) -> list[str]:
+  """Return compact ExplorerState lines in insertion order."""
+  rows = conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id").fetchall()
+  return [str(row["line"]) for row in rows]
+
+
+def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, line: str) -> int:
+  """Append one compact ExplorerState line."""
+  created_at = datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    cursor = conn.execute(
+      """
+      INSERT INTO explorer_state_lines(agent_id, created_at, line)
+      VALUES (?, ?, ?)
+      """,
+      (agent_id, created_at, line),
+    )
+  return int(cursor.lastrowid)
+
+
 def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
   agent_id: int,
   command: str,
-  experiment_cap: int,
   trace_ref: str = "",
+  attempt_cap: int | None = None,
 ) -> int:
   """Assign the next run id and insert the started benchmark row."""
   exact_hash = hashlib.sha256(command.encode("utf-8")).hexdigest()
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     conn.execute("BEGIN IMMEDIATE")
-    started_runs = conn.execute(
-      "SELECT COUNT(*) FROM runs WHERE agent_id = ?",
-      (agent_id,),
-    ).fetchone()[0]
-    if started_runs >= experiment_cap:
-      raise ValueError(f"experiment cap reached ({started_runs}/{experiment_cap}); wrap up")
+    if attempt_cap is not None:
+      attempts = conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE agent_id = ?",
+        (agent_id,),
+      ).fetchone()[0]
+      if attempts >= attempt_cap:
+        raise ValueError(f"attempt cap reached ({attempts}/{attempt_cap}); wrap up")
     row = conn.execute(
       "SELECT COALESCE(MAX(run_id) + 1, 0) AS run_id FROM runs WHERE agent_id = ?",
       (agent_id,),
@@ -97,7 +118,7 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
   with conn:
     conn.execute(
       "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ?",
-      (finished_at, agent_id, run_id, error[:2000]),
+      (finished_at, error[:2000], agent_id, run_id),
     )
 
 
@@ -148,28 +169,6 @@ def log_experiment(
       (agent_id, run_id, intent_key, encode_embedding(intent_embedding), *values),
     )
   return run_id
-
-
-def find_similar_experiments(
-  conn: sqlite3.Connection,
-  intent_key: str,
-  limit: int = 20,
-) -> list[tuple[float, sqlite3.Row]]:
-  """Return experiments ranked by embedding similarity to an intent key."""
-  query_embedding = embed_intent(intent_key)
-  rows = conn.execute(
-    """
-    SELECT experiments.*, runs.exact_hash, runs.gpu, runs.command, runs.finished_at
-    FROM experiments
-    JOIN runs USING(agent_id, run_id)
-    """
-  ).fetchall()
-  scored = [
-    (sum(a * b for a, b in zip(query_embedding, json.loads(row["intent_embedding"]))), row)
-    for row in rows
-  ]
-  scored.sort(key=lambda item: item[0], reverse=True)
-  return scored[:limit]
 
 
 def log_anomaly(
