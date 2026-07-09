@@ -106,7 +106,7 @@ def _collect_update(state: dict, event: object) -> dict:
       continue
     for key, value in update.items():
       if key == "messages":
-        state[key] = [*state.get(key, []), *value]
+        state.setdefault(key, []).extend(value)
       else:
         state[key] = value
   return state
@@ -131,14 +131,14 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
           lines.append(row["row_json"])
         return "\n".join(lines)
       tmux = shutil.which("tmux")
-      active_query = "SELECT * FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
-      for row in conn.execute(active_query).fetchall():
+      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
+      rows = conn.execute(active_query).fetchall()
+      for row in rows:
         alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
         if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
           line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
           db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
           return f"Tmux session update:\n{line}"
-      rows = conn.execute(active_query).fetchall()
       if main_row is not None and main_row["status"] == "ending":
         if not rows:
           return None

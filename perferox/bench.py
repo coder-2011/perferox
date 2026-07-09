@@ -185,7 +185,7 @@ def bench_serving_argv(args: BenchServingArgs) -> list[str]:
     argv.append(f"--{name.replace('_', '-')}")
     if value is True:
       continue
-    argv.extend(str(item) for item in (value if isinstance(value, list) else [value]))
+    argv.extend(map(str, value if isinstance(value, list) else (value,)))
   return argv
 
 
@@ -193,23 +193,23 @@ def parse_bench_serving_metrics(output: str, expected_requests: int | None = Non
   """Extract Perferox experiment metrics from SGLang benchmark output."""
   metrics = {}
   for raw_line in output.splitlines():
-    line = raw_line.strip()
-    if ":" not in line:
+    label, separator, raw_value = raw_line.partition(":")
+    if not separator:
       continue
-    label, raw_value = line.split(":", 1)
     label = label.strip()
-    parts = raw_value.strip().split()
-    if not parts:
+    metric_name = _CONSOLE_METRIC_LABELS.get(label)
+    if metric_name is None and (label != "Successful requests" or not expected_requests):
       continue
+    raw_value = raw_value.strip()
+    if not raw_value:
+      continue
+    raw_number = raw_value.split(maxsplit=1)[0].rstrip("%")
     try:
-      value = float(parts[0].rstrip("%"))
+      value = float(raw_number)
     except ValueError:
       continue
-    if label == "Successful requests" and expected_requests:
-      metrics["error_rate"] = max(expected_requests - value, 0.0) / expected_requests
-      continue
-    metric_name = _CONSOLE_METRIC_LABELS.get(label)
     if metric_name is None:
+      metrics["error_rate"] = max(expected_requests - value, 0.0) / expected_requests
       continue
     metrics[metric_name] = value / 100.0 if metric_name == "cache_hit_rate" else value
   return metrics

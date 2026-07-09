@@ -6,6 +6,7 @@ import shlex
 import signal
 import subprocess
 from contextlib import closing
+from heapq import nsmallest
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ SKIP_SEARCH_DIRS = {".git", ".ruff_cache", ".venv", "__pycache__"}
 def search_files_tool(cwd: str | Path) -> BaseTool:
   """Create a fuzzy repository path search tool."""
   root = Path(cwd).resolve()
+  root_path = os.fspath(root)
 
   @tool("search_files", description="Fuzzy-search repository file paths by name or path, not file contents.")
   def search_files(query: str, path: str = ".", limit: int = MAX_SEARCH_RESULTS) -> str:
@@ -38,15 +40,20 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
       search_root.relative_to(root)
     except ValueError:
       return f"path escapes repository root: {path}"
-    choices = {}
-    paths = [(search_root.parent, [], [search_root.name])] if search_root.is_file() else os.walk(search_root)
+    matches = []
+    paths = [(os.fspath(search_root.parent), [], [search_root.name])] if search_root.is_file() else os.walk(os.fspath(search_root))
     for dirpath, dirnames, filenames in paths:
       dirnames[:] = [name for name in dirnames if name not in SKIP_SEARCH_DIRS]
       for filename in filenames:
-        rel_path = (Path(dirpath) / filename).relative_to(root).as_posix()
+        rel_path = os.path.relpath(os.path.join(dirpath, filename), root_path)
+        if os.sep != "/":
+          rel_path = rel_path.replace(os.sep, "/")
         path_key = "".join(ch for ch in rel_path.casefold() if ch.isalnum())
-        if query_key in path_key:
-          choices[rel_path] = 1000 - path_key.index(query_key)
+        index = path_key.find(query_key)
+        if index >= 0:
+          matches.append((rel_path, 1000 - index))
+          continue
+        if len(query_key) > len(path_key):
           continue
         last = -1
         score = 0
@@ -58,9 +65,9 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
           score += 15 if index == last + 1 else 10
           last = index
         if score:
-          choices[rel_path] = score
-    matches = sorted(choices.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
-    return "\n".join(f"score={score} {rel_path}" for rel_path, score in matches[:limit]) or "no matches"
+          matches.append((rel_path, score))
+    matches = nsmallest(limit, matches, key=lambda item: (-item[1], len(item[0]), item[0]))
+    return "\n".join(f"score={score} {rel_path}" for rel_path, score in matches) or "no matches"
 
   return search_files
 
@@ -208,7 +215,7 @@ def _run_remote(session: RemoteSession, command: str, timeout_s: float | None) -
 
 def _format_result(exit_status: int | None, stdout: str, stderr: str) -> str:
   """Format command output for a tool message."""
-  output = "\n".join(part for part in (stdout, stderr) if part)
+  output = f"{stdout}\n{stderr}" if stdout and stderr else stdout or stderr
   if len(output) > MAX_OUTPUT_CHARS:
     keep = MAX_OUTPUT_CHARS // 2
     skipped = len(output) - MAX_OUTPUT_CHARS

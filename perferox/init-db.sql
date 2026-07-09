@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS doc_chunks (
   UNIQUE(source, chunk_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_runs_exact_hash ON runs(exact_hash);
 CREATE INDEX IF NOT EXISTS idx_experiments_intent_key ON experiments(intent_key);
 CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
 CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
