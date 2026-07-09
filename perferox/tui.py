@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import ClassVar
 
 # Textual reads color env vars at import time; keep the HTML Gruvbox hexes intact.
@@ -14,6 +15,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.events import Key
 from textual.widgets import Button, Input, Static
+
+from perferox.auth import chatgpt_auth_ready, login_chatgpt_oauth
 
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -162,6 +165,32 @@ class PerferoxTUI(App[None]):
     width: 100%;
     background: #1d2021;
     layers: base overlay;
+  }
+
+  #login-screen {
+    height: 1fr;
+    width: 100%;
+    align: center middle;
+    background: #1d2021;
+  }
+
+  #login-box {
+    width: 44;
+    height: 8;
+    align: center middle;
+  }
+
+  Button#login {
+    width: 36;
+    height: 5;
+    min-width: 36;
+    content-align: center middle;
+  }
+
+  #login-status {
+    height: 2;
+    color: #7c6f64;
+    content-align: center middle;
   }
 
   #body {
@@ -422,11 +451,14 @@ class PerferoxTUI(App[None]):
     super().__init__()
     self.anomalies = {anomaly["aid"]: anomaly for anomaly in ANOMALIES}
     self.selected_anomaly = "ANM-004"
+    self.logged_in = chatgpt_auth_ready()
+    self.login_thread: threading.Thread | None = None
     self.spin = 0
 
   def compose(self) -> ComposeResult:
     """Build the same high-level regions as the HTML mock."""
     with Vertical(id="root"):
+      yield self._login_screen()
       with Horizontal(id="body"):
         yield self._subagents()
         yield self._main()
@@ -436,13 +468,16 @@ class PerferoxTUI(App[None]):
 
   def on_mount(self) -> None:
     """Populate the selected anomaly after child widgets exist."""
+    self._sync_auth_gate()
     self._sync_anomaly_detail()
     self.set_interval(0.12, self._animate_subagents)
 
   def on_button_pressed(self, event: Button.Pressed) -> None:
     """Handle prototype buttons without mutating real benchmark state."""
     button_id = event.button.id
-    if button_id == "close-detail":
+    if button_id == "login":
+      self._start_login()
+    elif button_id == "close-detail":
       self.action_close_detail()
     elif button_id == "end":
       self.query_one("#end-confirm", Vertical).display = True
@@ -473,6 +508,40 @@ class PerferoxTUI(App[None]):
     self.selected_anomaly = "" if self.selected_anomaly == anomaly_id else anomaly_id
     self._sync_anomaly_detail()
 
+  def _sync_auth_gate(self) -> None:
+    """Show only the login screen until ChatGPT OAuth is ready."""
+    self.query_one("#login-screen", Vertical).display = not self.logged_in
+    self.query_one("#body", Horizontal).display = self.logged_in
+    self.query_one("#footer", Static).display = self.logged_in
+
+  def _start_login(self) -> None:
+    """Start the blocking OAuth browser flow outside the UI thread."""
+    if self.login_thread and self.login_thread.is_alive():
+      return
+    self.query_one("#login", Button).disabled = True
+    self.query_one("#login-status", Static).update("opening browser")
+    self.login_thread = threading.Thread(target=self._login_worker, daemon=True)
+    self.login_thread.start()
+
+  def _login_worker(self) -> None:
+    """Run ChatGPT OAuth and report the result back to Textual."""
+    try:
+      login_chatgpt_oauth()
+    except Exception as exc:
+      message = f"{type(exc).__name__}: {exc}"
+      self.call_from_thread(self._finish_login, False, message)
+      return
+    self.call_from_thread(self._finish_login, True, "")
+
+  def _finish_login(self, logged_in: bool, error: str) -> None:
+    """Apply the completed login result to visible UI state."""
+    self.logged_in = logged_in and chatgpt_auth_ready()
+    if self.logged_in:
+      self._sync_auth_gate()
+      return
+    self.query_one("#login", Button).disabled = False
+    self.query_one("#login-status", Static).update(escape(error) if error else "login failed")
+
   def _animate_subagents(self) -> None:
     """Rotate subagent spinners so running cards visibly update."""
     self.spin += 1
@@ -502,6 +571,9 @@ class PerferoxTUI(App[None]):
 
   def _append_prompt(self) -> None:
     """Append one local user steer and one agent acknowledgement to the trace."""
+    if not self.logged_in:
+      return
+
     prompt = self.query_one("#prompt", Input)
     text = prompt.value.strip()
     if not text:
@@ -519,6 +591,17 @@ class PerferoxTUI(App[None]):
       Static("SUBAGENTS", classes="section-title"),
       ScrollableContainer(*cards, classes="scroll-pane"),
       id="subagents",
+    )
+
+  def _login_screen(self) -> Vertical:
+    """Render the full-screen ChatGPT OAuth login gate."""
+    return Vertical(
+      Vertical(
+        Button("LOGIN", id="login"),
+        Static("", id="login-status"),
+        id="login-box",
+      ),
+      id="login-screen",
     )
 
   def _main(self) -> Vertical:
