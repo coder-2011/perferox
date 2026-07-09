@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
@@ -16,6 +17,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
+from perferox import db
 from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, CREATE_POD_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.tools import (
@@ -168,9 +170,30 @@ def build_subagent_graph(
       return "benchmark_tools"
     return "wrap_up"
 
-  def wrap_up(state: SubagentState) -> dict[str, str]:
-    """Save the final worker summary into graph state."""
-    return {"summary": _message_text(state["messages"][-1])}
+  def wrap_up(state: SubagentState) -> dict[str, Any]:
+    """Generate and notify the main agent with a final worker summary."""
+    state_messages = state.get("messages", [])
+    objective = _message_text(state_messages[0]) if state_messages else "(none)"
+    summary_prompt = (
+      "Close out this Perferox benchmark subagent with a concise factual summary. "
+      "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
+      f"Agent: {agent_id}\nObjective:\n{objective}\nLoop cap: {state.get('loop_cap', attempt_cap)}"
+    )
+    response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
+    summary = _message_text(response)
+    row = {
+      "agent_id": agent_id,
+      "objective": objective,
+      "summary": summary,
+      "started_attempts": _started_attempts(state),
+      "loop_cap": state.get("loop_cap", attempt_cap),
+      "trace_ref": trace_ref,
+    }
+    with closing(db.connect(db_path)) as conn:
+      db.init_db(conn)
+      with conn:
+        db.notify_main(conn, agent_id=agent_id, run_id=None, kind="subagent_summary", table_name="subagent_summary", row=row)
+    return {"summary": summary, "messages": [response]}
 
   for name, tool_node, tools, prompt, description in (
     ("create_pod", "create_pod_tools", create_tool_list, CREATE_POD_SYSTEM_PROMPT, "Create one temporary pod and wait for SSH details."),
