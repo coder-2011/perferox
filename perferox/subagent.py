@@ -105,6 +105,13 @@ def _started_attempts(state: SubagentState) -> int:
   )
 
 
+def _stop_requested(db_path: str | Path, agent_id: int) -> bool:
+  """Check the host-owned stop flag before starting more benchmark work."""
+  with closing(db.connect(db_path)) as conn:
+    db.init_db(conn)
+    return db.stop_requested(conn, agent_id=agent_id)
+
+
 def build_subagent_graph(
   model: BaseChatModel,
   agent_id: int,
@@ -148,6 +155,8 @@ def build_subagent_graph(
       return "basic_setup_tools"
     if "setup_failed" in _message_text(last_message).lower():
       return "setup_intervention"
+    if _stop_requested(db_path, agent_id):
+      return "wrap_up"
     if _started_attempts(state) >= attempt_cap:
       return "wrap_up"
     return "benchmark_loop"
@@ -163,6 +172,8 @@ def build_subagent_graph(
 
   def route_after_benchmark(state: SubagentState) -> str:
     """Keep benchmarking until the started-attempt cap is reached."""
+    if _stop_requested(db_path, agent_id):
+      return "wrap_up"
     if _started_attempts(state) >= attempt_cap:
       return "wrap_up"
     last_message = state["messages"][-1]

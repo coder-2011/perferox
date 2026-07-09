@@ -120,6 +120,27 @@ def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
   return cursor.rowcount == 1
 
 
+def request_soft_stop(conn: sqlite3.Connection) -> int:
+  """Mark every running tmux-wrapped agent session as ending."""
+  with conn:
+    cursor = conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status = 'running'")
+  return cursor.rowcount
+
+
+def stop_requested(conn: sqlite3.Connection, *, agent_id: int) -> bool:
+  """Return whether the main run or this subagent has been asked to stop."""
+  row = conn.execute(
+    """
+    SELECT 1 FROM agent_sessions
+    WHERE status = 'ending'
+      AND (session_name = 'perferox-main' OR (role = 'subagent' AND agent_id = ?))
+    LIMIT 1
+    """,
+    (agent_id,),
+  ).fetchone()
+  return row is not None
+
+
 def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
   """Return unread write notifications and mark them delivered."""
   with conn:
@@ -173,6 +194,8 @@ def start_benchmark_run(
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     conn.execute("BEGIN IMMEDIATE")
+    if stop_requested(conn, agent_id=agent_id):
+      raise ValueError("stop requested; wrap up")
     if attempt_cap is not None:
       attempts = conn.execute(
         "SELECT COUNT(*) FROM runs WHERE agent_id = ?",

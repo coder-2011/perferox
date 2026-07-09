@@ -80,7 +80,7 @@ def build_main_agent_graph(
   def refresh_sessions(conn) -> None:
     """Mark running tmux sessions missing when tmux no longer has them."""
     tmux = shutil.which("tmux")
-    rows = conn.execute("SELECT * FROM agent_sessions WHERE status = 'running'").fetchall()
+    rows = conn.execute("SELECT * FROM agent_sessions WHERE status IN ('running', 'ending')").fetchall()
     for row in rows:
       alive = tmux and subprocess.run(
         [tmux, "has-session", "-t", row["session_name"]],
@@ -233,6 +233,9 @@ def build_main_agent_graph(
     with closing(db.connect(database)) as conn:
       db.init_db(conn)
       refresh_sessions(conn)
+      main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()
+      if main_row is not None and main_row["status"] == "ending":
+        return "stop requested; not starting a new benchmark subagent"
       active_count = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchone()[0]
     if active_count >= MAX_ACTIVE_SUBAGENTS:
       return f"max active subagents reached ({active_count}/{MAX_ACTIVE_SUBAGENTS})"

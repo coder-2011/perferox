@@ -119,8 +119,6 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
-      if main_row is not None and main_row["status"] == "ending":
-        return None
       notifications = db.take_main_notifications(conn)
       if notifications:
         lines = ["Subagent SQLite write notifications:"]
@@ -133,13 +131,19 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
           lines.append(row["row_json"])
         return "\n".join(lines)
       tmux = shutil.which("tmux")
-      for row in conn.execute("SELECT * FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchall():
+      active_query = "SELECT * FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
+      for row in conn.execute(active_query).fetchall():
         alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
         if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
           line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
           db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
           return f"Tmux session update:\n{line}"
-      rows = conn.execute("SELECT session_name FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchall()
+      rows = conn.execute(active_query).fetchall()
+      if main_row is not None and main_row["status"] == "ending":
+        if not rows:
+          return None
+        time.sleep(poll_s)
+        return "End requested. Do not delegate new subagents; wait for active subagents to wrap up, then summarize."
     running = {row["session_name"] for row in rows}
     if previous_running is not None and running != previous_running:
       return "Tmux session update:\nsubagent tmux sessions changed" if running else "Tmux session update:\nall subagent tmux sessions completed"

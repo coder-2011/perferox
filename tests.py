@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -11,10 +13,12 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from perferox import db
+from perferox import cli, db
+from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.tools import sglang_bench_serving
+from perferox.tui import launch_main, read_dashboard, request_end
 
 
 @dataclass(slots=True)
@@ -143,6 +147,17 @@ class RunLifecycleTests(DatabaseTestCase):
     self.assertIn("remote crashed", row["error"])
     self.assertIsNotNone(row["finished_at"])
 
+  def test_soft_stop_blocks_new_run_ids_inside_db_transaction(self) -> None:
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
+    db.record_agent_session(self.conn, session_name="perferox-agent-2", role="subagent", agent_id=2)
+
+    self.assertEqual(db.request_soft_stop(self.conn), 2)
+
+    with self.assertRaisesRegex(ValueError, "stop requested"):
+      db.start_benchmark_run(self.conn, agent_id=2, command="should not start")
+    rows = self.conn.execute("SELECT * FROM runs").fetchall()
+    self.assertEqual(rows, [])
+
 
 class BenchmarkToolE2ETests(DatabaseTestCase):
   """Exercise the benchmark tool through fake SSH and real SQLite writes."""
@@ -188,6 +203,21 @@ class BenchmarkToolE2ETests(DatabaseTestCase):
 
     self.assertIn("run_id=0", result)
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', result)
+
+  def test_stop_requested_refuses_benchmark_before_remote_run(self) -> None:
+    session_id = "agent-9"
+    registry = SessionRegistry()
+    registry.add(FakeRemoteSession(session_id, RemoteResult(exit_status=0, stdout="unused", stderr="")))
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
+    db.record_agent_session(self.conn, session_name="perferox-agent-9", role="subagent", agent_id=9)
+    db.request_soft_stop(self.conn)
+    tool = sglang_bench_serving(registry, session_id, self.db_path, agent_id=9)
+
+    result = tool.invoke({"num_prompts": 1})
+
+    self.assertIn("benchmark not started: ValueError: stop requested; wrap up", result)
+    rows = self.conn.execute("SELECT * FROM runs").fetchall()
+    self.assertEqual(rows, [])
 
 
 class ExperimentLoggingTests(DatabaseTestCase):
@@ -270,6 +300,91 @@ class MainNotificationTests(DatabaseTestCase):
     self.assertEqual(second_batch, [])
     delivered = self.conn.execute("SELECT COUNT(*) FROM main_notifications WHERE delivered_at IS NOT NULL").fetchone()[0]
     self.assertEqual(delivered, 2)
+
+
+class TUIWiringTests(DatabaseTestCase):
+  """Protect the live TUI bridge without launching model, browser, SSH, or cloud work."""
+
+  def test_dashboard_reads_live_db_and_trace_without_consuming_notifications(self) -> None:
+    trace_path = Path(self.tempdir.name) / "main.jsonl"
+    trace_path.write_text(
+      json.dumps(
+        {
+          "ts": "2026-07-09T00:00:00+00:00",
+          "agent_id": None,
+          "payload": {"main": {"messages": [{"content": "thinking through cache pressure"}]}},
+        },
+        separators=(",", ":"),
+      )
+      + "\n",
+      encoding="utf-8",
+    )
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+    db.record_agent_session(self.conn, session_name="perferox-agent-0", role="subagent", agent_id=0, trace_ref=str(trace_path))
+    db.append_explorer_state(self.conn, agent_id=None, line="explorer saw cache pressure")
+    db.start_benchmark_run(self.conn, agent_id=0, command="bench cache")
+    db.log_anomaly(self.conn, agent_id=0, run_id=0, summary="cache pressure anomaly")
+
+    snapshot = read_dashboard(self.db_path)
+
+    trace_text = "\n".join(snapshot.trace_lines)
+    delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
+    subagent_session = next(session for session in snapshot.sessions if session["session_name"] == "perferox-agent-0")
+    self.assertEqual(snapshot.main_status, "running")
+    self.assertEqual(snapshot.runs, 1)
+    self.assertEqual(subagent_session["run_count"], 1)
+    self.assertEqual(snapshot.anomalies[0]["summary"], "cache pressure anomaly")
+    self.assertIn("thinking through cache pressure", trace_text)
+    self.assertIn("explorer saw cache pressure", trace_text)
+    self.assertIn("sqlite run_started", trace_text)
+    self.assertIsNone(delivered)
+
+  def test_end_request_reaches_runner_soft_stop_state(self) -> None:
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
+    db.record_agent_session(self.conn, session_name="perferox-agent-1", role="subagent", agent_id=1)
+
+    with patch("perferox.agent_runner.shutil.which", return_value=True), patch("perferox.agent_runner.subprocess.run") as run:
+      run.return_value.returncode = 0
+      stopped = request_end(self.db_path)
+      update = _wait_for_main_event(self.db_path, poll_s=0)
+
+    statuses = {
+      row["session_name"]: row["status"]
+      for row in self.conn.execute("SELECT session_name, status FROM agent_sessions").fetchall()
+    }
+    self.assertEqual(stopped, 2)
+    self.assertEqual(statuses[MAIN_SESSION], "ending")
+    self.assertEqual(statuses["perferox-agent-1"], "ending")
+    self.assertIn("End requested", update)
+
+    self.assertTrue(db.finish_agent_session(self.conn, session_name="perferox-agent-1", status="exited"))
+    self.assertIsNone(_wait_for_main_event(self.db_path, poll_s=0))
+
+  def test_launch_main_uses_existing_runner_cli(self) -> None:
+    with patch("perferox.tui.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout="started", stderr="")) as run:
+      result = launch_main(Path(self.tempdir.name), self.db_path, Path(self.tempdir.name) / "traces", "stress SGLang")
+
+    command = run.call_args.args[0]
+    self.assertEqual(result.stdout, "started")
+    self.assertEqual(command[:5], ["uv", "run", "python", "-m", "perferox.agent_runner"])
+    self.assertIn("launch-main", command)
+    self.assertIn("--objective", command)
+    self.assertEqual(command[command.index("--objective") + 1], "stress SGLang")
+
+
+class CLITests(DatabaseTestCase):
+  """Protect the no-TUI soft stop command."""
+
+  def test_end_command_requests_soft_stop(self) -> None:
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
+
+    with patch("builtins.print"):
+      result = cli.main(["--cwd", self.tempdir.name, "--db-path", str(self.db_path), "end"])
+
+    status = self.conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()["status"]
+    self.assertEqual(result, 0)
+    self.assertEqual(status, "ending")
+    self.assertIn("soft stop requested from CLI", db.read_explorer_state(self.conn))
 
 
 if __name__ == "__main__":
