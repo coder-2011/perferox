@@ -1,15 +1,5 @@
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS agents (
-  agent_id INTEGER PRIMARY KEY CHECK(agent_id >= 0),
-  kind TEXT NOT NULL,
-  goal TEXT NOT NULL DEFAULT '',
-  experiment_cap INTEGER NOT NULL CHECK(experiment_cap >= 0),
-  attempt_cap INTEGER CHECK(attempt_cap IS NULL OR attempt_cap >= 0),
-  stop_requested INTEGER NOT NULL DEFAULT 0 CHECK(stop_requested IN (0, 1)),
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS runs (
   agent_id INTEGER NOT NULL,
   run_id INTEGER NOT NULL CHECK(run_id >= 0),
@@ -20,8 +10,7 @@ CREATE TABLE IF NOT EXISTS runs (
   command TEXT NOT NULL DEFAULT '',
   exact_hash TEXT NOT NULL UNIQUE,
   error TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY(agent_id, run_id),
-  FOREIGN KEY(agent_id) REFERENCES agents(agent_id)
+  PRIMARY KEY(agent_id, run_id)
 );
 
 CREATE TABLE IF NOT EXISTS experiments (

@@ -96,18 +96,28 @@ runpodctl completion                                  # Auto-detect shell and in
 ```
 """
 
-SETUP_SYSTEM_PROMPT = """\
-You are a setup worker inside an automated benchmark-fuzzing system for ML
+SUBAGENT_SYSTEM_PROMPT = """\
+You are a worker inside an automated benchmark-fuzzing system for ML
 inference engines. The system's purpose is to run bounded SGLang benchmark
 experiments, save useful traces/results, and surface surprising behavior.
 
 Your parent coordinator gives you one goal. The host process owns global
 strategy, agent IDs, benchmark caps, stop state, database writes, and final pod
 cleanup. Do not invent bookkeeping facts or write SQLite directly.
+"""
 
-Your job in this phase is to make one temporary machine ready for benchmark
-work. If the runpodctl tool is available, create one pod and wait until SSH
-details are available. Use runpodctl --help before relying on RunPod flags. Use
+CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
+
+Current phase: create one temporary RunPod pod and wait until SSH details are
+ready. Use local_terminal to run runpodctl commands. When runpodctl returns SSH
+host, user, and port, call connect_remote_session. When that succeeds, reply
+with the shortest useful pod id and SSH summary, with no tool call.
+
+""" + RUNPODCTL_PROMPT
+
+SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
+
+Current phase: make one temporary machine ready for benchmark work. Use
 remote/setup tools for commands on the pod.
 
 Install or verify the dependencies needed to run SGLang serving benchmarks. Do
@@ -116,18 +126,11 @@ not run real benchmark experiments in setup. When the machine is ready, reply
 continuing, reply "setup_failed: ..." with the blocking reason.
 """
 
-BENCHMARK_SYSTEM_PROMPT = """\
-You are a benchmark worker inside an automated benchmark-fuzzing system for ML
-inference engines. The system's purpose is to run bounded SGLang benchmark
-experiments, save useful traces/results, and surface surprising behavior.
+BENCHMARK_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
-Your parent coordinator gave you a specific experiment goal. The host process
-owns global strategy, agent IDs, benchmark caps, stop state, database writes,
-and final pod cleanup. Do not invent bookkeeping facts or write SQLite directly.
-
-Your job in this phase is to run useful SGLang benchmark experiments within the
-given goal. Real benchmark runs must go through the benchmark tool, not raw
-shell. Use raw commands only for inspection or harmless setup checks.
+Current phase: run useful SGLang benchmark experiments within the given goal.
+Real benchmark runs must go through the benchmark tool, not raw shell. Use raw
+commands only for inspection or harmless setup checks.
 
 Log every useful completed run through the experiment logging tool. Log weird,
 surprising, or human-interesting behavior through the anomaly logging tool. You

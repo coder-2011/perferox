@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
-from functools import cache
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping, Sequence
 
+_EMBEDDER = None
 
 METRIC_COLUMNS = (
   "request_rps",
@@ -39,85 +40,98 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-  """Create the Perferox tables and indexes if they do not already exist."""
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
 
 
 def encode_embedding(embedding: Sequence[float]) -> str:
-  """Store embeddings as deterministic JSON until a vector extension is needed."""
   values = [float(value) for value in embedding]
   return json.dumps(values, separators=(",", ":"))
 
 
-@cache
-def _embedder():
-  """Load the Hugging Face embedding model once."""
-  from sentence_transformers import SentenceTransformer
-  return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-
 def embed_intent(intent_key: str) -> list[float]:
-  """Embed a human-readable experiment intent key."""
-  embedding = _embedder().encode(intent_key, normalize_embeddings=True)
-  return [float(value) for value in embedding]
+  global _EMBEDDER
+  if _EMBEDDER is None:
+    from sentence_transformers import SentenceTransformer
+    _EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+  return list(map(float, _EMBEDDER.encode(intent_key, normalize_embeddings=True)))
 
 
-def create_agent(
+def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
-  kind: str,
-  goal: str = "",
+  agent_id: int,
+  command: str,
   experiment_cap: int,
-  attempt_cap: int | None = None,
+  trace_ref: str = "",
 ) -> int:
-  """Allocate the next deterministic agent id and save its cap settings."""
-  created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+  """Assign the next run id and insert the started benchmark row."""
+  exact_hash = hashlib.sha256(command.encode("utf-8")).hexdigest()
+  started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
+    conn.execute("BEGIN IMMEDIATE")
+    started_runs = conn.execute(
+      "SELECT COUNT(*) FROM runs WHERE agent_id = ?",
+      (agent_id,),
+    ).fetchone()[0]
+    if started_runs >= experiment_cap:
+      raise ValueError(f"experiment cap reached ({started_runs}/{experiment_cap}); wrap up")
     row = conn.execute(
-      """
-      INSERT INTO agents(agent_id, kind, goal, experiment_cap, attempt_cap, created_at)
-      SELECT COALESCE(MAX(agent_id) + 1, 0), ?, ?, ?, ?, ? FROM agents
-      RETURNING agent_id
-      """,
-      (kind, goal, experiment_cap, attempt_cap, created_at),
+      "SELECT COALESCE(MAX(run_id) + 1, 0) AS run_id FROM runs WHERE agent_id = ?",
+      (agent_id,),
     ).fetchone()
-  return int(row["agent_id"])
-
-
-def request_stop(conn: sqlite3.Connection, agent_id: int | None = None) -> int:
-  """Set stop_requested so future benchmark starts are refused."""
-  with conn:
-    cursor = conn.execute(
+    run_id = int(row["run_id"])
+    conn.execute(
       """
-      UPDATE agents
-      SET stop_requested = 1
-      WHERE (? IS NULL OR agent_id = ?) AND stop_requested = 0
+      INSERT INTO runs(agent_id, run_id, started_at, trace_ref, command, exact_hash)
+      VALUES (?, ?, ?, ?, ?, ?)
       """,
-      (agent_id, agent_id),
+      (agent_id, run_id, started_at, trace_ref, command, exact_hash),
     )
-  return cursor.rowcount
+  return run_id
+
+
+def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, error: str) -> None:
+  """Mark a started benchmark run as finished with an error."""
+  finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    conn.execute(
+      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ?",
+      (finished_at, agent_id, run_id, error[:2000]),
+    )
 
 
 def log_experiment(
   conn: sqlite3.Connection,
   *,
   agent_id: int,
-  run_id: int,
   intent_key: str,
   metrics: Mapping[str, float | int | None] | None = None,
-) -> None:
+) -> int:
   """Atomically save benchmark metrics and mark the run successful."""
   metrics = metrics or {}
   unknown = sorted(set(metrics) - set(METRIC_COLUMNS))
   if unknown:
     raise ValueError(f"unknown metric columns: {', '.join(unknown)}")
 
+  row = conn.execute(
+    """
+    SELECT run_id FROM runs
+    WHERE agent_id = ? AND finished_at IS NULL AND error = ''
+    ORDER BY run_id DESC
+    LIMIT 1
+    """,
+    (agent_id,),
+  ).fetchone()
+  if row is None:
+    raise ValueError(f"no unfinished successful benchmark run for agent_id={agent_id}")
+  run_id = int(row["run_id"])
+
   columns = ", ".join(METRIC_COLUMNS)
   placeholders = ", ".join("?" for _ in METRIC_COLUMNS)
   values = [metrics.get(column) for column in METRIC_COLUMNS]
   intent_embedding = embed_intent(intent_key)
-  finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+  finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
   with conn:
     cursor = conn.execute(
@@ -133,6 +147,7 @@ def log_experiment(
       """,
       (agent_id, run_id, intent_key, encode_embedding(intent_embedding), *values),
     )
+  return run_id
 
 
 def find_similar_experiments(
@@ -165,7 +180,7 @@ def log_anomaly(
   summary: str,
 ) -> int:
   """Save a human-readable anomaly tied to a benchmark run."""
-  date = datetime.now(timezone.utc).isoformat(timespec="seconds")
+  date = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     cursor = conn.execute(
       """
@@ -188,7 +203,7 @@ def upsert_doc_chunk(
   url: str = "",
 ) -> int:
   """Insert or update one SGLang docs chunk and its embedding."""
-  updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+  updated_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     row = conn.execute(
       """

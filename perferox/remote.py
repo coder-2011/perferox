@@ -113,7 +113,7 @@ class RemoteSession:
 class SessionRegistry:
     """Keep live SSH clients behind string ids for graph/tool lookup."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._sessions: dict[str, RemoteSession] = {}
 
     def add(self, session: RemoteSession) -> None:
@@ -125,8 +125,9 @@ class SessionRegistry:
         return self._sessions[session_id]
 
     def close(self, session_id: str) -> None:
-        session = self._sessions.pop(session_id)
-        session.close()
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            session.close()
 
     def close_all(self) -> None:
         for session_id in list(self._sessions):
