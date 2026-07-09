@@ -6,17 +6,17 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import shlex
+import shutil
 import signal
 import subprocess
-import threading
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import Annotated, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -24,8 +24,6 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.remote import SessionRegistry
-from perferox.subagent import SubagentState, build_subagent_graph, stream_with_trace
 from perferox.tools import search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
@@ -33,6 +31,7 @@ MAX_EXPLORER_LINE_CHARS = 120
 MAX_FILE_LINES = 240
 MAX_OUTPUT_CHARS = 10000
 SQL_ROW_LIMIT = 100
+SUBAGENT_SESSION_PREFIX = "perferox-agent-"
 
 MAIN_AGENT_PROMPT = """\
 You are the Perferox main exploration agent.
@@ -71,11 +70,30 @@ def build_main_agent_graph(
   """Compile the main coordinator graph with ExplorerState hydration."""
   root = Path(cwd).resolve()
   traces = Path(trace_dir)
-  session_registry = SessionRegistry()
-  active_subagents: dict[int, threading.Thread] = {}
+  traces = traces if traces.is_absolute() else (root / traces).resolve()
+  database = Path(db_path)
+  database = database if database.is_absolute() else (root / database).resolve()
 
-  with closing(db.connect(db_path)) as conn:
+  with closing(db.connect(database)) as conn:
     db.init_db(conn)
+
+  def refresh_sessions(conn) -> None:
+    """Mark running tmux sessions missing when tmux no longer has them."""
+    tmux = shutil.which("tmux")
+    rows = conn.execute("SELECT * FROM agent_sessions WHERE status = 'running'").fetchall()
+    for row in rows:
+      alive = tmux and subprocess.run(
+        [tmux, "has-session", "-t", row["session_name"]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+      ).returncode == 0
+      if alive:
+        continue
+      if db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
+        label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
+        line = _shorten(f"{label} tmux missing; trace {Path(row['trace_ref']).name}", MAX_EXPLORER_LINE_CHARS)
+        db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
 
   @tool("bash", description="Run one local bash command from the repository root.")
   def bash(command: str, timeout_s: float = 30.0) -> str:
@@ -127,24 +145,19 @@ def build_main_agent_graph(
     selected = lines[start:start + line_count]
     return "\n".join(f"{start + index + 1}: {line}" for index, line in enumerate(selected))
 
-  @tool("query_sql", description="Run one read-only SQLite SELECT/WITH query against the Perferox database.")
+  @tool("query_sql", description="Run read-only SQLite against the Perferox database and return rows when available.")
   def query_sql(query: str, row_limit: int = SQL_ROW_LIMIT) -> str:
-    """Run a bounded read-only SQL query."""
-    stripped = query.strip()
-    lowered = stripped.casefold()
-    blocked = ("insert", "update", "delete", "drop", "alter", "create", "replace", "attach", "detach", "pragma", "vacuum")
+    """Run SQL through a read-only SQLite connection."""
+    if not query.strip():
+      return "query_sql failed: empty query"
     if row_limit < 1 or row_limit > SQL_ROW_LIMIT:
       return f"row_limit must be between 1 and {SQL_ROW_LIMIT}"
-    if not lowered.startswith(("select ", "with ")):
-      return "only SELECT/WITH queries are allowed"
-    if ";" in stripped.rstrip(";"):
-      return "only one SQL statement is allowed"
-    if any(re.search(rf"\b{token}\b", lowered) for token in blocked):
-      return "query contains a blocked SQL keyword"
     try:
-      with closing(db.connect(db_path)) as conn:
-        db.init_db(conn)
-        rows = conn.execute(query).fetchmany(row_limit)
+      with closing(db.connect(database, readonly=True)) as conn:
+        cursor = conn.execute(query)
+        if cursor.description is None:
+          return f"ok rowcount={cursor.rowcount}"
+        rows = cursor.fetchmany(row_limit)
     except Exception as exc:
       return f"query_sql failed: {type(exc).__name__}: {exc}"
     return json.dumps([dict(row) for row in rows], indent=2, default=str)
@@ -156,7 +169,7 @@ def build_main_agent_graph(
       return "limit must be between 1 and 10"
     try:
       query_embedding = db.embed_intent(query)
-      with closing(db.connect(db_path)) as conn:
+      with closing(db.connect(database)) as conn:
         db.init_db(conn)
         rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
     except Exception as exc:
@@ -178,7 +191,7 @@ def build_main_agent_graph(
   @tool("read_explorer_state", description="Read all compact ExplorerState lines.")
   def read_explorer_state() -> str:
     """Return the full compact ExplorerState ledger."""
-    with closing(db.connect(db_path)) as conn:
+    with closing(db.connect(database)) as conn:
       db.init_db(conn)
       lines = db.read_explorer_state(conn)
     return "\n".join(lines) if lines else "(empty)"
@@ -191,61 +204,58 @@ def build_main_agent_graph(
       return "empty ExplorerState line refused"
     if len(line) > MAX_EXPLORER_LINE_CHARS:
       return f"ExplorerState line too long ({len(line)}/{MAX_EXPLORER_LINE_CHARS} chars)"
-    with closing(db.connect(db_path)) as conn:
+    with closing(db.connect(database)) as conn:
       db.init_db(conn)
       line_id = db.append_explorer_state(conn, agent_id=agent_id, line=line)
     return f"wrote ExplorerState line X{line_id:04d}"
 
   @tool("delegate_benchmark_subagent", description="Start one benchmark subagent with a rich goal and started-attempt cap.")
   def delegate_benchmark_subagent(goal: str, attempt_cap: int) -> str:
-    """Start one background benchmark subagent."""
+    """Start one tmux-wrapped benchmark subagent process."""
     if attempt_cap < 1:
       return "attempt_cap must be >= 1"
-    for agent_id, thread in list(active_subagents.items()):
-      if not thread.is_alive():
-        active_subagents.pop(agent_id, None)
-    if len(active_subagents) >= MAX_ACTIVE_SUBAGENTS:
-      return f"max active subagents reached ({len(active_subagents)}/{MAX_ACTIVE_SUBAGENTS})"
+    if not goal.strip():
+      return "goal must not be empty"
+    with closing(db.connect(database)) as conn:
+      db.init_db(conn)
+      refresh_sessions(conn)
+      active_count = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchone()[0]
+    if active_count >= MAX_ACTIVE_SUBAGENTS:
+      return f"max active subagents reached ({active_count}/{MAX_ACTIVE_SUBAGENTS})"
+    tmux = shutil.which("tmux")
+    if tmux is None:
+      return "tmux is not installed or not on PATH"
     traces.mkdir(parents=True, exist_ok=True)
-    with closing(db.connect(db_path)) as conn:
+    with closing(db.connect(database)) as conn:
       db.init_db(conn)
       db_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM runs").fetchone()[0]
+      session_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM agent_sessions WHERE agent_id IS NOT NULL").fetchone()[0]
     trace_ids = [int(path.stem[6:]) for path in traces.glob("agent-*.jsonl") if path.stem[6:].isdigit()]
-    agent_id = max(db_next, max(trace_ids, default=-1) + 1)
+    agent_id = max(db_next, session_next, max(trace_ids, default=-1) + 1)
     trace_path = traces / f"agent-{agent_id}.jsonl"
+    goal_path = traces / f"agent-{agent_id}.goal.txt"
+    session_name = f"{SUBAGENT_SESSION_PREFIX}{agent_id}"
     trace_path.touch(exist_ok=False)
-    graph = build_subagent_graph(
-      model,
-      agent_id,
-      session_registry,
-      db_path,
-      attempt_cap=attempt_cap,
-      trace_ref=str(trace_path),
+    goal_path.write_text(goal, encoding="utf-8")
+    command = shlex.join([
+      "uv", "run", "python", "-m", "perferox.agent_runner", "subagent",
+      "--agent-id", str(agent_id), "--db-path", str(database),
+      "--trace-path", str(trace_path), "--goal-file", str(goal_path),
+      "--attempt-cap", str(attempt_cap),
+    ])
+    result = subprocess.run(
+      [tmux, "new-session", "-d", "-s", session_name, "-c", str(root), "--", "bash", "-lc", command],
+      text=True,
+      capture_output=True,
+      check=False,
     )
-    state: SubagentState = {"agent_id": agent_id, "messages": [HumanMessage(content=goal)]}
-    events = stream_with_trace(graph, state, trace_path, lambda: None, session_registry)
-
-    def drain_events() -> None:
-      """Consume a background subagent stream so it can run independently."""
-      try:
-        for _ in events:
-          pass
-      except Exception as exc:
-        line = _shorten(f"B agent-{agent_id} failed: {type(exc).__name__} {exc}", MAX_EXPLORER_LINE_CHARS)
-        with closing(db.connect(db_path)) as conn:
-          db.init_db(conn)
-          db.append_explorer_state(conn, agent_id=None, line=line)
-      finally:
-        active_subagents.pop(agent_id, None)
-
-    thread = threading.Thread(target=drain_events, daemon=True)
-    active_subagents[agent_id] = thread
-    thread.start()
+    if result.returncode != 0:
+      return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
     line = _shorten(f"start agent-{agent_id} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
-    with closing(db.connect(db_path)) as conn:
+    with closing(db.connect(database)) as conn:
       db.init_db(conn)
       db.append_explorer_state(conn, agent_id=None, line=line)
-    return f"started agent_id={agent_id} attempt_cap={attempt_cap} trace={trace_path}"
+    return f"started agent_id={agent_id} attempt_cap={attempt_cap} session={session_name} trace={trace_path} attach='tmux attach -t {session_name}'"
 
   tools = [
     bash,
@@ -262,12 +272,15 @@ def build_main_agent_graph(
 
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""
-    with closing(db.connect(db_path)) as conn:
+    with closing(db.connect(database)) as conn:
       db.init_db(conn)
+      refresh_sessions(conn)
       lines = db.read_explorer_state(conn)
+      session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
     objective = state.get("objective", "") or "(none)"
     explorer_state = "\n".join(lines) if lines else "(empty)"
-    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nObjective:\n{objective}\n\nExplorerState:\n{explorer_state}"
+    sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
+    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nObjective:\n{objective}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
     messages = [SystemMessage(content=system_prompt), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 

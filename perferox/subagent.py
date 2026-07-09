@@ -32,6 +32,7 @@ class SubagentState(TypedDict, total=False):
   """Graph-safe state for one benchmark subagent."""
 
   agent_id: int
+  loop_cap: int
   messages: Annotated[list[AnyMessage], add_messages]
   summary: str
 
@@ -46,31 +47,23 @@ def trace_jsonable(value: Any) -> Any:
 
 def stream_with_trace(
   graph: Any,
-  state: SubagentState,
+  state: Mapping[str, Any],
   path: str | Path,
-  teardown: Callable[[], None],
-  session_registry: SessionRegistry,
 ) -> Iterator[Any]:
-  """Stream graph updates, write JSONL, call teardown, and close SSH."""
-  agent_id = int(state["agent_id"])
+  """Stream graph updates and append them to one JSONL trace."""
+  agent_id = state.get("agent_id")
   trace_file = Path(path)
   trace_file.parent.mkdir(parents=True, exist_ok=True)
-  try:
-    for event in graph.stream(state, stream_mode="updates"):
-      record = {
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "agent_id": agent_id,
-        "kind": "graph_update",
-        "payload": event,
-      }
-      with trace_file.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, separators=(",", ":"), default=trace_jsonable) + "\n")
-      yield event
-  finally:
-    try:
-      teardown()
-    finally:
-      session_registry.close(f"agent-{agent_id}")
+  for event in graph.stream(state, stream_mode="updates"):
+    record = {
+      "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+      "agent_id": agent_id,
+      "kind": "graph_update",
+      "payload": event,
+    }
+    with trace_file.open("a", encoding="utf-8") as file:
+      file.write(json.dumps(record, separators=(",", ":"), default=trace_jsonable) + "\n")
+    yield event
 
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
@@ -78,7 +71,11 @@ def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: 
   bound_model = model.bind_tools(list(tools)) if tools else model
 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
-    messages = [SystemMessage(content=system_prompt), *state.get("messages", [])]
+    """Invoke the model with the subagent goal in the system prompt."""
+    state_messages = state.get("messages", [])
+    objective = _message_text(state_messages[0]) if state_messages else "(none)"
+    loop_cap = state.get("loop_cap", "(none)")
+    messages = [SystemMessage(content=f"{system_prompt}\n\nObjective:\n{objective}\n\nLoop cap:\n{loop_cap}"), *state_messages]
     response = bound_model.invoke(messages)
     return {"messages": [response]}
 
