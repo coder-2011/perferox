@@ -11,7 +11,7 @@ import subprocess
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
@@ -141,8 +141,7 @@ def build_main_agent_graph(
       return "limit must be between 1 and 10"
     try:
       query_embedding = db.embed_intent(query)
-      with closing(db.connect(database)) as conn:
-        db.init_db(conn)
+      with closing(db.connect(database, readonly=True)) as conn:
         rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
     except Exception as exc:
       return f"query_sglang_docs failed: {type(exc).__name__}: {exc}"
@@ -177,8 +176,7 @@ def build_main_agent_graph(
   @tool("read_explorer_state", description="Read all compact ExplorerState lines.")
   def read_explorer_state() -> str:
     """Return the full compact ExplorerState ledger."""
-    with closing(db.connect(database)) as conn:
-      db.init_db(conn)
+    with closing(db.connect(database, readonly=True)) as conn:
       lines = db.read_explorer_state(conn)
     return "\n".join(lines) if lines else "(empty)"
 
@@ -191,7 +189,6 @@ def build_main_agent_graph(
     if len(line) > MAX_EXPLORER_LINE_CHARS:
       return f"ExplorerState line too long ({len(line)}/{MAX_EXPLORER_LINE_CHARS} chars)"
     with closing(db.connect(database)) as conn:
-      db.init_db(conn)
       line_id = db.append_explorer_state(conn, agent_id=agent_id, line=line)
     return f"wrote ExplorerState line X{line_id:04d}"
 
@@ -203,22 +200,19 @@ def build_main_agent_graph(
     if not goal.strip():
       return "goal must not be empty"
     with closing(db.connect(database)) as conn:
-      db.init_db(conn)
       refresh_sessions(conn)
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()
       if main_row is not None and main_row["status"] == "ending":
         return "stop requested; not starting a new benchmark subagent"
       active_count = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchone()[0]
-    if active_count >= MAX_ACTIVE_SUBAGENTS:
-      return f"max active subagents reached ({active_count}/{MAX_ACTIVE_SUBAGENTS})"
-    tmux = shutil.which("tmux")
-    if tmux is None:
-      return "tmux is not installed or not on PATH"
-    traces.mkdir(parents=True, exist_ok=True)
-    with closing(db.connect(database)) as conn:
-      db.init_db(conn)
+      if active_count >= MAX_ACTIVE_SUBAGENTS:
+        return f"max active subagents reached ({active_count}/{MAX_ACTIVE_SUBAGENTS})"
+      tmux = shutil.which("tmux")
+      if tmux is None:
+        return "tmux is not installed or not on PATH"
       db_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM runs").fetchone()[0]
       session_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM agent_sessions WHERE agent_id IS NOT NULL").fetchone()[0]
+    traces.mkdir(parents=True, exist_ok=True)
     trace_next = max((int(path.stem[6:]) for path in traces.glob("agent-*.jsonl") if path.stem[6:].isdigit()), default=-1) + 1
     agent_id = max(db_next, session_next, trace_next)
     trace_path = traces / f"agent-{agent_id}.jsonl"
@@ -242,7 +236,6 @@ def build_main_agent_graph(
       return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
     line = _shorten(f"start agent-{agent_id} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
     with closing(db.connect(database)) as conn:
-      db.init_db(conn)
       db.append_explorer_state(conn, agent_id=None, line=line)
     return f"started agent_id={agent_id} attempt_cap={attempt_cap} session={session_name} trace={trace_path} attach='tmux attach -t {session_name}'"
 
@@ -258,12 +251,11 @@ def build_main_agent_graph(
     delegate_benchmark_subagent,
     *extra_tools,
   ]
-  bound_model = model.bind_tools(list(tools))
+  bound_model = model.bind_tools(tools)
 
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""
     with closing(db.connect(database)) as conn:
-      db.init_db(conn)
       refresh_sessions(conn)
       lines = db.read_explorer_state(conn)
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
@@ -274,7 +266,7 @@ def build_main_agent_graph(
     messages = [SystemMessage(content=system_prompt), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 
-  def route_after_main(state: MainAgentState) -> str:
+  def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
     """Route to tools when the model requested tool calls."""
     if getattr(state["messages"][-1], "tool_calls", None):
       return "tools"
@@ -284,7 +276,7 @@ def build_main_agent_graph(
   graph.add_node("main", call_model)
   graph.add_node("tools", ToolNode(tools, name="main_tools"))
   graph.add_edge(START, "main")
-  graph.add_conditional_edges("main", route_after_main, {"tools": "tools", END: END})
+  graph.add_conditional_edges("main", route_after_main)
   graph.add_edge("tools", "main")
   return graph.compile(name="perferox_main_agent")
 

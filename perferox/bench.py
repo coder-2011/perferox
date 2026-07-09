@@ -166,10 +166,9 @@ class BenchServingArgs(BaseModel):
       raise ValueError("tokenize_prompt is not compatible with image or mmmu datasets")
     if self.backend == "sglang-embedding" and self.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS:
       raise ValueError(f"{self.dataset_name} is unsupported for sglang-embedding")
-    if self.lora_request_distribution in ("distinct", "skewed") and not self.lora_name:
-      raise ValueError("distinct/skewed LoRA distribution requires lora_name")
-    if self.lora_request_distribution in ("distinct", "skewed") and len(self.lora_name or []) <= 1:
-      raise ValueError("distinct/skewed LoRA distribution requires more than one lora_name")
+    if self.lora_request_distribution in ("distinct", "skewed") and len(self.lora_name or ()) <= 1:
+      requirement = "lora_name" if not self.lora_name else "more than one lora_name"
+      raise ValueError(f"distinct/skewed LoRA distribution requires {requirement}")
     return self
 
 
