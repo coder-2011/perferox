@@ -12,3 +12,4 @@ perferox/serving.py
 *.sqlite3
 *.sqlite-*
 *.sqlite3-*
+perferox-tui-demo.mp4
