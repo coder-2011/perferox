@@ -46,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     db_path = (cwd / args.db_path).resolve()
     trace_dir = (cwd / args.trace_dir).resolve()
     trace_dir.mkdir(parents=True, exist_ok=True)
+    if subprocess.run([tmux, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+      print(f"{MAIN_SESSION} already running; attach with: tmux attach -t {MAIN_SESSION}")
+      return 1
     command = shlex.join(["uv", "run", "python", "-m", "perferox.agent_runner", "main", "--db-path", str(db_path), "--trace-dir", str(trace_dir), "--objective", args.objective, "--cwd", str(cwd)])
     result = subprocess.run([tmux, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
     print(f"started {MAIN_SESSION}; attach with: tmux attach -t {MAIN_SESSION}" if result.returncode == 0 else (result.stderr or result.stdout).strip())
