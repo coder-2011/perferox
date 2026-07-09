@@ -88,10 +88,14 @@ The agent/tool setup should be pretty small:
 - subagents do not need github
 - raw command running is fine for setup and inspection, but real benchmark experiments should go through the benchmark tool
 - main agent gets a LangGraph path for delegating benchmark subagents
-- benchmark subagents get runpodctl, remote session tools, `sglang_bench_serve`, `log_experiment`, `log_anomaly`, and query explore state
+- benchmark subagents get local terminal access for RunPod lifecycle,
+  `connect_remote_session`, remote session tools, `sglang_bench_serve`,
+  `log_experiment`, `log_anomaly`, and query explore state
 - anomaly agent should not be a tool right now. The anomaly thing is a separate host job that runs every 30 mins over saved data
 
-When main agent delegates, it should basically just give the subagent a goal. The host knows the agent #, run #, and experiment cap. The prompt does not need that bookkeeping unless we are debugging.
+When main agent delegates, it should basically just give the subagent a goal and
+success cap. The host knows the agent # and run #. The prompt can include the
+cap as a budget hint, but the host still enforces it.
 
 Subagents should not write SQLite directly. They call the narrow logging tools. This keeps the DB boring.
 
@@ -162,7 +166,7 @@ Subagents are benchmark workers, not anomaly agents.
 
 Each subagent gets a different pod. The shape should be:
 
-1. open a new pod through `runpodctl`
+1. open a new pod by running `runpodctl` through `local_terminal`
 2. wait until SSH works
 3. run the default basic setup on the remote machine
 4. install SGLang and whatever deps are needed
@@ -174,7 +178,9 @@ This should be modeled as a fixed LangGraph, not as one graph node per benchmark
 
 Rough graph:
 
-`START -> create_pod -> wait_for_ssh -> basic_setup -> benchmark_loop -> wrap_up -> teardown_pod -> END`
+`START -> create_pod -> basic_setup -> benchmark_loop -> wrap_up -> END`
+
+The host runner wraps graph streaming in `try/finally` and always runs teardown: stop/delete the pod and close the SSH session.
 
 If setup fails weirdly, route through:
 
@@ -182,7 +188,11 @@ If setup fails weirdly, route through:
 
 `benchmark_loop` can cycle through tool calls until the subagent ends, hits the cap, hits a deadline, or gets stopped.
 
-Tool access should change by step, using the tool set / `tool_choice` for that node. The setup step gets the setup tool. The benchmark loop gets the benchmark/logging/explore tools. After the successful benchmark count hits the cap, inject a message telling the subagent to wrap up, and do not let it start another benchmark.
+Tool access should change by step, using the tool set / `tool_choice` for that
+node. The create_pod step gets local terminal access plus the `runpodctl`
+prompt reference. The setup step gets the remote setup tool. The benchmark loop
+gets the benchmark/logging/explore tools. After the successful benchmark count
+hits the cap, route to wrap-up and do not let it start another benchmark.
 
 The setup step is not fully deterministic, because pods can start from different images / drivers / CUDA state / package state. The default path should still be boring: run the known install/bootstrap commands on the pod and return verbose output. But if setup does not go according to plan, we should interject with a narrow setup intervention step.
 
@@ -194,7 +204,8 @@ The SGLang benchmark tool should be one tool with a rich args schema. It should 
 
 The subagent system prompt should say:
 
-- use `runpodctl --help` if it needs more context on pod commands
+- use `runpodctl --help` through `local_terminal` if it needs more context on pod commands
+- call `connect_remote_session` after `runpodctl` returns SSH host/user/port
 - use the remote session tools for anything on the pod
 - run benchmarks through the SGLang benchmark tool, not random shell once we are in the benchmark loop
 - always log useful runs with `log_experiment`
@@ -375,7 +386,6 @@ perferox/
   db.py              # sqlite schema + writes + cap/id transactions
   state.py           # dataclasses / TypedDicts for graph state
   remote.py          # Paramiko RemoteSession + SessionRegistry
-  runpod.py          # runpodctl wrapper
   setup.py           # basic setup commands + setup diagnostics
   bench.py           # SGLang command builder + parser
   tools.py           # LangChain tools
@@ -391,11 +401,14 @@ Build order:
 1. Add `pyproject.toml` with the real deps: `langchain`, `langgraph`, `langchain-openai`, `textual`, `paramiko`, `pydantic`, and probably `numpy` for simple embedding cosine search.
 2. Build `db.py`: `runs`, `experiments`, `anomalies`, `explore_events`, `explore_summaries`, `doc_chunks`, and transaction helpers for agent ids / run ids / caps / status updates.
 3. Build `remote.py`: `RemoteSession.connect/run/put/close` and `SessionRegistry`. Graph state stores only ids/strings, never Paramiko clients.
-4. Build `runpod.py`: `runpodctl_help`, `create_pod`, `wait_for_ssh`, `teardown_pod`, and pod tags for run/agent metadata.
+4. Keep RunPod lifecycle prompt-driven: inject `RUNPODCTL_PROMPT` into `create_pod` and let `local_terminal` run `runpodctl`; do not build a dedicated `runpod.py` wrapper at first.
 5. Build `setup.py`: `basic_remote_setup(session)` runs the default setup commands and returns logs. Weird setup failures route to `setup_intervention`.
 6. Build `bench.py`: one `sglang_bench_serve` args schema, command builder, and parser. Defaults include `--output-details --cache-report`.
 7. Build `tools.py`: `sglang_bench_serve`, `log_experiment`, `log_anomaly`, `finish_subagent`, and `query_explore_state`. No github for subagents.
-8. Build `subagent.py`: fixed lifecycle graph. Only `benchmark_loop` is agent-flexible. After a successful benchmark, bind only logging/finish tools until `log_experiment`. After success cap, inject wrap-up prompt and remove benchmark tools. Teardown always runs.
+8. Build `subagent.py`: fixed lifecycle graph. Only `benchmark_loop` is
+agent-flexible. After a successful benchmark, bind only logging/finish tools
+until `log_experiment`. After success cap, route to wrap-up and remove benchmark
+tools. Teardown always runs.
 9. Build `explore.py`: append-only events, non-destructive summaries, and context reconstruction from latest summary + recent events + embedding hits.
 10. Build `docs.py`: local SGLang docs vector DB. Simplest version stores chunks + embedding blobs/json in SQLite and does cosine search in Python. Swap to `sqlite-vec` later only if needed.
 11. Build `main_agent.py`: main graph, max 3 active subagents, `delegate_benchmark_subagent(goal, max_successful_benchmarks, deadline)`, `query_sglang_docs`, `query_explore_state`, 3 day deadline, and shutdown hook.
