@@ -1,9 +1,24 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "perferox"
 version = "0.1.0"
 description = "Agentic benchmark explorer for SGLang."
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Naman Chetwani" }]
+keywords = ["sglang", "benchmark", "fuzzing", "inference", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "langchain",
   "langgraph",
@@ -20,6 +35,12 @@ perferox = "perferox.cli:main"
 
 [tool.uv]
 package = true
+
+[tool.setuptools.packages.find]
+include = ["perferox*"]
+
+[tool.setuptools.package-data]
+perferox = ["init-db.sql", "perferox-tui-demo.gif"]
 
 [tool.ruff]
 preview = true
