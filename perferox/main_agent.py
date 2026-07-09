@@ -188,6 +188,20 @@ def build_main_agent_graph(
       lines.append(f"score={score:.3f} {title} {location}\n{_shorten(str(row['text']), 500)}")
     return "\n\n".join(lines)
 
+  @tool("query_intent_embeddings", description="Find logged experiments with semantically similar intent keys.")
+  def query_intent_embeddings(intent: str, limit: int = 5) -> str:
+    """Search experiment intent embeddings without exposing the raw vectors."""
+    if limit < 1 or limit > 10:
+      return "limit must be between 1 and 10"
+    if not intent.strip():
+      return "intent must not be empty"
+    try:
+      with closing(db.connect(database, readonly=True)) as conn:
+        matches = db.find_similar_experiments(conn, intent, limit)
+    except Exception as exc:
+      return f"query_intent_embeddings failed: {type(exc).__name__}: {exc}"
+    return json.dumps(matches, indent=2, default=str) if matches else "no logged experiment intent embeddings"
+
   @tool("read_explorer_state", description="Read all compact ExplorerState lines.")
   def read_explorer_state() -> str:
     """Return the full compact ExplorerState ledger."""
@@ -263,6 +277,7 @@ def build_main_agent_graph(
     read_file,
     query_sql,
     query_sglang_docs,
+    query_intent_embeddings,
     read_explorer_state,
     write_explorer_state,
     delegate_benchmark_subagent,
