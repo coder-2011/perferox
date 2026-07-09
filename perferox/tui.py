@@ -492,6 +492,7 @@ class PerferoxTUI(App[None]):
   def on_input_submitted(self, event: Input.Submitted) -> None:
     """Echo submitted steering text into the visible trace."""
     self._append_prompt()
+    event.stop()
 
   def action_close_detail(self) -> None:
     """Close the detail split and clear the active anomaly card."""
@@ -580,9 +581,27 @@ class PerferoxTUI(App[None]):
       return
 
     trace = self.query_one("#trace", ScrollableContainer)
-    trace.mount(_trace_line("❯", "#fabd2f", "steer", "#b8bb26", text, "#ebdbb2"))
-    trace.mount(_trace_line("◈", "#d3869b", "thinking", "#b16286", "folding that steer into the current benchmark plan", "#bdae93"))
     prompt.value = ""
+    trace.mount(_trace_line("❯", "#fabd2f", "STEER", "#b8bb26", text, "#ebdbb2"))
+    reply = _trace_line("◈", "#d3869b", "THINKING", "#b16286", "", "#bdae93")
+    trace.mount(reply)
+    trace.scroll_end(animate=False)
+    self._stream_trace_reply(trace, reply, "folding that steer into the current benchmark plan")
+
+  def _stream_trace_reply(self, trace: ScrollableContainer, reply: Static, text: str) -> None:
+    """Reveal the local agent acknowledgement like a streaming response."""
+    index = 0
+
+    def step() -> None:
+      """Append the next few characters and keep the latest text visible."""
+      nonlocal index
+      index = min(len(text), index + 4)
+      reply.update(_trace_markup("◈", "#d3869b", "THINKING", "#b16286", text[:index], "#bdae93"))
+      trace.scroll_end(animate=False)
+      if index == len(text):
+        timer.stop()
+
+    timer = self.set_interval(0.025, step)
 
   def _subagents(self) -> Vertical:
     """Render the left subagent status column."""
@@ -690,7 +709,12 @@ def _progress_bar(done: int, total: int) -> str:
 def _trace_line(glyph: str, glyph_color: str, tag: str, tag_color: str, text: str, text_color: str) -> Static:
   """Render one HTML-style trace row with a glyph, action tag, and body."""
   classes = "trace-line anomaly" if tag == "ANOMALY" else "trace-line"
-  return Static(f"[{glyph_color}]{glyph}[/] [{tag_color}]{tag}[/] [{text_color}]{escape(text)}[/]", classes=classes)
+  return Static(_trace_markup(glyph, glyph_color, tag, tag_color, text, text_color), classes=classes)
+
+
+def _trace_markup(glyph: str, glyph_color: str, tag: str, tag_color: str, text: str, text_color: str) -> str:
+  """Build escaped Rich markup for a trace row."""
+  return f"[{glyph_color}]{glyph}[/] [{tag_color}]{tag}[/] [{text_color}]{escape(text)}[/]"
 
 
 if __name__ == "__main__":
