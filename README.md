@@ -25,4 +25,4 @@ Things that need to be built for this:
 
 We will probably write this in either python or rust. I haven't messed around w/ Rust that much, so maybe rust, just for kicks.
 
-Goal is < 1.5 kLOC
+Goal is < 2 kLOC
