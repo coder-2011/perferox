@@ -29,13 +29,19 @@ METRIC_COLUMNS = (
 )
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
   """Open one SQLite connection for a worker or tool call."""
-  conn = sqlite3.connect(path)
+  if readonly:
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+  else:
+    conn = sqlite3.connect(path)
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys = ON")
   conn.execute("PRAGMA busy_timeout = 5000")
-  conn.execute("PRAGMA journal_mode = WAL")
+  if readonly:
+    conn.execute("PRAGMA query_only = ON")
+  else:
+    conn.execute("PRAGMA journal_mode = WAL")
   return conn
 
 
@@ -77,6 +83,64 @@ def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, lin
   return int(cursor.lastrowid)
 
 
+def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: str, agent_id: int | None = None, trace_ref: str = "") -> None:
+  """Record one tmux-wrapped agent process as running."""
+  with conn:
+    conn.execute(
+      """
+      INSERT OR REPLACE INTO agent_sessions(session_name, role, agent_id, status, trace_ref)
+      VALUES (?, ?, ?, 'running', ?)
+      """,
+      (session_name, role, agent_id, trace_ref),
+    )
+
+
+def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str) -> bool:
+  """Mark a tmux-wrapped agent process as exited or missing."""
+  with conn:
+    cursor = conn.execute(
+      """
+      UPDATE agent_sessions
+      SET status = ?
+      WHERE session_name = ? AND status IN ('running', 'ending')
+      """,
+      (status, session_name),
+    )
+  return cursor.rowcount == 1
+
+
+def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
+  """Mark a running agent session ending after a human End action."""
+  with conn:
+    cursor = conn.execute(
+      "UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status = 'running'",
+      (session_name,),
+    )
+  return cursor.rowcount == 1
+
+
+def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+  """Return unread write notifications and mark them delivered."""
+  with conn:
+    rows = conn.execute(
+      """
+      SELECT * FROM main_notifications
+      WHERE delivered_at IS NULL
+      ORDER BY notification_id
+      LIMIT ?
+      """,
+      (limit,),
+    ).fetchall()
+    if rows:
+      delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
+      placeholders = ",".join("?" for _ in rows)
+      conn.execute(
+        f"UPDATE main_notifications SET delivered_at = ? WHERE notification_id IN ({placeholders})",
+        (delivered_at, *(row["notification_id"] for row in rows)),
+      )
+  return rows
+
+
 def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
@@ -109,6 +173,8 @@ def start_benchmark_run(
       """,
       (agent_id, run_id, started_at, trace_ref, command, exact_hash),
     )
+    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)
   return run_id
 
 
@@ -120,6 +186,8 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
       "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ?",
       (finished_at, error[:2000], agent_id, run_id),
     )
+    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
 
 
 def log_experiment(
@@ -161,6 +229,8 @@ def log_experiment(
     )
     if cursor.rowcount != 1:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
+    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
     conn.execute(
       f"""
       INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {columns})
@@ -168,6 +238,8 @@ def log_experiment(
       """,
       (agent_id, run_id, intent_key, encode_embedding(intent_embedding), *values),
     )
+    row = conn.execute("SELECT * FROM experiments WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
 
 
@@ -188,7 +260,28 @@ def log_anomaly(
       """,
       (agent_id, run_id, date, summary),
     )
-  return int(cursor.lastrowid)
+    anomaly_id = int(cursor.lastrowid)
+    row = conn.execute("SELECT * FROM anomalies WHERE anomaly_id = ?", (anomaly_id,)).fetchone()
+    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
+  return anomaly_id
+
+
+def _insert_main_notification(conn: sqlite3.Connection, *, agent_id: int, run_id: int, kind: str, table_name: str, row: sqlite3.Row) -> None:
+  """Queue one written SQLite row for the main agent to inspect."""
+  conn.execute(
+    """
+    INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """,
+    (
+      datetime.now(UTC).isoformat(timespec="seconds"),
+      agent_id,
+      run_id,
+      kind,
+      table_name,
+      json.dumps(dict(row), separators=(",", ":"), default=str),
+    ),
+  )
 
 
 def upsert_doc_chunk(

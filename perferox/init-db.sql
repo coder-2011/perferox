@@ -52,6 +52,25 @@ CREATE TABLE IF NOT EXISTS explorer_state_lines (
   line TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  session_name TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  agent_id INTEGER,
+  status TEXT NOT NULL,
+  trace_ref TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS main_notifications (
+  notification_id INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  agent_id INTEGER,
+  run_id INTEGER,
+  kind TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  row_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS doc_chunks (
   doc_chunk_id INTEGER PRIMARY KEY,
   source TEXT NOT NULL,
@@ -68,4 +87,6 @@ CREATE INDEX IF NOT EXISTS idx_runs_exact_hash ON runs(exact_hash);
 CREATE INDEX IF NOT EXISTS idx_experiments_intent_key ON experiments(intent_key);
 CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
 CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_main_notifications_delivered ON main_notifications(delivered_at, notification_id);
 CREATE INDEX IF NOT EXISTS idx_doc_chunks_source ON doc_chunks(source);
