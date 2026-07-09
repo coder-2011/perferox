@@ -37,14 +37,16 @@ def main(argv: list[str] | None = None) -> int:
     subagent.add_argument(f"--{name}", required=True)
   args = parser.parse_args(argv)
 
+  if args.command in ("launch-main", "main"):
+    cwd = Path(args.cwd).resolve()
+    db_path = (cwd / args.db_path).resolve()
+    trace_dir = (cwd / args.trace_dir).resolve()
+
   if args.command == "launch-main":
     tmux = shutil.which("tmux")
     if tmux is None:
       print("tmux is not installed or not on PATH")
       return 1
-    cwd = Path(args.cwd).resolve()
-    db_path = (cwd / args.db_path).resolve()
-    trace_dir = (cwd / args.trace_dir).resolve()
     trace_dir.mkdir(parents=True, exist_ok=True)
     if subprocess.run([tmux, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
       print(f"{MAIN_SESSION} already running; attach with: tmux attach -t {MAIN_SESSION}")
@@ -55,9 +57,6 @@ def main(argv: list[str] | None = None) -> int:
     return result.returncode
 
   if args.command == "main":
-    cwd = Path(args.cwd).resolve()
-    db_path = (cwd / args.db_path).resolve()
-    trace_dir = (cwd / args.trace_dir).resolve()
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     try:
@@ -68,11 +67,11 @@ def main(argv: list[str] | None = None) -> int:
       state = {"objective": args.objective, "messages": [HumanMessage(content=args.objective)]}
       while True:
         for event in stream_with_trace(graph, state, trace_path):
-          state = _collect_update(state, event)
+          _collect_update(state, event)
         update = _wait_for_main_event(db_path, args.poll_s)
         if update is None:
           return 0
-        state["messages"] = [*state.get("messages", []), HumanMessage(content=update)]
+        state.setdefault("messages", []).append(HumanMessage(content=update))
     finally:
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="exited")
@@ -88,22 +87,21 @@ def main(argv: list[str] | None = None) -> int:
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
     attempt_cap = int(args.attempt_cap)
     graph = build_subagent_graph(build_chat_model(), agent_id, registry, db_path, attempt_cap=attempt_cap, trace_ref=str(trace_path))
-    state = {"agent_id": agent_id, "loop_cap": attempt_cap, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
+    state = {"agent_id": agent_id, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
     for _ in stream_with_trace(graph, state, trace_path):
       pass
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
     with closing(db.connect(db_path)) as conn:
-      db.init_db(conn)
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
 
 
-def _collect_update(state: dict, event: object) -> dict:
+def _collect_update(state: dict, event: object) -> None:
   """Merge one streamed LangGraph update into a reusable graph state."""
   if not isinstance(event, dict):
-    return state
+    return
   for update in event.values():
     if not isinstance(update, dict):
       continue
@@ -112,15 +110,14 @@ def _collect_update(state: dict, event: object) -> dict:
         state.setdefault(key, []).extend(value)
       else:
         state[key] = value
-  return state
 
 
 def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
   """Wait for a main-agent wakeup or a human End request."""
   previous_running = None
+  tmux = shutil.which("tmux")
   while True:
     with closing(db.connect(db_path)) as conn:
-      db.init_db(conn)
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
       notifications = db.take_main_notifications(conn)
       if notifications:
@@ -133,7 +130,6 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
           )
           lines.append(row["row_json"])
         return "\n".join(lines)
-      tmux = shutil.which("tmux")
       active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
       rows = conn.execute(active_query).fetchall()
       for row in rows:
@@ -142,11 +138,12 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
           line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
           db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
           return f"Tmux session update:\n{line}"
-      if main_row is not None and main_row["status"] == "ending":
-        if not rows:
-          return None
-        time.sleep(poll_s)
-        return "End requested. Do not delegate new subagents; wait for active subagents to wrap up, then summarize."
+      ending = main_row is not None and main_row["status"] == "ending"
+      if ending and not rows:
+        return None
+    if ending:
+      time.sleep(poll_s)
+      return "End requested. Do not delegate new subagents; wait for active subagents to wrap up, then summarize."
     running = {row["session_name"] for row in rows}
     if previous_running is not None and running != previous_running:
       return "Tmux session update:\nsubagent tmux sessions changed" if running else "Tmux session update:\nall subagent tmux sessions completed"
