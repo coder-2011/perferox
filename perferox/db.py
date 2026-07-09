@@ -12,22 +12,7 @@ from pathlib import Path
 
 _EMBEDDER = None
 
-METRIC_COLUMNS = (
-  "request_rps",
-  "input_tps",
-  "output_tps",
-  "ttft_p50_ms",
-  "ttft_p99_ms",
-  "tpot_p50_ms",
-  "tpot_p99_ms",
-  "error_rate",
-  "cache_hit_rate",
-  "peak_gpu_mem_gb",
-  "startup_s",
-  "warmup_s",
-  "accept_length",
-  "correctness_score",
-)
+METRIC_COLUMNS = ["request_rps", "input_tps", "output_tps", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "error_rate", "cache_hit_rate", "peak_gpu_mem_gb", "startup_s", "warmup_s", "accept_length", "correctness_score"]
 _METRIC_COLUMN_SET = set(METRIC_COLUMNS)
 _METRIC_COLUMNS_SQL = ", ".join(METRIC_COLUMNS)
 _METRIC_PLACEHOLDERS_SQL = ", ".join("?" for _ in METRIC_COLUMNS)
@@ -224,7 +209,7 @@ def start_benchmark_run(
       (agent_id, run_id, started_at, trace_ref, command, exact_hash),
     )
     row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
-    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)
   return run_id
 
 
@@ -237,7 +222,7 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
       (finished_at, error[:2000], agent_id, run_id),
     )
     row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
-    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
 
 
 def log_experiment(
@@ -295,7 +280,7 @@ def log_experiment(
     if cursor.rowcount != 1:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
     row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
-    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
     conn.execute(
       f"""
       INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL})
@@ -304,7 +289,7 @@ def log_experiment(
       (agent_id, run_id, intent_key, json.dumps(intent_embedding, separators=(",", ":")), *values),
     )
     row = conn.execute("SELECT * FROM experiments WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
-    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
 
 
@@ -347,10 +332,5 @@ def log_anomaly(
     )
     anomaly_id = int(cursor.lastrowid)
     row = conn.execute("SELECT * FROM anomalies WHERE anomaly_id = ?", (anomaly_id,)).fetchone()
-    _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
   return anomaly_id
-
-
-def _insert_main_notification(conn: sqlite3.Connection, *, agent_id: int, run_id: int, kind: str, table_name: str, row: sqlite3.Row) -> None:
-  """Queue one written SQLite row for the main agent to inspect."""
-  notify_main(conn, agent_id=agent_id, run_id=run_id, kind=kind, table_name=table_name, row=row)

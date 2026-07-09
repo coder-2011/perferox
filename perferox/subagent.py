@@ -203,19 +203,15 @@ def build_subagent_graph(
         db.notify_main(conn, agent_id=agent_id, run_id=None, kind="subagent_summary", table_name="subagent_summary", row=row)
     return {"summary": summary, "messages": [response]}
 
-  for name, tool_node, tools, prompt, description in (
-    ("create_pod", "create_pod_tools", create_tool_list, CREATE_POD_SYSTEM_PROMPT, "Create one temporary pod and wait for SSH details."),
-    ("basic_setup", "basic_setup_tools", setup_tool_list, SETUP_SYSTEM_PROMPT, "Prepare the pod to run SGLang serving benchmarks."),
-    ("setup_intervention", "setup_intervention_tools", setup_tool_list, SETUP_SYSTEM_PROMPT, "Recover from setup_failed and retry setup if useful."),
-    ("benchmark_loop", "benchmark_tools", benchmark_tool_list, benchmark_prompt, "Run bounded SGLang benchmark experiments for the goal."),
+  for name, tool_node, tools, prompt in (
+    ("create_pod", "create_pod_tools", create_tool_list, CREATE_POD_SYSTEM_PROMPT),
+    ("basic_setup", "basic_setup_tools", setup_tool_list, SETUP_SYSTEM_PROMPT),
+    ("setup_intervention", "setup_intervention_tools", setup_tool_list, SETUP_SYSTEM_PROMPT),
+    ("benchmark_loop", "benchmark_tools", benchmark_tool_list, benchmark_prompt),
   ):
-    graph.add_node(name, _model_node(model, tools, prompt), metadata={"description": description})
-    graph.add_node(tool_node, ToolNode(tools, name=tool_node), metadata={"description": f"Run tools requested by {name}."})
-  graph.add_node(
-    "wrap_up",
-    wrap_up,
-    metadata={"description": "Save the final worker summary into graph state."},
-  )
+    graph.add_node(name, _model_node(model, tools, prompt))
+    graph.add_node(tool_node, ToolNode(tools, name=tool_node))
+  graph.add_node("wrap_up", wrap_up)
 
   graph.add_edge(START, "create_pod")
   graph.add_conditional_edges(

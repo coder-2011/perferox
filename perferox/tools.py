@@ -77,7 +77,7 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
   description="Run one shell command on the local host. Use for local files and local setup; directory changes do not persist.",
 )
 def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-  return _run_local(command, timeout_s)
+  return run_local_command(command, timeout_s)
 
 
 def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTool:
@@ -182,7 +182,7 @@ def log_anomaly_tool(db_path: str | Path, agent_id: int) -> BaseTool:
   return log_anomaly
 
 
-def _run_local(command: str, timeout_s: float | None) -> str:
+def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | None = None) -> str:
   """Run a local command, killing the process group on timeout."""
   try:
     process = subprocess.Popen(
@@ -192,6 +192,7 @@ def _run_local(command: str, timeout_s: float | None) -> str:
       errors="replace",
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
+      cwd=cwd,
       start_new_session=os.name == "posix",
     )
     stdout, stderr = process.communicate(timeout=timeout_s)

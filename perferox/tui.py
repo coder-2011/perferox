@@ -12,7 +12,6 @@ from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
 
 # Textual reads color env vars at import time.
 os.environ.pop("NO_COLOR", None)
@@ -95,11 +94,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = TRACE_LIMIT) -> Da
     runs = int(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
     experiments = int(conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0])
 
-  main_status = "idle"
-  for session in sessions:
-    if session["session_name"] == MAIN_SESSION:
-      main_status = str(session["status"])
-      break
+  main_status = next((str(session["status"]) for session in sessions if session["session_name"] == MAIN_SESSION), "idle")
   trace_refs = list(dict.fromkeys(str(session["trace_ref"]) for session in sessions if session.get("trace_ref")))
   trace_lines = [*reversed(db_events), *read_trace_tail(trace_refs, trace_limit)]
   return DashboardSnapshot(
@@ -218,104 +213,24 @@ class PerferoxTUI(App[None]):
   """Render live Perferox state and controls."""
 
   CSS = """
-  Screen {
-    background: #1d2021;
-    color: #d5c4a1;
-  }
-
-  #root {
-    height: 100%;
-    width: 100%;
-    background: #1d2021;
-  }
-
-  #login-screen {
-    height: 1fr;
-    width: 100%;
-    align: center middle;
-  }
-
-  #login-box {
-    width: 44;
-    height: 8;
-    align: center middle;
-  }
-
-  #body {
-    height: 1fr;
-  }
-
-  #left {
-    width: 31;
-    border-right: solid #504945;
-  }
-
-  #main {
-    width: 1fr;
-    min-width: 64;
-  }
-
-  #right {
-    width: 34;
-    border-left: solid #504945;
-  }
-
-  .section-title {
-    height: 2;
-    padding: 0 1;
-    color: #fabd2f;
-    text-style: bold;
-    border-bottom: solid #32302f;
-  }
-
-  .scroll-pane {
-    height: 1fr;
-    padding: 1;
-    scrollbar-color: #504945;
-    scrollbar-background: #1d2021;
-    scrollbar-corner-color: #1d2021;
-  }
-
-  #objective-row {
-    height: 5;
-    padding: 1;
-    background: #282828;
-    border-bottom: solid #504945;
-  }
-
-  #objective {
-    width: 1fr;
-    height: 3;
-    margin-right: 1;
-    background: #1d2021;
-    color: #ebdbb2;
-    border: solid #504945;
-  }
-
-  Button {
-    height: 3;
-    min-width: 10;
-    margin-right: 1;
-    background: #32302f;
-    color: #fabd2f;
-    border: solid #b57614;
-    text-style: bold;
-  }
-
-  Button#end {
-    color: #fb4934;
-    border: solid #fb4934;
-  }
-
-  #footer {
-    height: 1;
-    padding: 0 1;
-    background: #282828;
-    color: #7c6f64;
-  }
+  Screen { background: #1d2021; color: #d5c4a1; }
+  #root { height: 100%; width: 100%; background: #1d2021; }
+  #login-screen { height: 1fr; width: 100%; align: center middle; }
+  #login-box { width: 44; height: 8; align: center middle; }
+  #body { height: 1fr; }
+  #left { width: 31; border-right: solid #504945; }
+  #main { width: 1fr; min-width: 64; }
+  #right { width: 34; border-left: solid #504945; }
+  .section-title { height: 2; padding: 0 1; color: #fabd2f; text-style: bold; border-bottom: solid #32302f; }
+  .scroll-pane { height: 1fr; padding: 1; scrollbar-color: #504945; scrollbar-background: #1d2021; scrollbar-corner-color: #1d2021; }
+  #objective-row { height: 5; padding: 1; background: #282828; border-bottom: solid #504945; }
+  #objective { width: 1fr; height: 3; margin-right: 1; background: #1d2021; color: #ebdbb2; border: solid #504945; }
+  Button { height: 3; min-width: 10; margin-right: 1; background: #32302f; color: #fabd2f; border: solid #b57614; text-style: bold; }
+  Button#end { color: #fb4934; border: solid #fb4934; }
+  #footer { height: 1; padding: 0 1; background: #282828; color: #7c6f64; }
   """
 
-  BINDINGS: ClassVar = [("q", "quit", "Quit")]
+  BINDINGS = (("q", "quit", "Quit"),)
 
   def __init__(
     self,
@@ -336,11 +251,31 @@ class PerferoxTUI(App[None]):
   def compose(self) -> ComposeResult:
     """Build the live dashboard layout."""
     with Vertical(id="root"):
-      yield self._login_screen()
+      yield Vertical(Vertical(Button("LOGIN", id="login"), Static("", id="login-status"), id="login-box"), id="login-screen")
       with Horizontal(id="body"):
-        yield self._left_panel()
-        yield self._main_panel()
-        yield self._right_panel()
+        yield Vertical(
+          Static("STATUS", classes="section-title"),
+          Static("", id="counters"),
+          Static("SESSIONS", classes="section-title"),
+          ScrollableContainer(Static("", id="sessions"), classes="scroll-pane"),
+          id="left",
+        )
+        yield Vertical(
+          Horizontal(
+            Input(placeholder="Objective", id="objective"),
+            Button("START", id="start"),
+            Button("END", id="end"),
+            id="objective-row",
+          ),
+          Static("TRACE", classes="section-title"),
+          ScrollableContainer(Static("", id="trace-text"), classes="scroll-pane"),
+          id="main",
+        )
+        yield Vertical(
+          Static("ANOMALIES", classes="section-title"),
+          ScrollableContainer(Static("", id="anomalies-text"), classes="scroll-pane"),
+          id="right",
+        )
       yield Static("", id="footer")
 
   def on_mount(self) -> None:
@@ -375,7 +310,8 @@ class PerferoxTUI(App[None]):
     self.query_one("#sessions", Static).update(_session_text(snapshot.sessions))
     self.query_one("#trace-text", Static).update(_trace_text(snapshot.trace_lines))
     self.query_one("#anomalies-text", Static).update(_anomaly_text(snapshot.anomalies))
-    self.query_one("#footer", Static).update(_footer_text(snapshot))
+    footer = {"running": "main graph running", "ending": "soft stop requested; waiting for current work to finish", "exited": "main graph exited"}.get(snapshot.main_status, "idle")
+    self.query_one("#footer", Static).update(footer)
     self.query_one("#start", Button).disabled = snapshot.main_status in {"running", "ending"}
     self.query_one("#end", Button).disabled = snapshot.main_status not in {"running", "ending"}
 
@@ -432,49 +368,6 @@ class PerferoxTUI(App[None]):
     self.query_one("#login", Button).disabled = False
     self.query_one("#login-status", Static).update(escape(error) if error else "login failed")
 
-  def _login_screen(self) -> Vertical:
-    """Render the OAuth gate."""
-    return Vertical(
-      Vertical(
-        Button("LOGIN", id="login"),
-        Static("", id="login-status"),
-        id="login-box",
-      ),
-      id="login-screen",
-    )
-
-  def _left_panel(self) -> Vertical:
-    """Render target counters and agent sessions."""
-    return Vertical(
-      Static("STATUS", classes="section-title"),
-      Static("", id="counters"),
-      Static("SESSIONS", classes="section-title"),
-      ScrollableContainer(Static("", id="sessions"), classes="scroll-pane"),
-      id="left",
-    )
-
-  def _main_panel(self) -> Vertical:
-    """Render objective controls and graph trace output."""
-    return Vertical(
-      Horizontal(
-        Input(placeholder="Objective", id="objective"),
-        Button("START", id="start"),
-        Button("END", id="end"),
-        id="objective-row",
-      ),
-      Static("TRACE", classes="section-title"),
-      ScrollableContainer(Static("", id="trace-text"), classes="scroll-pane"),
-      id="main",
-    )
-
-  def _right_panel(self) -> Vertical:
-    """Render recent anomalies from SQLite."""
-    return Vertical(
-      Static("ANOMALIES", classes="section-title"),
-      ScrollableContainer(Static("", id="anomalies-text"), classes="scroll-pane"),
-      id="right",
-    )
-
 
 def _counter_text(snapshot: DashboardSnapshot) -> str:
   """Render compact live counters."""
@@ -517,17 +410,6 @@ def _anomaly_text(anomalies: list[dict[str, object]]) -> str:
   return "\n\n".join(lines)
 
 
-def _footer_text(snapshot: DashboardSnapshot) -> str:
-  """Render one-line run control state."""
-  if snapshot.main_status == "running":
-    return "main graph running"
-  if snapshot.main_status == "ending":
-    return "soft stop requested; waiting for current work to finish"
-  if snapshot.main_status == "exited":
-    return "main graph exited"
-  return "idle"
-
-
 def _find_last_message(value: object) -> object | None:
   """Find the deepest final LangChain message-shaped dict in a trace payload."""
   if isinstance(value, dict):
@@ -553,9 +435,7 @@ def _find_last_message(value: object) -> object | None:
 def _short(text: str, limit: int) -> str:
   """Collapse whitespace and cap one visible line."""
   compact = " ".join(text.split())
-  if len(compact) <= limit:
-    return compact
-  return compact[:limit - 1].rstrip() + "..."
+  return compact if len(compact) <= limit else compact[:limit - 1].rstrip() + "..."
 
 
 if __name__ == "__main__":
