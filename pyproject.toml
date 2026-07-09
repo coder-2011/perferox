@@ -15,8 +15,11 @@ dependencies = [
   "sentence-transformers>=5.6.0",
 ]
 
+[project.scripts]
+perferox = "perferox.cli:main"
+
 [tool.uv]
-package = false
+package = true
 
 [tool.ruff]
 preview = true

@@ -4,4 +4,5 @@
 *.sqlite3
 *.sqlite-*
 *.sqlite3-*
+*.egg-info/
 perferox-tui-demo.mp4
