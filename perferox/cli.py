@@ -7,8 +7,6 @@ from contextlib import closing
 from pathlib import Path
 
 from perferox import db
-from perferox.agent_runner import main as run_agent
-from perferox.tui import PerferoxTUI
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,9 +26,13 @@ def main(argv: list[str] | None = None) -> int:
   trace_dir = (cwd / args.trace_dir).resolve()
 
   if args.command is None:
+    from perferox.tui import PerferoxTUI
+
     PerferoxTUI(cwd=cwd, db_path=db_path, trace_dir=trace_dir).run()
     return 0
   if args.command == "run":
+    from perferox.agent_runner import main as run_agent
+
     objective = " ".join(args.objective)
     return run_agent(["launch-main", "--db-path", str(db_path), "--trace-dir", str(trace_dir), "--objective", objective, "--cwd", str(cwd)])
   with closing(db.connect(db_path)) as conn:

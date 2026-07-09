@@ -56,16 +56,17 @@ def stream_with_trace(
   agent_id = state.get("agent_id")
   trace_file = Path(path)
   trace_file.parent.mkdir(parents=True, exist_ok=True)
-  for event in graph.stream(state, stream_mode="updates"):
-    record = {
-      "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-      "agent_id": agent_id,
-      "kind": "graph_update",
-      "payload": event,
-    }
-    with trace_file.open("a", encoding="utf-8") as file:
+  with trace_file.open("a", encoding="utf-8") as file:
+    for event in graph.stream(state, stream_mode="updates"):
+      record = {
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "agent_id": agent_id,
+        "kind": "graph_update",
+        "payload": event,
+      }
       file.write(json.dumps(record, separators=(",", ":"), default=trace_jsonable) + "\n")
-    yield event
+      file.flush()
+      yield event
 
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
@@ -155,9 +156,7 @@ def build_subagent_graph(
       return "basic_setup_tools"
     if "setup_failed" in _message_text(last_message).lower():
       return "setup_intervention"
-    if _stop_requested(db_path, agent_id):
-      return "wrap_up"
-    if _started_attempts(state) >= attempt_cap:
+    if _stop_requested(db_path, agent_id) or _started_attempts(state) >= attempt_cap:
       return "wrap_up"
     return "benchmark_loop"
 
@@ -172,9 +171,7 @@ def build_subagent_graph(
 
   def route_after_benchmark(state: SubagentState) -> str:
     """Keep benchmarking until the started-attempt cap is reached."""
-    if _stop_requested(db_path, agent_id):
-      return "wrap_up"
-    if _started_attempts(state) >= attempt_cap:
+    if _stop_requested(db_path, agent_id) or _started_attempts(state) >= attempt_cap:
       return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):

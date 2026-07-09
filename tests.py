@@ -18,7 +18,7 @@ from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.tools import sglang_bench_serving
-from perferox.tui import launch_main, read_dashboard, request_end
+from perferox.tui import launch_main, read_dashboard, read_trace_tail, request_end
 
 
 @dataclass(slots=True)
@@ -307,18 +307,8 @@ class TUIWiringTests(DatabaseTestCase):
 
   def test_dashboard_reads_live_db_and_trace_without_consuming_notifications(self) -> None:
     trace_path = Path(self.tempdir.name) / "main.jsonl"
-    trace_path.write_text(
-      json.dumps(
-        {
-          "ts": "2026-07-09T00:00:00+00:00",
-          "agent_id": None,
-          "payload": {"main": {"messages": [{"content": "thinking through cache pressure"}]}},
-        },
-        separators=(",", ":"),
-      )
-      + "\n",
-      encoding="utf-8",
-    )
+    lines = [json.dumps({"payload": {"main": {"messages": [{"content": f"cache pressure {index}"}]}}}, separators=(",", ":")) for index in range(30)]
+    trace_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
     db.record_agent_session(self.conn, session_name="perferox-agent-0", role="subagent", agent_id=0, trace_ref=str(trace_path))
     db.append_explorer_state(self.conn, agent_id=None, line="explorer saw cache pressure")
@@ -334,10 +324,13 @@ class TUIWiringTests(DatabaseTestCase):
     self.assertEqual(snapshot.runs, 1)
     self.assertEqual(subagent_session["run_count"], 1)
     self.assertEqual(snapshot.anomalies[0]["summary"], "cache pressure anomaly")
-    self.assertIn("thinking through cache pressure", trace_text)
+    self.assertIn("cache pressure 29", trace_text)
     self.assertIn("explorer saw cache pressure", trace_text)
     self.assertIn("sqlite run_started", trace_text)
     self.assertIsNone(delivered)
+    tail_lines = read_trace_tail([str(trace_path)], 5)
+    self.assertIn("cache pressure 25", tail_lines[0])
+    self.assertIn("cache pressure 29", tail_lines[-1])
 
   def test_end_request_reaches_runner_soft_stop_state(self) -> None:
     db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")

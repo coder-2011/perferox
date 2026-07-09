@@ -93,10 +93,11 @@ class RemoteSession:
             channel.exec_command(command)
             channel.shutdown_write()
             while not channel.exit_status_ready():
-                drain()
+                drained = drain()
                 if deadline is not None and monotonic() >= deadline:
                     return result(None)
-                time.sleep(0.05)
+                if not drained:
+                    time.sleep(0.05)
             while drain():
                 pass
             return result(channel.recv_exit_status())

@@ -80,7 +80,7 @@ def build_main_agent_graph(
   def refresh_sessions(conn) -> None:
     """Mark running tmux sessions missing when tmux no longer has them."""
     tmux = shutil.which("tmux")
-    rows = conn.execute("SELECT * FROM agent_sessions WHERE status IN ('running', 'ending')").fetchall()
+    rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending')").fetchall()
     for row in rows:
       alive = tmux and subprocess.run(
         [tmux, "has-session", "-t", row["session_name"]],
@@ -247,8 +247,8 @@ def build_main_agent_graph(
       db.init_db(conn)
       db_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM runs").fetchone()[0]
       session_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM agent_sessions WHERE agent_id IS NOT NULL").fetchone()[0]
-    trace_ids = [int(path.stem[6:]) for path in traces.glob("agent-*.jsonl") if path.stem[6:].isdigit()]
-    agent_id = max(db_next, session_next, max(trace_ids, default=-1) + 1)
+    trace_next = max((int(path.stem[6:]) for path in traces.glob("agent-*.jsonl") if path.stem[6:].isdigit()), default=-1) + 1
+    agent_id = max(db_next, session_next, trace_next)
     trace_path = traces / f"agent-{agent_id}.jsonl"
     goal_path = traces / f"agent-{agent_id}.goal.txt"
     session_name = f"{SUBAGENT_SESSION_PREFIX}{agent_id}"

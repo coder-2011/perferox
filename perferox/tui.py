@@ -29,6 +29,7 @@ from perferox.auth import chatgpt_auth_ready, login_chatgpt_oauth
 
 ANOMALY_LIMIT = 8
 TRACE_LIMIT = 80
+TRACE_TAIL_CHUNK_BYTES = 65536
 
 
 @dataclass(slots=True)
@@ -118,10 +119,29 @@ def read_trace_tail(paths: list[str], limit: int) -> list[str]:
     path = Path(raw_path)
     if not path.exists():
       continue
-    with path.open(encoding="utf-8", errors="replace") as file:
-      for raw_line in file:
-        lines.append(format_trace_line(path, raw_line))
+    for raw_line in _tail_lines(path, limit):
+      lines.append(format_trace_line(path, raw_line))
   return list(lines)
+
+
+def _tail_lines(path: Path, limit: int) -> list[str]:
+  """Read the last trace lines without scanning a long JSONL file."""
+  if limit <= 0:
+    return []
+  chunks = []
+  newlines = 0
+  with path.open("rb") as file:
+    file.seek(0, os.SEEK_END)
+    position = file.tell()
+    while position > 0 and newlines <= limit:
+      read_size = min(TRACE_TAIL_CHUNK_BYTES, position)
+      position -= read_size
+      file.seek(position)
+      chunk = file.read(read_size)
+      chunks.append(chunk)
+      newlines += chunk.count(b"\n")
+  data = b"".join(reversed(chunks))
+  return [line.decode("utf-8", "replace") for line in data.splitlines()[-limit:]]
 
 
 def format_trace_line(path: Path, raw_line: str) -> str:

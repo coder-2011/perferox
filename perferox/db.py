@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +28,11 @@ METRIC_COLUMNS = (
   "accept_length",
   "correctness_score",
 )
+_METRIC_COLUMN_SET = set(METRIC_COLUMNS)
+_METRIC_COLUMNS_SQL = ", ".join(METRIC_COLUMNS)
+_METRIC_PLACEHOLDERS_SQL = ", ".join("?" for _ in METRIC_COLUMNS)
+_METRIC_SELECT_SQL = ", ".join(f"e.{column}" for column in METRIC_COLUMNS)
+_RATE_COLUMNS = {"error_rate", "cache_hit_rate"}
 
 
 def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
@@ -49,11 +54,6 @@ def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
-
-
-def encode_embedding(embedding: Sequence[float]) -> str:
-  values = [float(value) for value in embedding]
-  return json.dumps(values, separators=(",", ":"))
 
 
 def embed_intent(intent_key: str) -> list[float]:
@@ -163,7 +163,15 @@ def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[s
   return rows
 
 
-def notify_main(conn: sqlite3.Connection, *, agent_id: int | None, run_id: int | None, kind: str, table_name: str, row: Mapping[str, object]) -> None:
+def notify_main(
+  conn: sqlite3.Connection,
+  *,
+  agent_id: int | None,
+  run_id: int | None,
+  kind: str,
+  table_name: str,
+  row: Mapping[str, object] | sqlite3.Row,
+) -> None:
   """Queue one host event for the main agent to inspect."""
   conn.execute(
     """
@@ -241,7 +249,7 @@ def log_experiment(
 ) -> int:
   """Atomically save benchmark metrics and mark the run successful."""
   metrics = metrics or {}
-  unknown = sorted(set(metrics) - set(METRIC_COLUMNS))
+  unknown = sorted(set(metrics) - _METRIC_COLUMN_SET)
   if unknown:
     raise ValueError(f"unknown metric columns: {', '.join(unknown)}")
   normalized_metrics = {}
@@ -254,11 +262,11 @@ def log_experiment(
       normalized = float(value)
     except (TypeError, ValueError):
       raise TypeError(f"{name} must be a finite number or null") from None
-    if name in ("error_rate", "cache_hit_rate") and normalized > 1.0:
+    if name in _RATE_COLUMNS and normalized > 1.0:
       normalized /= 100.0
     if not math.isfinite(normalized) or normalized < 0.0:
       raise ValueError(f"{name} must be finite and >= 0")
-    if name in ("error_rate", "cache_hit_rate") and normalized > 1.0:
+    if name in _RATE_COLUMNS and normalized > 1.0:
       raise ValueError(f"{name} must normalize to a 0..1 rate")
     normalized_metrics[name] = normalized
 
@@ -275,8 +283,6 @@ def log_experiment(
     raise ValueError(f"no unfinished successful benchmark run for agent_id={agent_id}")
   run_id = int(row["run_id"])
 
-  columns = ", ".join(METRIC_COLUMNS)
-  placeholders = ", ".join("?" for _ in METRIC_COLUMNS)
   values = [normalized_metrics.get(column) for column in METRIC_COLUMNS]
   intent_embedding = embed_intent(intent_key)
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
@@ -292,10 +298,10 @@ def log_experiment(
     _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
     conn.execute(
       f"""
-      INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {columns})
-      VALUES (?, ?, ?, ?, {placeholders})
+      INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL})
+      VALUES (?, ?, ?, ?, {_METRIC_PLACEHOLDERS_SQL})
       """,
-      (agent_id, run_id, intent_key, encode_embedding(intent_embedding), *values),
+      (agent_id, run_id, intent_key, json.dumps(intent_embedding, separators=(",", ":")), *values),
     )
     row = conn.execute("SELECT * FROM experiments WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
     _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
@@ -305,10 +311,9 @@ def log_experiment(
 def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int = 5) -> list[dict[str, object]]:
   """Return logged experiments closest to an intent embedding."""
   query_embedding = embed_intent(intent)
-  metric_columns = ", ".join(f"e.{column}" for column in METRIC_COLUMNS)
   rows = conn.execute(
     f"""
-    SELECT e.agent_id, e.run_id, e.intent_key, e.intent_embedding, {metric_columns},
+    SELECT e.agent_id, e.run_id, e.intent_key, e.intent_embedding, {_METRIC_SELECT_SQL},
       r.trace_ref, r.command, r.started_at, r.finished_at, r.error
     FROM experiments e
     JOIN runs r ON r.agent_id = e.agent_id AND r.run_id = e.run_id
@@ -337,10 +342,7 @@ def log_anomaly(
   date = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     cursor = conn.execute(
-      """
-      INSERT INTO anomalies(agent_id, run_id, date, summary)
-      VALUES (?, ?, ?, ?)
-      """,
+      "INSERT INTO anomalies(agent_id, run_id, date, summary) VALUES (?, ?, ?, ?)",
       (agent_id, run_id, date, summary),
     )
     anomaly_id = int(cursor.lastrowid)
@@ -351,34 +353,4 @@ def log_anomaly(
 
 def _insert_main_notification(conn: sqlite3.Connection, *, agent_id: int, run_id: int, kind: str, table_name: str, row: sqlite3.Row) -> None:
   """Queue one written SQLite row for the main agent to inspect."""
-  notify_main(conn, agent_id=agent_id, run_id=run_id, kind=kind, table_name=table_name, row=dict(row))
-
-
-def upsert_doc_chunk(
-  conn: sqlite3.Connection,
-  *,
-  source: str,
-  chunk_id: str,
-  text: str,
-  embedding: Sequence[float],
-  title: str = "",
-  url: str = "",
-) -> int:
-  """Insert or update one SGLang docs chunk and its embedding."""
-  updated_at = datetime.now(UTC).isoformat(timespec="seconds")
-  with conn:
-    row = conn.execute(
-      """
-      INSERT INTO doc_chunks(source, chunk_id, title, url, text, embedding, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(source, chunk_id) DO UPDATE SET
-        title = excluded.title,
-        url = excluded.url,
-        text = excluded.text,
-        embedding = excluded.embedding,
-        updated_at = excluded.updated_at
-      RETURNING doc_chunk_id
-      """,
-      (source, chunk_id, title, url, text, encode_embedding(embedding), updated_at),
-    ).fetchone()
-  return int(row["doc_chunk_id"])
+  notify_main(conn, agent_id=agent_id, run_id=run_id, kind=kind, table_name=table_name, row=row)
