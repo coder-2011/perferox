@@ -1,5 +1,6 @@
 # ruff: noqa: BLE001
 
+import json
 import os
 import shlex
 import signal
@@ -11,7 +12,7 @@ from typing import Any
 from langchain_core.tools import BaseTool, tool
 
 from perferox import db
-from perferox.bench import BenchServingArgs, bench_serving_argv
+from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteSession, SessionRegistry
 
 DEFAULT_TIMEOUT_S = 30.0
@@ -134,7 +135,10 @@ def sglang_bench_serving(
       # Failed started runs still count, so mark them in SQLite.
       with closing(db.connect(db_path)) as conn:
         db.mark_run_failed(conn, agent_id=agent_id, run_id=run_id, error=output)
-    return f"run_id={run_id}\n{output}"
+      return f"run_id={run_id}\n{output}"
+    metrics = parse_bench_serving_metrics(output, expected_requests=args.num_prompts)
+    metrics_json = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
+    return f"run_id={run_id}\nparsed_metrics={metrics_json}\n{output}"
 
   return run
 
@@ -142,7 +146,7 @@ def sglang_bench_serving(
 def log_experiment_tool(db_path: str | Path, agent_id: int) -> BaseTool:
   @tool(
     "log_experiment",
-    description="Locally mark a successful benchmark run and save its metrics to SQLite.",
+    description="Locally mark a successful benchmark run and save normalized metrics to SQLite; use parsed_metrics from sglang_bench_serving.",
   )
   def log_experiment(intent_key: str, metrics: dict[str, float | int | None] | None = None) -> str:
     try:

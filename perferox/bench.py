@@ -6,6 +6,17 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BENCH_TIMEOUT_S = 6 * 60 * 60.0
+_CONSOLE_METRIC_LABELS = {
+  "Request throughput (req/s)": "request_rps",
+  "Input token throughput (tok/s)": "input_tps",
+  "Output token throughput (tok/s)": "output_tps",
+  "Median TTFT (ms)": "ttft_p50_ms",
+  "P99 TTFT (ms)": "ttft_p99_ms",
+  "Median TPOT (ms)": "tpot_p50_ms",
+  "P99 TPOT (ms)": "tpot_p99_ms",
+  "Cache hit rate": "cache_hit_rate",
+  "Accept length": "accept_length",
+}
 
 BenchBackend = Literal[
   "sglang",
@@ -176,3 +187,29 @@ def bench_serving_argv(args: BenchServingArgs) -> list[str]:
       continue
     argv.extend(str(item) for item in (value if isinstance(value, list) else [value]))
   return argv
+
+
+def parse_bench_serving_metrics(output: str, expected_requests: int | None = None) -> dict[str, float]:
+  """Extract Perferox experiment metrics from SGLang benchmark output."""
+  metrics = {}
+  for raw_line in output.splitlines():
+    line = raw_line.strip()
+    if ":" not in line:
+      continue
+    label, raw_value = line.split(":", 1)
+    label = label.strip()
+    parts = raw_value.strip().split()
+    if not parts:
+      continue
+    try:
+      value = float(parts[0].rstrip("%"))
+    except ValueError:
+      continue
+    if label == "Successful requests" and expected_requests:
+      metrics["error_rate"] = max(expected_requests - value, 0.0) / expected_requests
+      continue
+    metric_name = _CONSOLE_METRIC_LABELS.get(label)
+    if metric_name is None:
+      continue
+    metrics[metric_name] = value / 100.0 if metric_name == "cache_hit_rate" else value
+  return metrics

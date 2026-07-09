@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -141,6 +142,24 @@ def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[s
   return rows
 
 
+def notify_main(conn: sqlite3.Connection, *, agent_id: int | None, run_id: int | None, kind: str, table_name: str, row: Mapping[str, object]) -> None:
+  """Queue one host event for the main agent to inspect."""
+  conn.execute(
+    """
+    INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """,
+    (
+      datetime.now(UTC).isoformat(timespec="seconds"),
+      agent_id,
+      run_id,
+      kind,
+      table_name,
+      json.dumps(dict(row), separators=(",", ":"), default=str),
+    ),
+  )
+
+
 def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
@@ -202,6 +221,23 @@ def log_experiment(
   unknown = sorted(set(metrics) - set(METRIC_COLUMNS))
   if unknown:
     raise ValueError(f"unknown metric columns: {', '.join(unknown)}")
+  normalized_metrics = {}
+  for name, value in metrics.items():
+    if value is None:
+      continue
+    if isinstance(value, bool):
+      raise TypeError(f"{name} must be a finite number or null")
+    try:
+      normalized = float(value)
+    except (TypeError, ValueError):
+      raise TypeError(f"{name} must be a finite number or null") from None
+    if name in ("error_rate", "cache_hit_rate") and normalized > 1.0:
+      normalized /= 100.0
+    if not math.isfinite(normalized) or normalized < 0.0:
+      raise ValueError(f"{name} must be finite and >= 0")
+    if name in ("error_rate", "cache_hit_rate") and normalized > 1.0:
+      raise ValueError(f"{name} must normalize to a 0..1 rate")
+    normalized_metrics[name] = normalized
 
   row = conn.execute(
     """
@@ -218,7 +254,7 @@ def log_experiment(
 
   columns = ", ".join(METRIC_COLUMNS)
   placeholders = ", ".join("?" for _ in METRIC_COLUMNS)
-  values = [metrics.get(column) for column in METRIC_COLUMNS]
+  values = [normalized_metrics.get(column) for column in METRIC_COLUMNS]
   intent_embedding = embed_intent(intent_key)
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -241,6 +277,30 @@ def log_experiment(
     row = conn.execute("SELECT * FROM experiments WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
     _insert_main_notification(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
+
+
+def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int = 5) -> list[dict[str, object]]:
+  """Return logged experiments closest to an intent embedding."""
+  query_embedding = embed_intent(intent)
+  metric_columns = ", ".join(f"e.{column}" for column in METRIC_COLUMNS)
+  rows = conn.execute(
+    f"""
+    SELECT e.agent_id, e.run_id, e.intent_key, e.intent_embedding, {metric_columns},
+      r.trace_ref, r.command, r.started_at, r.finished_at, r.error
+    FROM experiments e
+    JOIN runs r ON r.agent_id = e.agent_id AND r.run_id = e.run_id
+    """
+  ).fetchall()
+  scored = []
+  for row in rows:
+    entry = dict(row)
+    embedding = json.loads(entry.pop("intent_embedding"))
+    entry = {key: value for key, value in entry.items() if value is not None and value != ""}
+    score = sum(a * b for a, b in zip(query_embedding, embedding))
+    entry["score"] = round(score, 3)
+    scored.append((score, entry))
+  scored.sort(key=lambda item: item[0], reverse=True)
+  return [entry for _, entry in scored[:limit]]
 
 
 def log_anomaly(
@@ -268,20 +328,7 @@ def log_anomaly(
 
 def _insert_main_notification(conn: sqlite3.Connection, *, agent_id: int, run_id: int, kind: str, table_name: str, row: sqlite3.Row) -> None:
   """Queue one written SQLite row for the main agent to inspect."""
-  conn.execute(
-    """
-    INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """,
-    (
-      datetime.now(UTC).isoformat(timespec="seconds"),
-      agent_id,
-      run_id,
-      kind,
-      table_name,
-      json.dumps(dict(row), separators=(",", ":"), default=str),
-    ),
-  )
+  notify_main(conn, agent_id=agent_id, run_id=run_id, kind=kind, table_name=table_name, row=dict(row))
 
 
 def upsert_doc_chunk(
