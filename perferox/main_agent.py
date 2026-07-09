@@ -5,10 +5,8 @@
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import shutil
-import signal
 import subprocess
 from collections.abc import Sequence
 from contextlib import closing
@@ -24,12 +22,11 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.tools import search_files_tool
+from perferox.tools import run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
 MAX_EXPLORER_LINE_CHARS = 120
 MAX_FILE_LINES = 240
-MAX_OUTPUT_CHARS = 10000
 SQL_ROW_LIMIT = 100
 SUBAGENT_SESSION_PREFIX = "perferox-agent-"
 
@@ -98,32 +95,7 @@ def build_main_agent_graph(
   @tool("bash", description="Run one local bash command from the repository root.")
   def bash(command: str, timeout_s: float = 30.0) -> str:
     """Run one shell command and return bounded output."""
-    try:
-      process = subprocess.Popen(
-        ["bash", "-lc", command],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=root,
-        start_new_session=os.name == "posix",
-      )
-      stdout, stderr = process.communicate(timeout=timeout_s)
-      exit_status = process.returncode
-    except subprocess.TimeoutExpired:
-      os.killpg(process.pid, signal.SIGKILL) if os.name == "posix" else process.kill()
-      stdout, stderr = process.communicate()
-      exit_status = None
-      stderr = f"{stderr}\ntimed out after {timeout_s}s"
-    except Exception as exc:
-      stdout, stderr = "", f"{type(exc).__name__}: {exc}"
-      exit_status = None
-    output = "\n".join(part for part in (stdout, stderr) if part)
-    if len(output) > MAX_OUTPUT_CHARS:
-      keep = MAX_OUTPUT_CHARS // 2
-      output = f"{output[:keep]}\n\n... {len(output) - MAX_OUTPUT_CHARS} chars elided ...\n\n{output[-keep:]}"
-    return f"exit_code={exit_status}\n{output}"
+    return run_local_command(command, timeout_s, cwd=root)
 
   @tool("read_file", description="Read a repository file with optional 1-based line range.")
   def read_file(path: str, start_line: int = 1, line_count: int = MAX_FILE_LINES) -> str:
