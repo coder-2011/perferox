@@ -80,7 +80,7 @@ def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) ->
 
 def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTool:
   """Create the tool that owns one host-assigned SSH session id."""
-  @tool("connect_remote_session", description="Open the persistent SSH session after local runpodctl returns host, user, and port.")
+  @tool("connect_remote_session", description="Open the persistent SSH session after the selected cloud provider returns host, user, and port.")
   def connect(host: str, user: str = "root", port: int = 22, timeout_s: float = 30.0) -> str:
     """Replace the id's SSH connection with a newly connected session."""
     registry.close(session_id)

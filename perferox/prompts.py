@@ -88,7 +88,7 @@ You are a benchmark-fuzzing worker for ML systems. Run bounded experiments,
 save useful results, and surface surprising behavior.
 
 The target repository and commit in this prompt are immutable. The host owns
-strategy, IDs, caps, stop state, database writes, and pod cleanup. Do not
+strategy, IDs, caps, stop state, and database writes. Do not
 substitute another revision or write SQLite directly.
 """
 
@@ -105,6 +105,19 @@ user, and port, call connect_remote_session. When that succeeds, reply with the
 shortest useful pod id, chosen environment, and SSH summary, with no tool call.
 
 """ + RUNPODCTL_PROMPT
+
+LAMBDA_CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
+
+Current phase: create one temporary Lambda Cloud instance and connect over SSH.
+
+Use local_terminal to run lambda-labs commands. Inspect the live catalog and
+SSH keys, launch one suitable instance, and poll list until its public IP is
+ready. Then call
+connect_remote_session with that IP, user root, and port 22.
+
+When SSH connects, reply with the shortest useful instance id, instance type,
+region, and SSH summary, with no tool call.
+"""
 
 SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 

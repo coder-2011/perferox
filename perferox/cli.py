@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from contextlib import closing
 from pathlib import Path
 
+from rich.prompt import Prompt
+
 from perferox import db
+from perferox.auth import cloud_provider
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
   subparsers = parser.add_subparsers(dest="command")
   run_parser = subparsers.add_parser("run", help="start the main graph without opening the TUI")
   run_parser.add_argument("objective", nargs="+", help="objective for the main agent")
+  run_parser.add_argument("--provider", choices=("runpod", "lambda"), help="cloud provider; inferred from a recognized key prefix")
   subparsers.add_parser("status", help="print persisted run status")
   subparsers.add_parser("end", help="request a soft stop without opening the TUI")
   args = parser.parse_args(argv)
@@ -35,7 +40,19 @@ def main(argv: list[str] | None = None) -> int:
     from perferox.agent_runner import main as run_agent
 
     objective = " ".join(args.objective)
-    return run_agent(["launch-main", "--db-path", str(db_path), "--trace-dir", str(trace_dir), "--objective", objective, "--cwd", str(cwd)])
+    selected = args.provider or Prompt.ask("Cloud provider", choices=("runpod", "lambda"))
+    env_name = "LAMBDA_API_KEY" if selected == "lambda" else "RUNPOD_API_KEY"
+    api_key = os.environ.get(env_name) or Prompt.ask(f"{selected.title()} API key", password=True)
+    provider = cloud_provider(api_key)
+    if provider != selected:
+      print(f"Using {provider} based on the key prefix.")
+    return run_agent(
+      [
+        "launch-main", "--db-path", str(db_path), "--trace-dir", str(trace_dir),
+        "--objective", objective, "--cwd", str(cwd),
+      ],
+      cloud_api_key=api_key,
+    )
   if args.command == "status":
     from perferox.tui import read_dashboard
 
