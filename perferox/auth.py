@@ -17,10 +17,8 @@ ORIGINATOR = "perferox"
 
 def cloud_provider(api_key: str) -> str:
   """Infer the provider from its API-key prefix."""
-  if api_key.startswith("secret_"):
-    return "lambda"
-  if api_key.startswith("rpa_"):
-    return "runpod"
+  if api_key.startswith("secret_"): return "lambda"
+  if api_key.startswith("rpa_"): return "runpod"
   raise ValueError("API key must start with secret_ for Lambda or rpa_ for RunPod")
 
 
