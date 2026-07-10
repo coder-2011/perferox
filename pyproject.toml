@@ -24,6 +24,7 @@ dependencies = [
   "langchain",
   "langgraph",
   "langchain-openai",
+  "rich",
   "textual",
   "paramiko",
   "pydantic",

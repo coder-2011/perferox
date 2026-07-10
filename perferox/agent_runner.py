@@ -13,6 +13,8 @@ from contextlib import closing
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
+from rich.console import Console
+from rich.text import Text
 
 from perferox import db
 from perferox.auth import build_chat_model, cloud_provider, read_cloud_key, write_cloud_key
@@ -22,6 +24,8 @@ from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
 
 MAIN_SESSION = "perferox-main"
+CONSOLE = Console()
+ERROR_CONSOLE = Console(stderr=True)
 
 
 def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> int:
@@ -49,11 +53,11 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   if args.command == "launch-main":
     tmux = shutil.which("tmux")
     if tmux is None:
-      print("tmux is not installed or not on PATH")
+      ERROR_CONSOLE.print("[bold red]error:[/] tmux is not installed or not on PATH")
       return 1
     trace_dir.mkdir(parents=True, exist_ok=True)
     if subprocess.run([tmux, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
-      print(f"{MAIN_SESSION} already running; attach with: tmux attach -t {MAIN_SESSION}")
+      CONSOLE.print(f"[yellow]{MAIN_SESSION} already running[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
       return 1
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
@@ -81,7 +85,10 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       key_path.unlink(missing_ok=True)
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
-    print(f"started {MAIN_SESSION}; attach with: tmux attach -t {MAIN_SESSION}" if result.returncode == 0 else (result.stderr or result.stdout).strip())
+    if result.returncode == 0:
+      CONSOLE.print(f"[green]started {MAIN_SESSION}[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
+    else:
+      ERROR_CONSOLE.print(Text((result.stderr or result.stdout).strip(), style="red"))
     return result.returncode
 
   if args.command == "main":

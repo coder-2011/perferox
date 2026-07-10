@@ -21,9 +21,10 @@ from perferox import db
 from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
+from perferox.status import read_dashboard, read_trace_tail
 from perferox.subagent import build_subagent_graph
 from perferox.tools import sglang_bench_serving
-from perferox.tui import read_dashboard, read_trace_tail, request_end
+from perferox.tui import request_end
 
 
 @dataclass(slots=True)
@@ -244,6 +245,9 @@ class TUIWiringTests(DatabaseTestCase):
     subagent = next(session for session in snapshot.sessions if session["session_name"] == "perferox-agent-0")
     self.assertEqual(snapshot.main_status, "running")
     self.assertEqual(snapshot.runs, 1)
+    self.assertEqual(snapshot.running_runs, 1)
+    self.assertEqual(snapshot.anomaly_count, 1)
+    self.assertEqual(snapshot.recent_runs[0]["label"], "bench cache")
     self.assertEqual(subagent["run_count"], 1)
     self.assertEqual(snapshot.anomalies[0]["summary"], "cache pressure anomaly")
     self.assertIn("cache pressure 29", trace_text)

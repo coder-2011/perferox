@@ -4,13 +4,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import threading
-from collections import deque
 from contextlib import closing
-from dataclasses import dataclass
 from pathlib import Path
 
 # Textual reads color env vars at import time.
@@ -23,160 +20,8 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
 from perferox import db
-from perferox.agent_runner import MAIN_SESSION
 from perferox.auth import chatgpt_auth_ready, cloud_provider, login_chatgpt_oauth
-
-ANOMALY_LIMIT = 8
-TRACE_LIMIT = 80
-TRACE_TAIL_CHUNK_BYTES = 65536
-
-
-@dataclass(slots=True)
-class DashboardSnapshot:
-  """Small immutable view of the SQLite and JSONL state the TUI renders."""
-
-  sessions: list[dict[str, object]]
-  anomalies: list[dict[str, object]]
-  trace_lines: list[str]
-  runs: int
-  experiments: int
-  main_status: str
-
-
-def read_dashboard(db_path: str | Path, *, trace_limit: int = TRACE_LIMIT) -> DashboardSnapshot:
-  """Read the live run status without consuming main-agent notifications."""
-  with closing(db.connect(db_path)) as conn:
-    db.init_db(conn)
-    sessions = [
-      dict(row)
-      for row in conn.execute(
-        """
-        SELECT s.*,
-          COUNT(r.run_id) AS run_count,
-          SUM(CASE WHEN r.finished_at IS NOT NULL AND r.error = '' THEN 1 ELSE 0 END) AS succeeded_runs,
-          SUM(CASE WHEN r.error != '' THEN 1 ELSE 0 END) AS failed_runs
-        FROM agent_sessions s
-        LEFT JOIN runs r ON r.agent_id = s.agent_id
-        GROUP BY s.session_name
-        ORDER BY s.role, s.agent_id, s.session_name
-        """
-      ).fetchall()
-    ]
-    anomalies = [
-      dict(row)
-      for row in conn.execute(
-        """
-        SELECT a.*, r.command
-        FROM anomalies a
-        LEFT JOIN runs r ON r.agent_id = a.agent_id AND r.run_id = a.run_id
-        ORDER BY a.anomaly_id DESC
-        LIMIT ?
-        """,
-        (ANOMALY_LIMIT,),
-      ).fetchall()
-    ]
-    db_events = [
-      f"{row['created_at']} explorer: {row['line']}"
-      for row in conn.execute("SELECT created_at, line FROM explorer_state_lines ORDER BY line_id DESC LIMIT ?", (trace_limit,)).fetchall()
-    ]
-    db_events.extend(
-      f"{row['created_at']} sqlite {row['kind']}: {_notification_text(row['row_json'])}"
-      for row in conn.execute(
-        """
-        SELECT created_at, kind, row_json
-        FROM main_notifications
-        ORDER BY notification_id DESC
-        LIMIT ?
-        """,
-        (trace_limit,),
-      ).fetchall()
-    )
-    runs = int(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
-    experiments = int(conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0])
-
-  main_status = next((str(session["status"]) for session in sessions if session["session_name"] == MAIN_SESSION), "idle")
-  trace_refs = list(dict.fromkeys(str(session["trace_ref"]) for session in sessions if session.get("trace_ref")))
-  trace_lines = [*reversed(db_events), *read_trace_tail(trace_refs, trace_limit)]
-  return DashboardSnapshot(
-    sessions=sessions,
-    anomalies=anomalies,
-    trace_lines=trace_lines[-trace_limit:],
-    runs=runs,
-    experiments=experiments,
-    main_status=main_status,
-  )
-
-
-def read_trace_tail(paths: list[str], limit: int) -> list[str]:
-  """Return compact trace lines from the newest available JSONL records."""
-  lines: deque[str] = deque(maxlen=limit)
-  for raw_path in paths:
-    path = Path(raw_path)
-    if not path.exists():
-      continue
-    for raw_line in _tail_lines(path, limit):
-      lines.append(format_trace_line(path, raw_line))
-  return list(lines)
-
-
-def _tail_lines(path: Path, limit: int) -> list[str]:
-  """Read the last trace lines without scanning a long JSONL file."""
-  if limit <= 0:
-    return []
-  chunks = []
-  newlines = 0
-  with path.open("rb") as file:
-    file.seek(0, os.SEEK_END)
-    position = file.tell()
-    while position > 0 and newlines <= limit:
-      read_size = min(TRACE_TAIL_CHUNK_BYTES, position)
-      position -= read_size
-      file.seek(position)
-      chunk = file.read(read_size)
-      chunks.append(chunk)
-      newlines += chunk.count(b"\n")
-  data = b"".join(reversed(chunks))
-  return [line.decode("utf-8", "replace") for line in data.splitlines()[-limit:]]
-
-
-def format_trace_line(path: Path, raw_line: str) -> str:
-  """Convert one graph JSONL record into a human-readable TUI line."""
-  try:
-    record = json.loads(raw_line)
-  except json.JSONDecodeError:
-    return f"{path.name}: {_short(raw_line.strip(), 300)}"
-  ts = str(record.get("ts", ""))
-  agent = record.get("agent_id")
-  who = "main" if agent is None else f"agent-{agent}"
-  text = trace_payload_text(record.get("payload"))
-  return _short(f"{ts} {who}: {text}", 500)
-
-
-def trace_payload_text(payload: object) -> str:
-  """Extract the most useful message text from a LangGraph trace payload."""
-  message = _find_last_message(payload)
-  if isinstance(message, dict):
-    content = message.get("content")
-    if content:
-      return str(content)
-    tool_calls = message.get("tool_calls") or message.get("additional_kwargs", {}).get("tool_calls")
-    if tool_calls:
-      return f"tool calls: {_short(json.dumps(tool_calls, default=str), 220)}"
-  return _short(json.dumps(payload, default=str, separators=(",", ":")), 300)
-
-
-def _notification_text(row_json: str) -> str:
-  """Render one SQLite write notification without dumping the whole row."""
-  try:
-    row = json.loads(row_json)
-  except json.JSONDecodeError:
-    return _short(row_json, 300)
-  parts = []
-  for key in ("agent_id", "run_id", "summary", "intent_key", "command", "error"):
-    value = row.get(key)
-    if value not in (None, ""):
-      parts.append(f"{key}={value}")
-  return _short(", ".join(parts) or row_json, 300)
+from perferox.status import DashboardSnapshot, read_dashboard
 
 
 def request_end(db_path: str | Path) -> int:
@@ -396,7 +241,7 @@ def _counter_text(snapshot: DashboardSnapshot) -> str:
     f"subagents: {active} active\n"
     f"runs: {snapshot.runs}\n"
     f"experiments: {snapshot.experiments}\n"
-    f"anomalies: {len(snapshot.anomalies)} recent\n"
+    f"anomalies: {snapshot.anomaly_count}\n"
   )
 
 
@@ -427,30 +272,6 @@ def _anomaly_text(anomalies: list[dict[str, object]]) -> str:
     header = f"ANM-{anomaly['anomaly_id']:04d} agent-{anomaly['agent_id']} run-{anomaly['run_id']}"
     lines.append(f"[#fb4934]{header}[/]\n{escape(str(anomaly['summary']))}\n[#7c6f64]{escape(str(anomaly.get('command') or ''))}[/]")
   return "\n\n".join(lines)
-
-
-def _find_last_message(value: object) -> object | None:
-  """Find the final LangChain message by searching trace branches newest-first."""
-  if isinstance(value, dict):
-    messages = value.get("messages")
-    if isinstance(messages, list) and messages:
-      return messages[-1]
-    children = reversed(value.values())
-  elif isinstance(value, list):
-    children = reversed(value)
-  else:
-    return None
-  for child in children:
-    found = _find_last_message(child)
-    if found is not None:
-      return found
-  return None
-
-
-def _short(text: str, limit: int) -> str:
-  """Collapse whitespace and cap one visible line."""
-  compact = " ".join(text.split())
-  return compact if len(compact) <= limit else compact[:limit - 1].rstrip() + "..."
 
 
 if __name__ == "__main__":
