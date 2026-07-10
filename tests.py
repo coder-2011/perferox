@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import shlex
 import sqlite3
+import stat
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
+import lambda_labs
 from pydantic import ValidationError
 
 from perferox import db
 from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
+from perferox.agent_runner import main as run_agent
+from perferox.auth import cloud_provider, read_cloud_key, write_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
-from perferox.tools import sglang_bench_serving
+from perferox.tools import lambda_labs_tool, runpodctl_tool, sglang_bench_serving
 from perferox.tui import read_dashboard, read_trace_tail, request_end
 
 
@@ -101,6 +109,53 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertEqual(metrics["input_tps"], 1234.5)
     self.assertEqual(metrics["cache_hit_rate"], 0.75)
     self.assertEqual(metrics["error_rate"], 0.1)
+
+
+class CloudProviderTests(unittest.TestCase):
+  """Protect the Lambda request and cloud-key boundaries."""
+
+  def test_lambda_launch_normalizes_auth_and_body(self) -> None:
+    """Check the canonical paid-resource request boundary."""
+    response = io.BytesIO(b'{"data":{"instance_ids":["instance-0","instance-1"]}}')
+    body = {"region_name": "us-west-1", "instance_type_name": "gpu_1x_a10", "ssh_key_names": ["perferox"], "quantity": 2}
+    with patch.dict(os.environ, {"LAMBDA_API_KEY": "secret_test"}), patch("lambda_labs.urlopen", return_value=response) as open_url:
+      result = lambda_labs.request("POST", "instance-operations/launch", body)
+
+    first_request = open_url.call_args_list[0].args[0]
+    self.assertEqual(result["instance_ids"], ["instance-0", "instance-1"])
+    self.assertEqual(first_request.get_header("Authorization"), "Bearer secret_test")
+    self.assertEqual(json.loads(first_request.data), body)
+
+  def test_provider_key_is_one_use_and_tools_are_exclusive(self) -> None:
+    """Check provider inference, secret handoff, and model-visible tool choice."""
+    key_path = write_cloud_key("secret_lambda")
+    mode = stat.S_IMODE(key_path.stat().st_mode)
+    api_key = read_cloud_key(key_path)
+
+    self.assertEqual(cloud_provider(api_key), "lambda")
+    self.assertEqual(mode, 0o600)
+    self.assertFalse(key_path.exists())
+    lambda_tool = lambda_labs_tool(api_key, set())
+    runpod_tool = runpodctl_tool("rpa_test")
+    self.assertEqual(lambda_tool.name, "lambda_labs")
+    self.assertEqual(runpod_tool.name, "runpodctl")
+    self.assertNotIn(api_key, json.dumps(lambda_tool.args_schema.model_json_schema()))
+    self.assertNotIn("rpa_test", json.dumps(runpod_tool.args_schema.model_json_schema()))
+
+    with tempfile.TemporaryDirectory() as directory, patch("perferox.agent_runner.shutil.which", return_value="/usr/bin/tmux"), patch(
+      "perferox.agent_runner.subprocess.run",
+      side_effect=(subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0, "", "")),
+    ) as run, patch("builtins.print"):
+      result = run_agent(
+        ["launch-main", "--db-path", "state.sqlite", "--objective", "test", "--cwd", directory],
+        cloud_api_key=api_key,
+      )
+      command = run.call_args_list[-1].args[0][-1]
+      arguments = shlex.split(command)
+      handed_off_key = Path(arguments[arguments.index("--cloud-key-file") + 1])
+      self.assertEqual(result, 0)
+      self.assertNotIn(api_key, command)
+      self.assertEqual(read_cloud_key(handed_off_key), api_key)
 
 
 class HostStateTests(DatabaseTestCase):

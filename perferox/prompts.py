@@ -100,11 +100,24 @@ Choose the simplest environment. Building the repository is normal; a container
 is only an optional shortcut when it clearly helps. Web-search images if useful.
 For SGLang, start with https://hub.docker.com/r/lmsysorg/sglang/tags.
 
-Use local_terminal to run runpodctl commands. When runpodctl returns SSH host,
+Use the runpodctl tool for RunPod commands. When it returns SSH host,
 user, and port, call connect_remote_session. When that succeeds, reply with the
 shortest useful pod id, chosen environment, and SSH summary, with no tool call.
 
 """ + RUNPODCTL_PROMPT
+
+LAMBDA_CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
+
+Current phase: create one temporary Lambda Cloud instance and connect over SSH.
+
+Use lambda_labs to inspect the live catalog and SSH keys, launch one suitable
+instance, and poll list until its public IP is ready. Then call
+connect_remote_session with that IP, user root, and port 22. The host tracks and
+terminates every instance this worker launches, including on failure.
+
+When SSH connects, reply with the shortest useful instance id, instance type,
+region, and SSH summary, with no tool call.
+"""
 
 SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 

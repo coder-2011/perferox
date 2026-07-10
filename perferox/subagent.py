@@ -18,12 +18,11 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, CREATE_POD_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
+from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.tools import (
   WEB_SEARCH_TOOL,
   connect_remote_session,
-  local_terminal,
   log_anomaly_tool,
   log_experiment_tool,
   remote_terminal,
@@ -104,9 +103,11 @@ def build_subagent_graph(
   db_path: str | Path,
   repository: str,
   commit: str,
+  *,
+  create_pod_tools: Sequence[BaseTool],
+  create_pod_prompt: str,
   attempt_cap: int = 1,
   trace_ref: str = "",
-  create_pod_tools: Sequence[BaseTool] = (local_terminal,),
   setup_tools: Sequence[BaseTool] = (),
   benchmark_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
@@ -199,7 +200,7 @@ def build_subagent_graph(
     return {"summary": summary, "messages": [response]}
 
   for name, tool_node, tools, prompt in (
-    ("create_pod", "create_pod_tools", create_pod_tools, CREATE_POD_SYSTEM_PROMPT),
+    ("create_pod", "create_pod_tools", create_pod_tools, create_pod_prompt),
     ("basic_setup", "basic_setup_tools", setup_tools, SETUP_SYSTEM_PROMPT),
     ("setup_intervention", "setup_intervention_tools", setup_tools, SETUP_SYSTEM_PROMPT),
     ("benchmark_loop", "benchmark_tools", benchmark_tools, BENCHMARK_SYSTEM_PROMPT),

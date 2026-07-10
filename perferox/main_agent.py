@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
+from perferox.auth import write_cloud_key
 from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
@@ -66,6 +67,8 @@ def build_main_agent_graph(
   model: BaseChatModel,
   db_path: str | Path,
   *,
+  cloud_provider: str,
+  cloud_api_key: str,
   cwd: str | Path = ".",
   runtime_cwd: str | Path | None = None,
   trace_dir: str | Path = "traces",
@@ -232,20 +235,28 @@ def build_main_agent_graph(
     session_name = f"{SUBAGENT_SESSION_PREFIX}{agent_id}"
     trace_path.touch(exist_ok=False)
     goal_path.write_text(goal, encoding="utf-8")
+    key_path = write_cloud_key(cloud_api_key)
     command = shlex.join([
       "uv", "run", "python", "-m", "perferox.agent_runner", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
       "--repository", repository, "--commit", commit,
+      "--cloud-key-file", str(key_path),
       "--attempt-cap", str(attempt_cap),
     ])
-    result = subprocess.run(
-      [tmux, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command],
-      text=True,
-      capture_output=True,
-      check=False,
-    )
+    try:
+      result = subprocess.run(
+        [tmux, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command],
+        text=True,
+        capture_output=True,
+        check=False,
+      )
+    except OSError:
+      # Delete a secret handoff that tmux never delivered.
+      key_path.unlink(missing_ok=True)
+      raise
     if result.returncode != 0:
+      key_path.unlink(missing_ok=True)
       return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
     line = _shorten(f"start agent-{agent_id} {repository}@{commit} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
     with closing(db.connect(database)) as conn:
@@ -276,7 +287,7 @@ def build_main_agent_graph(
     objective = state.get("objective", "") or "(none)"
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
-    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nObjective:\n{objective}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
+    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nObjective:\n{objective}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
     messages = [SystemMessage(content=system_prompt), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 

@@ -6,6 +6,7 @@ import argparse
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -13,15 +14,17 @@ from pathlib import Path
 from langchain_core.messages import HumanMessage
 
 from perferox import db
-from perferox.auth import build_chat_model
+from perferox.auth import build_chat_model, cloud_provider, read_cloud_key, write_cloud_key
 from perferox.main_agent import build_main_agent_graph
+from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
+from perferox.tools import lambda_labs_tool, runpodctl_tool
 
 MAIN_SESSION = "perferox-main"
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> int:
   """Parse the runner command and run the requested whole-agent process."""
   parser = argparse.ArgumentParser(prog="python -m perferox.agent_runner")
   subparsers = parser.add_subparsers(dest="command", required=True)
@@ -31,9 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     subparser.add_argument("--trace-dir", default="traces")
     subparser.add_argument("--objective", required=True)
     subparser.add_argument("--cwd", default=".")
+  subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
-  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "attempt-cap"):
+  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "attempt-cap", "cloud-key-file"):
     subagent.add_argument(f"--{name}", required=True)
   args = parser.parse_args(argv)
 
@@ -51,12 +55,29 @@ def main(argv: list[str] | None = None) -> int:
     if subprocess.run([tmux, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
       print(f"{MAIN_SESSION} already running; attach with: tmux attach -t {MAIN_SESSION}")
       return 1
-    command = shlex.join(["uv", "run", "python", "-m", "perferox.agent_runner", "main", "--db-path", str(db_path), "--trace-dir", str(trace_dir), "--objective", args.objective, "--cwd", str(cwd)])
-    result = subprocess.run([tmux, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
+    api_key = cloud_api_key or sys.stdin.read().strip()
+    cloud_provider(api_key)
+    key_path = write_cloud_key(api_key)
+    command = shlex.join([
+      "uv", "run", "python", "-m", "perferox.agent_runner", "main",
+      "--db-path", str(db_path), "--trace-dir", str(trace_dir),
+      "--objective", args.objective, "--cwd", str(cwd),
+      "--cloud-key-file", str(key_path),
+    ])
+    try:
+      result = subprocess.run([tmux, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
+    except OSError:
+      # Delete a secret handoff that tmux never delivered.
+      key_path.unlink(missing_ok=True)
+      raise
+    if result.returncode != 0:
+      key_path.unlink(missing_ok=True)
     print(f"started {MAIN_SESSION}; attach with: tmux attach -t {MAIN_SESSION}" if result.returncode == 0 else (result.stderr or result.stdout).strip())
     return result.returncode
 
   if args.command == "main":
+    api_key = read_cloud_key(args.cloud_key_file)
+    provider = cloud_provider(api_key)
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
@@ -67,7 +88,11 @@ def main(argv: list[str] | None = None) -> int:
       with closing(db.connect(db_path)) as conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
-      graph = build_main_agent_graph(build_chat_model(), db_path, cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir)
+      graph = build_main_agent_graph(
+        build_chat_model(), db_path,
+        cloud_provider=provider, cloud_api_key=api_key,
+        cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir,
+      )
       state = {"objective": args.objective, "messages": [HumanMessage(content=args.objective)]}
       while True:
         for event in stream_with_trace(graph, state, trace_path):
@@ -85,13 +110,19 @@ def main(argv: list[str] | None = None) -> int:
   trace_path = Path(args.trace_path).resolve()
   session_name = f"perferox-agent-{agent_id}"
   registry = SessionRegistry()
+  api_key = read_cloud_key(args.cloud_key_file)
+  provider = cloud_provider(api_key)
+  launched_ids: set[str] = set()
   try:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
     attempt_cap = int(args.attempt_cap)
+    provider_tool = lambda_labs_tool(api_key, launched_ids) if provider == "lambda" else runpodctl_tool(api_key)
+    create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
     graph = build_subagent_graph(
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
+      create_pod_tools=(provider_tool,), create_pod_prompt=create_prompt,
       attempt_cap=attempt_cap, trace_ref=str(trace_path),
     )
     state = {"agent_id": agent_id, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
@@ -100,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
+    if launched_ids:
+      output = lambda_labs_tool(api_key, set()).invoke({"arguments": ["rm", *sorted(launched_ids)]})
+      if not output.startswith("exit_code=0\n"):
+        print(f"Lambda cleanup failed: {output}")
     with closing(db.connect(db_path)) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")

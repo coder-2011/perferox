@@ -20,6 +20,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "lambda-labs",
   "langchain",
   "langgraph",
   "langchain-openai",
@@ -35,6 +36,9 @@ perferox = "perferox.cli:main"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+lambda-labs = { path = "packages/lambda-labs", editable = true }
 
 [tool.setuptools.packages.find]
 include = ["perferox*"]

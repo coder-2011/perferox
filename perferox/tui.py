@@ -20,11 +20,11 @@ os.environ.setdefault("TEXTUAL_COLOR_SYSTEM", "truecolor")
 from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, Select, Static
 
 from perferox import db
 from perferox.agent_runner import MAIN_SESSION
-from perferox.auth import chatgpt_auth_ready, login_chatgpt_oauth
+from perferox.auth import chatgpt_auth_ready, cloud_provider, login_chatgpt_oauth
 
 ANOMALY_LIMIT = 8
 TRACE_LIMIT = 80
@@ -188,7 +188,13 @@ def request_end(db_path: str | Path) -> int:
   return stopped
 
 
-def launch_main(cwd: str | Path, db_path: str | Path, trace_dir: str | Path, objective: str) -> subprocess.CompletedProcess[str]:
+def launch_main(
+  cwd: str | Path,
+  db_path: str | Path,
+  trace_dir: str | Path,
+  objective: str,
+  cloud_api_key: str,
+) -> subprocess.CompletedProcess[str]:
   """Start the tmux-wrapped main graph through the existing runner CLI."""
   command = [
     "uv",
@@ -206,7 +212,7 @@ def launch_main(cwd: str | Path, db_path: str | Path, trace_dir: str | Path, obj
     "--cwd",
     str(Path(cwd).resolve()),
   ]
-  return subprocess.run(command, cwd=Path(cwd), text=True, capture_output=True, check=False)
+  return subprocess.run(command, cwd=Path(cwd), input=cloud_api_key, text=True, capture_output=True, check=False)
 
 
 class PerferoxTUI(App[None]):
@@ -224,6 +230,8 @@ class PerferoxTUI(App[None]):
   .section-title { height: 2; padding: 0 1; color: #fabd2f; text-style: bold; border-bottom: solid #32302f; }
   .scroll-pane { height: 1fr; padding: 1; scrollbar-color: #504945; scrollbar-background: #1d2021; scrollbar-corner-color: #1d2021; }
   #objective-row { height: 5; padding: 1; background: #282828; border-bottom: solid #504945; }
+  #cloud-provider { width: 16; margin-right: 1; }
+  #cloud-key { width: 24; margin-right: 1; }
   #objective { width: 1fr; height: 3; margin-right: 1; background: #1d2021; color: #ebdbb2; border: solid #504945; }
   Button { height: 3; min-width: 10; margin-right: 1; background: #32302f; color: #fabd2f; border: solid #b57614; text-style: bold; }
   Button#end { color: #fb4934; border: solid #fb4934; }
@@ -262,6 +270,8 @@ class PerferoxTUI(App[None]):
         )
         yield Vertical(
           Horizontal(
+            Select((("RunPod", "runpod"), ("Lambda", "lambda")), prompt="Provider", id="cloud-provider"),
+            Input(placeholder="API key", password=True, id="cloud-key"),
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
             Button("END", id="end"),
@@ -297,7 +307,7 @@ class PerferoxTUI(App[None]):
 
   def on_input_submitted(self, event: Input.Submitted) -> None:
     """Launch from the objective field when Enter is pressed."""
-    if event.input.id == "objective":
+    if event.input.id in ("cloud-key", "objective"):
       self._start_main()
       event.stop()
 
@@ -319,13 +329,22 @@ class PerferoxTUI(App[None]):
     """Launch the tmux-backed main graph for the entered objective."""
     if not self.logged_in:
       return
+    api_key = self.query_one("#cloud-key", Input).value.strip()
+    try:
+      provider = cloud_provider(api_key)
+    except ValueError as exc:
+      self.query_one("#footer", Static).update(escape(str(exc)))
+      return
     objective = self.query_one("#objective", Input).value.strip()
     if not objective:
       self.query_one("#footer", Static).update("enter an objective before starting")
       return
-    result = launch_main(self.cwd, self.db_path, self.trace_dir, objective)
+    selected = self.query_one("#cloud-provider", Select).value
+    correction = f"using {provider} based on key; " if selected is not Select.BLANK and selected != provider else ""
+    result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key)
+    self.query_one("#cloud-key", Input).value = ""
     output = (result.stdout or result.stderr).strip()
-    self.query_one("#footer", Static).update(output or f"launch exited {result.returncode}")
+    self.query_one("#footer", Static).update(correction + (output or f"launch exited {result.returncode}"))
     self.refresh_dashboard()
 
   def _end_main(self) -> None:

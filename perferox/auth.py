@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -11,6 +13,31 @@ if TYPE_CHECKING:
 DEFAULT_CHAT_MODEL = "gpt-5.5"
 MODEL_ENV_VAR = "PERFEROX_CHAT_MODEL"
 ORIGINATOR = "perferox"
+
+
+def cloud_provider(api_key: str) -> str:
+  """Infer the provider from its API-key prefix."""
+  if api_key.startswith("secret_"):
+    return "lambda"
+  if api_key.startswith("rpa_"):
+    return "runpod"
+  raise ValueError("API key must start with secret_ for Lambda or rpa_ for RunPod")
+
+
+def write_cloud_key(api_key: str) -> Path:
+  """Write a mode-0600 key handoff for one detached agent process."""
+  with tempfile.NamedTemporaryFile("w", prefix="perferox-key-", delete=False) as file:
+    file.write(api_key)
+    return Path(file.name)
+
+
+def read_cloud_key(path: str | Path) -> str:
+  """Read and delete a one-use API-key handoff."""
+  key_path = Path(path)
+  try:
+    return key_path.read_text()
+  finally:
+    key_path.unlink(missing_ok=True)
 
 
 def chatgpt_auth_ready() -> bool:

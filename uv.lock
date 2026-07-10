@@ -723,6 +723,17 @@ wheels = [
 ]
 
 [[package]]
+name = "lambda-labs"
+version = "0.1.0"
+source = { editable = "packages/lambda-labs" }
+dependencies = [
+    { name = "rich" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "rich" }]
+
+[[package]]
 name = "langchain"
 version = "1.3.11"
 source = { registry = "https://pypi.org/simple" }
@@ -1478,6 +1489,7 @@ name = "perferox"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "lambda-labs" },
     { name = "langchain" },
     { name = "langchain-openai" },
     { name = "langgraph" },
@@ -1496,6 +1508,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "lambda-labs", editable = "packages/lambda-labs" },
     { name = "langchain" },
     { name = "langchain-openai" },
     { name = "langgraph" },
