@@ -46,7 +46,7 @@ def launch_main(
     "run",
     "python",
     "-m",
-    "perferox.agent_runner",
+    "perferox.process_host",
     "launch-main",
     "--db-path",
     str(Path(db_path).resolve()),

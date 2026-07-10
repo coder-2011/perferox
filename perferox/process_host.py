@@ -1,4 +1,4 @@
-"""Tiny CLI for tmux-wrapped Perferox agent processes."""
+"""Host tmux-wrapped Perferox agent processes."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ ERROR_CONSOLE = Console(stderr=True)
 
 def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> int:
   """Parse the runner command and run the requested whole-agent process."""
-  parser = argparse.ArgumentParser(prog="python -m perferox.agent_runner")
+  parser = argparse.ArgumentParser(prog="python -m perferox.process_host")
   subparsers = parser.add_subparsers(dest="command", required=True)
   for name in ("launch-main", "main"):
     subparser = subparsers.add_parser(name)
@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       db.record_agent_session(conn, session_name=MAIN_SESSION, role="main")
     command = shlex.join([
-      "uv", "run", "python", "-m", "perferox.agent_runner", "main",
+      "uv", "run", "python", "-m", "perferox.process_host", "main",
       "--db-path", str(db_path), "--trace-dir", str(trace_dir),
       "--objective", args.objective, "--cwd", str(cwd),
       "--cloud-key-file", str(key_path),

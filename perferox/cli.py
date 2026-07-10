@@ -103,7 +103,7 @@ def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) ->
   """Validate credentials and launch the tmux-wrapped main agent."""
   if not chatgpt_auth_ready():
     return _error("ChatGPT OAuth is missing; run `perferox login` first")
-  from perferox.agent_runner import main as run_agent
+  from perferox.process_host import main as run_agent
 
   objective = " ".join(args.objective)
   selected = args.provider or Prompt.ask("Cloud provider", choices=("runpod", "lambda"), console=CONSOLE)

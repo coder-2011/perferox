@@ -237,7 +237,7 @@ def build_main_agent_graph(
     goal_path.write_text(goal, encoding="utf-8")
     key_path = write_cloud_key(cloud_api_key)
     command = shlex.join([
-      "uv", "run", "python", "-m", "perferox.agent_runner", "subagent",
+      "uv", "run", "python", "-m", "perferox.process_host", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
       "--repository", repository, "--commit", commit,

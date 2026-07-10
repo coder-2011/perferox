@@ -35,7 +35,7 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
-The TUI and CLI both launch `perferox.agent_runner`. The API-key prefix selects RunPod or Lambda, and the runner passes the key to detached tmux processes through a one-use file. Workers expose only the selected provider's environment variable.
+The TUI and CLI both launch `perferox.process_host`. The API-key prefix selects RunPod or Lambda, and the host passes the key to detached tmux processes through a one-use file. Workers expose only the selected provider's environment variable.
 
 The main process uses two roots:
 
@@ -179,7 +179,7 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | --- | --- |
 | `cli.py` | CLI routing for TUI, run, status, and end |
 | `tui.py` | OAuth gate, live dashboard, launch, and soft-stop controls |
-| `agent_runner.py` | tmux process entry points, persistent SGLang workspace, traces, and wakeups |
+| `process_host.py` | tmux process entry points, persistent SGLang workspace, traces, and wakeups |
 | `main_agent.py` | coordinator graph, research tools, ExplorerState, and delegation |
 | `subagent.py` | fixed worker lifecycle graph and final summary notification |
 | `tools.py` | local/remote execution and narrow host-owned LangChain tools |

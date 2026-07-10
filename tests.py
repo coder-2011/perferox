@@ -18,8 +18,8 @@ from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from perferox import db
-from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
+from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail
 from perferox.subagent import build_subagent_graph
@@ -235,7 +235,7 @@ class TUIWiringTests(DatabaseTestCase):
     snapshot = read_dashboard(self.db_path)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
     db.take_main_notifications(self.conn)
-    with patch("perferox.agent_runner.shutil.which", return_value=True), patch("perferox.agent_runner.subprocess.run") as run:
+    with patch("perferox.process_host.shutil.which", return_value=True), patch("perferox.process_host.subprocess.run") as run:
       run.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
       stopped = request_end(self.db_path)
       update = _wait_for_main_event(self.db_path, poll_s=0)
