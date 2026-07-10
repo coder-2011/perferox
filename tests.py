@@ -25,7 +25,7 @@ from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
 from perferox.subagent import build_subagent_graph
-from perferox.tools import sglang_bench_serving
+from perferox.tools import create_cloud_resource_tool, sglang_bench_serving, terminate_cloud_resources
 from perferox.tui import request_end
 
 
@@ -80,6 +80,9 @@ class BenchmarkContractTests(unittest.TestCase):
   def test_serving_args_and_metrics_stay_stable(self) -> None:
     """Check the command/hash boundary and parsed metrics in one fixture."""
     args = BenchServingArgs(
+      gpu="H100 SXM 80GB x1",
+      server_command="python -m sglang.launch_server --model model-a",
+      model_state="model-a@revision-1",
       num_prompts=8,
       request_rate=2.5,
       extra_request_body={"mode": "stress", "seed": 7},
@@ -95,9 +98,16 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertEqual(argv[argv.index("--extra-request-body") + 1], '{"mode":"stress","seed":7}')
     self.assertEqual(argv[argv.index("--header") + 1], "x-trace=perferox")
     self.assertNotIn("--timeout-s", argv)
+    self.assertNotIn("--server-command", argv)
 
     with self.assertRaises(ValidationError):
-      BenchServingArgs(print_requests=True, backend="sglang")
+      BenchServingArgs(
+        gpu=args.gpu,
+        server_command=args.server_command,
+        model_state=args.model_state,
+        print_requests=True,
+        backend="sglang",
+      )
 
     output = """
     Successful requests:                     18
@@ -128,6 +138,7 @@ class HostStateTests(DatabaseTestCase):
     self.assertEqual(db.start_benchmark_run(self.conn, agent_id=1, command="bench c"), 0)
     with self.assertRaises(sqlite3.IntegrityError):
       db.start_benchmark_run(self.conn, agent_id=1, command="bench a")
+    self.assertEqual(db.start_benchmark_run(self.conn, agent_id=1, command="bench a", commit="different-commit"), 1)
 
     run_id = db.start_benchmark_run(self.conn, agent_id=2, command="fragile", attempt_cap=1)
     db.mark_run_failed(self.conn, agent_id=2, run_id=run_id, error="remote crashed")
@@ -173,7 +184,8 @@ class ToolAndExperimentTests(DatabaseTestCase):
     registry = SessionRegistry()
     registry.add(FakeRemoteSession("fail", RemoteResult(exit_status=2, stdout="", stderr="benchmark exploded")))
     fail_tool = sglang_bench_serving(registry, "fail", self.db_path, agent_id=7, trace_ref="traces/agent-7.jsonl")
-    failed = fail_tool.invoke({"output_details": True, "cache_report": True, "num_prompts": 1, "timeout_s": 3.0})
+    identity = {"gpu": "A100 x1", "server_command": "serve model-a", "model_state": "model-a@revision-1"}
+    failed = fail_tool.invoke({**identity, "output_details": True, "cache_report": True, "num_prompts": 1, "timeout_s": 3.0})
 
     registry.add(
       FakeRemoteSession(
@@ -186,7 +198,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
       ),
     )
     ok_tool = sglang_bench_serving(registry, "ok", self.db_path, agent_id=8)
-    succeeded = ok_tool.invoke({"num_prompts": 20})
+    succeeded = ok_tool.invoke({**identity, "num_prompts": 20})
 
     self.assertIn("run_id=0", failed)
     self.assertIn("exit_code=2", failed)
@@ -240,6 +252,53 @@ class ToolAndExperimentTests(DatabaseTestCase):
 
     self.assertEqual(calls, [])
     self.assertEqual(result["summary"], "stopped before provisioning")
+
+  def test_final_attempt_can_log_before_wrap_up(self) -> None:
+    """Finish and log the sole allowed run before the worker summarizes."""
+    registry = SessionRegistry()
+    registry.add(FakeRemoteSession("agent-10", RemoteResult(exit_status=0, stdout="Request throughput (req/s): 12.0", stderr="")))
+    model = ToolBindingFakeModel(responses=[
+      AIMessage(content="pod ready"),
+      AIMessage(content="setup_ready: commit"),
+      AIMessage(content="", tool_calls=[{
+        "name": "sglang_bench_serving",
+        "args": {"gpu": "H100 x1", "server_command": "serve model-a", "model_state": "model-a@revision-1", "num_prompts": 1},
+        "id": "benchmark-call",
+        "type": "tool_call",
+      }]),
+      AIMessage(content="", tool_calls=[{
+        "name": "log_experiment",
+        "args": {"intent_key": "single capped run", "metrics": {"request_rps": 12.0}},
+        "id": "log-call",
+        "type": "tool_call",
+      }]),
+      AIMessage(content="done"),
+      AIMessage(content="final summary"),
+    ])
+    graph = build_subagent_graph(model, 10, registry, self.db_path, "repo", "commit", attempt_cap=1)
+
+    with patch.object(db, "embed_intent", return_value=[1.0, 0.0]):
+      result = graph.invoke({"agent_id": 10, "objective": "benchmark goal", "messages": []})
+
+    run = self.run_row(agent_id=10)
+    experiments = self.conn.execute("SELECT COUNT(*) FROM experiments WHERE agent_id = 10").fetchone()[0]
+    self.assertIsNotNone(run["finished_at"])
+    self.assertEqual(experiments, 1)
+    self.assertEqual(result["summary"], "final summary")
+
+  def test_cloud_resource_is_persisted_and_terminated(self) -> None:
+    """Keep a provider ID durable until host cleanup succeeds."""
+    created = subprocess.CompletedProcess([], 0, stdout='{"id":"pod-123"}\n', stderr="")
+    terminated = subprocess.CompletedProcess([], 0, stdout="deleted pod-123\n", stderr="")
+    with patch("perferox.tools.subprocess.run", side_effect=[created, terminated]) as run:
+      output = create_cloud_resource_tool("runpod", self.db_path, 11).invoke({"arguments": ["--image", "image", "--gpu-id", "H100"]})
+      cleanup = terminate_cloud_resources(self.db_path, 11, "secret")
+
+    resource = self.conn.execute("SELECT * FROM cloud_resources WHERE agent_id = 11").fetchone()
+    self.assertIn("resource_id=pod-123", output)
+    self.assertEqual(cleanup, ["runpod pod-123: terminated"])
+    self.assertIsNotNone(resource["terminated_at"])
+    self.assertEqual(run.call_args_list[1].args[0], ["runpodctl", "pod", "delete", "pod-123"])
 
 
 class TUIWiringTests(DatabaseTestCase):

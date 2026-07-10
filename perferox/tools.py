@@ -75,6 +75,12 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
 @tool("local_terminal", description="Run one shell command on the local host. Use for local files and local setup; directory changes do not persist.")
 def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
   """Run one shell command on the local host."""
+  try:
+    argv = shlex.split(command)
+  except ValueError as exc:
+    return f"invalid shell command: {exc}"
+  if argv[:3] == ["runpodctl", "pod", "create"] or argv[:2] == ["lambda-labs", "up"]:
+    return "cloud creation refused; use create_cloud_resource so the host can guarantee teardown"
   return run_local_command(command, timeout_s)
 
 
@@ -112,6 +118,9 @@ def sglang_bench_serving(
   session_id: str,
   db_path: str | Path,
   agent_id: int,
+  repository: str = "",
+  commit: str = "",
+  provider: str = "",
   trace_ref: str = "",
   attempt_cap: int | None = None,
 ) -> BaseTool:
@@ -130,7 +139,19 @@ def sglang_bench_serving(
     session = registry.get(session_id)
     try:
       with closing(db.connect(db_path)) as conn:
-        run_id = db.start_benchmark_run(conn, agent_id=agent_id, command=command, trace_ref=trace_ref, attempt_cap=attempt_cap)
+        run_id = db.start_benchmark_run(
+          conn,
+          agent_id=agent_id,
+          command=command,
+          repository=repository,
+          commit=commit,
+          provider=provider,
+          gpu=args.gpu,
+          server_command=args.server_command,
+          model_state=args.model_state,
+          trace_ref=trace_ref,
+          attempt_cap=attempt_cap,
+        )
     except Exception as exc:
       return f"benchmark not started: {type(exc).__name__}: {exc}"
     output = _run_remote(session, command, args.timeout_s)
@@ -144,6 +165,87 @@ def sglang_bench_serving(
     return f"run_id={run_id}\nparsed_metrics={metrics_json}\n{output}"
 
   return run
+
+
+def create_cloud_resource_tool(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
+  """Create and immediately persist one provider resource ID."""
+  if provider == "lambda":
+    @tool("create_cloud_resource", description="Launch exactly one Lambda instance and persist its ID for guaranteed host teardown.")
+    def create_lambda(instance_type: str, region: str, ssh_key: str) -> str:
+      """Launch one Lambda instance through the bundled CLI."""
+      command = ["lambda-labs", "up", instance_type, "--region", region, "--key", ssh_key]
+      result = subprocess.run(command, text=True, capture_output=True, check=False)
+      output = result.stdout.strip()
+      if result.returncode != 0:
+        return _format_result(result.returncode, result.stdout, result.stderr)
+      resource_ids = output.removeprefix("launched ").split(", ")
+      if len(resource_ids) != 1 or resource_ids[0] == output:
+        return f"instance launched but resource id was not recognized; stop and clean up manually: {output}"
+      resource_id = resource_ids[0]
+      persistence_error = _persist_cloud_resource(db_path, agent_id, provider, resource_id)
+      if persistence_error:
+        return persistence_error
+      return f"created lambda resource_id={resource_id}"
+
+    return create_lambda
+
+  @tool("create_cloud_resource", description="Create one RunPod pod and persist its ID for guaranteed host teardown.")
+  def create_runpod(arguments: list[str]) -> str:
+    """Create one RunPod pod from explicit CLI arguments."""
+    command = ["runpodctl", "pod", "create", *arguments, "--output", "json"]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+      return _format_result(result.returncode, result.stdout, result.stderr)
+    try:
+      resource_id = str(json.loads(result.stdout)["id"])
+    except (KeyError, TypeError, ValueError):
+      return f"pod created but resource id was not recognized; stop and clean up manually: {result.stdout.strip()}"
+    persistence_error = _persist_cloud_resource(db_path, agent_id, provider, resource_id)
+    if persistence_error:
+      return persistence_error
+    return f"created runpod resource_id={resource_id}\n{result.stdout.strip()}"
+
+  return create_runpod
+
+
+def _persist_cloud_resource(db_path: str | Path, agent_id: int, provider: str, resource_id: str) -> str:
+  """Persist a new resource ID or immediately delete the untracked resource."""
+  try:
+    with closing(db.connect(db_path)) as conn:
+      db.record_cloud_resource(conn, agent_id=agent_id, provider=provider, resource_id=resource_id)
+  except Exception as exc:
+    cleanup = subprocess.run(_cloud_delete_command(provider, resource_id), text=True, capture_output=True, check=False)
+    outcome = "deleted" if cleanup.returncode == 0 else (cleanup.stderr or cleanup.stdout).strip()
+    return f"resource persistence failed: {type(exc).__name__}: {exc}; immediate cleanup: {outcome}"
+  return ""
+
+
+def _cloud_delete_command(provider: str, resource_id: str) -> list[str]:
+  """Return the provider CLI command that permanently deletes one resource."""
+  return ["lambda-labs", "rm", resource_id] if provider == "lambda" else ["runpodctl", "pod", "delete", resource_id]
+
+
+def terminate_cloud_resources(db_path: str | Path, agent_id: int, api_key: str | None = None) -> list[str]:
+  """Terminate every persisted paid resource owned by one worker."""
+  with closing(db.connect(db_path, readonly=True)) as conn:
+    resources = db.pending_cloud_resources(conn, agent_id=agent_id)
+  results = []
+  for resource in resources:
+    provider = resource["provider"]
+    resource_id = resource["resource_id"]
+    command = _cloud_delete_command(provider, resource_id)
+    env = os.environ.copy()
+    if api_key:
+      env["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
+    try:
+      result = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
+      error = "" if result.returncode == 0 else (result.stderr or result.stdout).strip()
+    except OSError as exc:
+      error = f"{type(exc).__name__}: {exc}"
+    with closing(db.connect(db_path)) as conn:
+      db.finish_cloud_resource(conn, provider=provider, resource_id=resource_id, error=error)
+    results.append(f"{provider} {resource_id}: {'terminated' if not error else error}")
+  return results
 
 
 def log_experiment_tool(db_path: str | Path, agent_id: int) -> BaseTool:

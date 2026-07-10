@@ -101,6 +101,7 @@ def build_subagent_graph(
   db_path: str | Path,
   repository: str,
   commit: str,
+  provider: str = "runpod",
   *,
   create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
   attempt_cap: int = 1,
@@ -119,7 +120,17 @@ def build_subagent_graph(
   benchmark_tools = [
     *benchmark_tools,
     remote_tool,
-    sglang_bench_serving(session_registry, session_id, db_path, agent_id, trace_ref, attempt_cap),
+    sglang_bench_serving(
+      session_registry,
+      session_id,
+      db_path,
+      agent_id,
+      repository,
+      commit,
+      provider,
+      trace_ref,
+      attempt_cap,
+    ),
     log_experiment_tool(db_path, agent_id),
     log_anomaly_tool(db_path, agent_id),
   ]
@@ -169,12 +180,12 @@ def build_subagent_graph(
 
   def route_after_benchmark(state: SubagentState) -> Literal["benchmark_tools", "wrap_up"]:
     """Keep benchmarking until the started-attempt cap is reached."""
-    stopped, attempts = runtime_status()
-    if stopped or attempts >= attempt_cap:
-      return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "benchmark_tools"
+    stopped, attempts = runtime_status()
+    if stopped or attempts >= attempt_cap:
+      return "wrap_up"
     return "wrap_up"
 
   def wrap_up(state: SubagentState) -> dict[str, Any]:

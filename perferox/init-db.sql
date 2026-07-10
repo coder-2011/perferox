@@ -2,7 +2,9 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS runs (
   agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL CHECK(run_id >= 0),
-  gpu TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT,
+  repository TEXT NOT NULL DEFAULT '', commit_hash TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
+  gpu TEXT NOT NULL DEFAULT '', server_command TEXT NOT NULL DEFAULT '', model_state TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT,
   command TEXT NOT NULL DEFAULT '', exact_hash TEXT NOT NULL UNIQUE, error TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(agent_id, run_id)
 );
@@ -40,6 +42,12 @@ CREATE TABLE IF NOT EXISTS main_notifications (
   table_name TEXT NOT NULL, row_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cloud_resources (
+  provider TEXT NOT NULL, resource_id TEXT NOT NULL, agent_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL, terminated_at TEXT, termination_error TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(provider, resource_id)
+);
+
 CREATE TABLE IF NOT EXISTS doc_chunks (
   doc_chunk_id INTEGER PRIMARY KEY, source TEXT NOT NULL, chunk_id TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
@@ -52,3 +60,4 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
 CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_main_notifications_delivered ON main_notifications(delivered_at, notification_id);
+CREATE INDEX IF NOT EXISTS idx_cloud_resources_agent ON cloud_resources(agent_id, terminated_at);

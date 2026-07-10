@@ -8,6 +8,7 @@ import json
 import shlex
 import shutil
 import subprocess
+import sys
 from collections.abc import Sequence
 from contextlib import closing
 from itertools import islice
@@ -225,7 +226,7 @@ def build_main_agent_graph(
         db.finish_agent_session(conn, session_name=session_name, status="missing")
       raise
     command = shlex.join([
-      "uv", "run", "python", "-m", "perferox.process_host", "subagent",
+      sys.executable, "-m", "perferox.process_host", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
       "--repository", repository, "--commit", commit,
