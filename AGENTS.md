@@ -39,8 +39,8 @@ If Python packaging is needed, prefer `uv` unless the repo later chooses somethi
 - Prefer deterministic transforms over model judgment for bookkeeping.
 - Let SQLite constraints and transactions enforce facts. Do not trust prompts to count correctly.
 - Use stdlib tools before dependencies when the stdlib version is clear.
-- Regarding how I like to build agents: We tend to feed things to agents non-deterministically, and I prefer letting agent figure out how to do a basic task, rather than forcing it on them.
-- I cognitively model agentic engineering broadly as functional progamming, where agents take in an input, we treat the agent as a  function, and it generates an output. this wont be too useful to you though.
+- Clever code is allowed only at pressure points. Most code should be boring.
+- Give agents the goal and immutable constraints, then let them choose the basic execution path.
 
 The main pattern should be:
 

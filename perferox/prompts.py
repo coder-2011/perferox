@@ -84,27 +84,21 @@ runpodctl completion                                  # Auto-detect shell and in
 """
 
 SUBAGENT_SYSTEM_PROMPT = """\
-You are a worker inside an automated benchmark-fuzzing system for ML
-systems. The system's purpose is to run bounded benchmark experiments, save
-useful traces/results, and surface surprising behavior.
+You are a benchmark-fuzzing worker for ML systems. Run bounded experiments,
+save useful results, and surface surprising behavior.
 
-Your parent coordinator gives you one exact repository, commit, and goal. Treat
-the repository and commit in this system prompt as immutable facts. The host
-process owns global strategy, agent IDs, benchmark caps, stop state, database
-writes, and final pod cleanup. Do not substitute another revision, invent
-bookkeeping facts, or write SQLite directly.
+The target repository and commit in this prompt are immutable. The host owns
+strategy, IDs, caps, stop state, database writes, and pod cleanup. Do not
+substitute another revision or write SQLite directly.
 """
 
 CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
-Current phase: create one temporary RunPod pod and wait until SSH details are
-ready.
+Current phase: create one temporary RunPod pod and connect it over SSH.
 
-Choose the simplest environment likely to support the target. Building the
-repository directly is a normal path. A container is only an optional shortcut
-when it clearly saves setup work; do not search for or use one by default. If a
-container would help, use web search to inspect available images. For SGLang,
-https://hub.docker.com/r/lmsysorg/sglang/tags is a useful starting point.
+Choose the simplest environment. Building the repository is normal; a container
+is only an optional shortcut when it clearly helps. Web-search images if useful.
+For SGLang, start with https://hub.docker.com/r/lmsysorg/sglang/tags.
 
 Use local_terminal to run runpodctl commands. When runpodctl returns SSH host,
 user, and port, call connect_remote_session. When that succeeds, reply with the
@@ -114,20 +108,15 @@ shortest useful pod id, chosen environment, and SSH summary, with no tool call.
 
 SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
-Current phase: make one temporary machine ready for benchmark work. Use
-remote/setup tools for commands on the pod.
+Current phase: prepare the temporary machine. Use remote/setup tools on the pod.
 
-Set up only the repository and commit named in this system prompt. The normal
-path is to clone it into `/workspace/target`, check out the commit in detached
-HEAD state, verify it with `git rev-parse HEAD`, then follow that repository's
-own instructions to build or install it.
+Clone the exact target into `/workspace/target`, check out the commit in detached
+HEAD state, verify it with `git rev-parse HEAD`, and follow its build instructions.
 
-Docker is optional. A container may provide a convenient base environment, or
-replace the source build when it verifiably contains the exact target commit.
-Do not fail or delay setup merely because no suitable container exists. Do not
-install a different revision or unrelated implementation.
+A container is optional and may replace the source build only when it verifiably
+contains the exact commit. A missing container is not a setup failure.
 
-Do not run real benchmark experiments in setup. When the exact target is ready,
+Do not run benchmarks during setup. When the exact target is ready,
 reply "setup_ready: ..." with the verified commit and shortest useful notes. If
 setup is not worth continuing, reply "setup_failed: ..." with the blocking
 reason.
