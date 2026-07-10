@@ -8,24 +8,10 @@ Perferox is intentionally small. I think of agentic engineering as carefully dec
 
 ```mermaid
 flowchart LR
-  user["User"] --> surface["Textual TUI / CLI"]
-  surface --> runner["Host runner"]
-  runner --> main["Main agent in tmux"]
-  main --> source["Persistent ./sglang checkout"]
-  main --> workers["Benchmark subagents in tmux"]
-  workers --> pod["RunPod / Lambda instance"]
-  workers --> ssh["Host-owned SSH session"]
-  ssh --> pod
-
+  user["User"] --> surface["TUI / CLI"] --> main["Main agent"]
+  main --> workers["Benchmark subagents"] --> instance["RunPod / Lambda"]
   main <--> db[("SQLite state")]
   workers <--> db
-  main --> traces["JSONL traces"]
-  workers --> traces
-  db --> surface
-  traces --> surface
-
-  main -. "native web search" .-> web["Web"]
-  workers -. "native web search" .-> web
 ```
 
 The important split is:
@@ -95,24 +81,13 @@ Delegation takes exactly four model-supplied values: `repository`, `commit`, `go
 Each subagent receives one exact repository, commit, goal, and hard attempt cap. The graph changes its local tools by phase while web search remains available during active model phases.
 
 ```mermaid
-flowchart TD
-  start["START"] --> create["Create cloud instance"]
-  create -->|"provider CLI / connect SSH"| create_tools["Create-instance tools"]
-  create_tools --> create
-  create -->|"SSH connected"| setup["Basic setup"]
-
-  setup -->|"remote commands"| setup_tools["Setup tools"]
-  setup_tools --> setup
-  setup -->|"setup failed"| intervention["Setup intervention"]
-  intervention -->|"remote commands"| intervention_tools["Intervention tools"]
-  intervention_tools --> intervention
-  intervention -->|"retry"| setup
-
-  setup -->|"target ready"| bench["Benchmark loop"]
-  bench -->|"run / log tools"| bench_tools["Benchmark tools"]
-  bench_tools --> bench
-  bench -->|"cap, stop, or finished"| wrap["Wrap up"]
-  intervention -->|"unrecoverable"| wrap
+flowchart LR
+  start["START"] --> create["Create instance + SSH"] --> setup["Set up target"]
+  setup -->|"ready"| bench["Benchmark loop"]
+  setup -->|"retry needed"| intervention["Setup intervention"]
+  intervention --> setup
+  intervention -->|"unrecoverable"| wrap["Wrap up"]
+  bench -->|"cap, stop, or done"| wrap
   wrap --> finish["END"]
 ```
 
