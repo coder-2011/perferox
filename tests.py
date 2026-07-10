@@ -240,6 +240,8 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertIn("run_id=0", failed)
     self.assertIn("exit_code=2", failed)
     self.assertIn("benchmark exploded", self.run_row(agent_id=7)["error"])
+    self.assertIn("sglang.bench_serving", self.run_row(agent_id=7)["command"])
+    self.assertIn("sglang.benchmark.serving", self.run_row(agent_id=8)["command"])
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', succeeded)
 
   def test_experiment_logging_similarity_and_anomalies(self) -> None:

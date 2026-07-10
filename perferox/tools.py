@@ -140,11 +140,13 @@ def sglang_bench_serving(
       if overlap:
         raise ValueError(f"advanced_args repeats common fields: {', '.join(overlap)}")
       args = BenchServingArgs(**common, **request.advanced_args)
-      command = shlex.join(bench_serving_argv(args))
     except Exception as exc:
       return f"invalid bench_serving args: {type(exc).__name__}: {exc}"
     try:
       session = registry.get(session_id)
+      probe = session.run("python -c \"import importlib.util; raise SystemExit(not importlib.util.find_spec('sglang.benchmark.serving'))\"", timeout_s=30)
+      module = "sglang.benchmark.serving" if probe.exit_status == 0 else "sglang.bench_serving"
+      command = shlex.join(bench_serving_argv(args, module))
       with db.open_db(db_path) as conn:
         resource = db.active_cloud_resources(conn, agent_id=agent_id)
         if len(resource) != 1:

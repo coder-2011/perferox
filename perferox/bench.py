@@ -220,12 +220,12 @@ class ExperimentMetrics(BaseModel):
   correctness_score: float | None = Field(None, ge=0)
 
 
-def bench_serving_argv(args: BenchServingArgs) -> list[str]:
+def bench_serving_argv(args: BenchServingArgs, module: str = "sglang.benchmark.serving") -> list[str]:
   """Build the SGLang serving benchmark argv from typed fields."""
   data = args.model_dump(exclude={"timeout_s", "extra_request_body", "header"}, exclude_none=True)
   data["extra_request_body"] = json.dumps(args.extra_request_body, separators=(",", ":")) if args.extra_request_body else None
   data["header"] = [f"{key}={value}" for key, value in (args.header or {}).items()]
-  argv = ["python", "-m", "sglang.benchmark.serving"]
+  argv = ["python", "-m", module]
   for name, value in data.items():
     if value is False or value is None or value == []:
       continue
