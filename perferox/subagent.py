@@ -21,6 +21,7 @@ from perferox import db
 from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, CREATE_POD_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.tools import (
+  WEB_SEARCH_TOOL,
   connect_remote_session,
   local_terminal,
   log_anomaly_tool,
@@ -71,7 +72,8 @@ def stream_with_trace(
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
   """Return a LangGraph node that invokes one chat model step."""
-  bound_model = model.bind_tools(tools) if tools else model
+  # Native web search completes inside the model call; ToolNode handles local tools.
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
     """Invoke the model with the subagent goal in the system prompt."""
@@ -100,6 +102,8 @@ def build_subagent_graph(
   agent_id: int,
   session_registry: SessionRegistry,
   db_path: str | Path,
+  repository: str,
+  commit: str,
   attempt_cap: int = 1,
   trace_ref: str = "",
   create_pod_tools: Sequence[BaseTool] = (local_terminal,),
@@ -108,6 +112,7 @@ def build_subagent_graph(
 ) -> CompiledStateGraph:
   """Compile the fixed subagent lifecycle graph."""
   session_id = f"agent-{agent_id}"
+  target_prompt = f"\n\nTarget repository:\n{repository}\n\nTarget commit:\n{commit}"
   graph = StateGraph(SubagentState)
   remote_tool = remote_terminal(session_registry, session_id)
   create_pod_tools = [*create_pod_tools, connect_remote_session(session_registry, session_id)]
@@ -174,13 +179,15 @@ def build_subagent_graph(
     summary_prompt = (
       "Close out this Perferox benchmark subagent with a concise factual summary. "
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
-      f"Agent: {agent_id}\nObjective:\n{objective}\nLoop cap: {attempt_cap}"
+      f"Agent: {agent_id}\nRepository: {repository}\nCommit: {commit}\nObjective:\n{objective}\nLoop cap: {attempt_cap}"
     )
-    response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
+    response = model.bind_tools([WEB_SEARCH_TOOL]).invoke([SystemMessage(content=summary_prompt), *state_messages])
     summary = _message_text(response)
     _, started_attempts = runtime_status()
     row = {
       "agent_id": agent_id,
+      "repository": repository,
+      "commit": commit,
       "objective": objective,
       "summary": summary,
       "started_attempts": started_attempts,
@@ -197,7 +204,7 @@ def build_subagent_graph(
     ("setup_intervention", "setup_intervention_tools", setup_tools, SETUP_SYSTEM_PROMPT),
     ("benchmark_loop", "benchmark_tools", benchmark_tools, BENCHMARK_SYSTEM_PROMPT),
   ):
-    phase_prompt = f"{prompt}\n\nHard cap: start at most {attempt_cap} benchmark attempt(s), then summarize."
+    phase_prompt = f"{prompt}{target_prompt}\n\nHard cap: start at most {attempt_cap} benchmark attempt(s), then summarize."
     graph.add_node(name, _model_node(model, tools, phase_prompt))
     graph.add_node(tool_node, ToolNode(tools, name=tool_node))
   graph.add_node("wrap_up", wrap_up)
