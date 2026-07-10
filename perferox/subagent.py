@@ -211,7 +211,7 @@ def build_subagent_graph(
   ):
     phase_prompt = f"{prompt}{target_prompt}\n\nHard cap: start at most {attempt_cap} benchmark attempt(s), then summarize."
     graph.add_node(name, _model_node(model, tools, phase_prompt))
-    graph.add_node(tool_node, ToolNode(tools, name=tool_node))
+    graph.add_node(tool_node, ToolNode(tools, name=tool_node).with_config({"max_concurrency": 1}))
   graph.add_node("wrap_up", wrap_up)
 
   graph.add_edge(START, "create_pod")

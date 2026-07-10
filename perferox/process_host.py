@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
         # A prior coordinator may have died after reserving but before launching tmux.
-        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status = 'running' AND trace_ref = ''")
+        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status IN ('running', 'ending') AND trace_ref = ''")
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
         if session["status"] == "ending":
           return 0
@@ -142,8 +142,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
-      session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()
-      if session["status"] == "ending":
+      if conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()["status"] == "ending":
         return 0
     attempt_cap = int(args.attempt_cap)
     create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT

@@ -43,7 +43,9 @@ def refresh_sessions(conn) -> list[str]:
   alive = set((result.stdout or "").splitlines())
   missing = []
   for row in rows:
-    if row["session_name"] in alive or not db.finish_agent_session(conn, session_name=row["session_name"], status="missing", trace_ref=row["trace_ref"]):
+    if row["session_name"] in alive or subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+      continue
+    if not db.finish_agent_session(conn, session_name=row["session_name"], status="missing", trace_ref=row["trace_ref"]):
       continue
     line = f"{row['label']} tmux missing; trace {Path(row['trace_ref']).name}"
     db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)

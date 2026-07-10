@@ -151,18 +151,18 @@ class HostStateTests(DatabaseTestCase):
     self.assertIn("remote crashed", self.run_row(agent_id=2)["error"])
 
   def test_refresh_preserves_sessions_registered_after_its_snapshot(self) -> None:
-    """Keep a newly registered worker live and allow a missing worker to recover."""
+    """Keep workers registered after the list snapshot live."""
     db.record_agent_session(self.conn, session_name="old", role="subagent", agent_id=0, trace_ref="old.jsonl")
 
     def probe(*args, **kwargs):
       """Register a worker after refresh selected its candidate rows."""
+      db.record_agent_session(self.conn, session_name="old", role="subagent", agent_id=0, trace_ref="old.jsonl")
       db.record_agent_session(self.conn, session_name="new", role="subagent", agent_id=1, trace_ref="new.jsonl")
       return subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
     with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=probe):
       missing = refresh_sessions(self.conn)
-    db.record_agent_session(self.conn, session_name="old", role="subagent", agent_id=0, trace_ref="old.jsonl")
-    self.assertEqual(missing, ["agent-0 tmux missing; trace old.jsonl"])
+    self.assertEqual(missing, [])
     self.assertEqual(dict(self.conn.execute("SELECT session_name, status FROM agent_sessions")), {"old": "running", "new": "running"})
 
 class ToolAndExperimentTests(DatabaseTestCase):
@@ -259,7 +259,7 @@ class TUIWiringTests(DatabaseTestCase):
     snapshot = read_dashboard(self.db_path)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
     db.take_main_notifications(self.conn)
-    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\n", stderr="")):
+    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=[subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\n", stderr=""), subprocess.CompletedProcess([], 1)]):
       stopped = request_end(self.db_path)
       update = _wait_for_main_event(self.db_path, poll_s=0)
 
