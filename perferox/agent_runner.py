@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import shutil
 import subprocess
@@ -19,7 +20,6 @@ from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
-from perferox.tools import lambda_labs_tool, runpodctl_tool
 
 MAIN_SESSION = "perferox-main"
 
@@ -112,18 +112,19 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   registry = SessionRegistry()
   api_key = read_cloud_key(args.cloud_key_file)
   provider = cloud_provider(api_key)
-  launched_ids: set[str] = set()
+  # Expose only the selected CLI credential to local_terminal.
+  for name in ("LAMBDA_API_KEY", "RUNPOD_API_KEY"):
+    os.environ.pop(name, None)
+  os.environ["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
   try:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
     attempt_cap = int(args.attempt_cap)
-    provider_tool = lambda_labs_tool(api_key, launched_ids) if provider == "lambda" else runpodctl_tool(api_key)
     create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
     graph = build_subagent_graph(
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
-      create_pod_tools=(provider_tool,), create_pod_prompt=create_prompt,
-      attempt_cap=attempt_cap, trace_ref=str(trace_path),
+      create_pod_prompt=create_prompt, attempt_cap=attempt_cap, trace_ref=str(trace_path),
     )
     state = {"agent_id": agent_id, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
     for _ in stream_with_trace(graph, state, trace_path):
@@ -131,10 +132,6 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
-    if launched_ids:
-      output = lambda_labs_tool(api_key, set()).invoke({"arguments": ["rm", *sorted(launched_ids)]})
-      if not output.startswith("exit_code=0\n"):
-        print(f"Lambda cleanup failed: {output}")
     with closing(db.connect(db_path)) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")

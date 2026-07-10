@@ -78,35 +78,6 @@ def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) ->
   return run_local_command(command, timeout_s)
 
 
-def runpodctl_tool(api_key: str) -> BaseTool:
-  """Create a runpodctl tool with its API key bound outside model arguments."""
-  @tool("runpodctl", description="Run runpodctl with the host-bound RunPod API key. Pass arguments without the runpodctl executable name.")
-  def runpodctl(arguments: list[str], timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-    """Run one shell-safe runpodctl invocation."""
-    env = {**os.environ, "RUNPOD_API_KEY": api_key}
-    return run_local_command(shlex.join(["runpodctl", *arguments]), timeout_s, env=env)
-
-  return runpodctl
-
-
-def lambda_labs_tool(api_key: str, launched_ids: set[str]) -> BaseTool:
-  """Create a lambda-labs CLI tool with its API key bound outside model arguments."""
-  @tool("lambda_labs", description="Run lambda-labs with the host-bound Lambda API key. Pass arguments without the executable name.")
-  def lambda_labs(arguments: list[str], timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-    """Run one shell-safe lambda-labs invocation."""
-    env = {**os.environ, "LAMBDA_API_KEY": api_key}
-    output = run_local_command(shlex.join(["lambda-labs", *arguments]), timeout_s, env=env)
-    if output.startswith("exit_code=0\n") and arguments:
-      if arguments[0] == "up":
-        launched = next(line for line in output.splitlines() if line.startswith("launched "))
-        launched_ids.update(launched.removeprefix("launched ").split(", "))
-      elif arguments[0] == "rm":
-        launched_ids.difference_update(arguments[1:])
-    return output
-
-  return lambda_labs
-
-
 def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTool:
   """Create the tool that owns one host-assigned SSH session id."""
   @tool("connect_remote_session", description="Open the persistent SSH session after the selected cloud provider returns host, user, and port.")
@@ -211,7 +182,7 @@ def log_anomaly_tool(db_path: str | Path, agent_id: int) -> BaseTool:
   return log_anomaly
 
 
-def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | None = None, env: dict[str, str] | None = None) -> str:
+def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | None = None) -> str:
   """Run a local command, killing the process group on timeout."""
   try:
     process = subprocess.Popen(
@@ -222,7 +193,6 @@ def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | N
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
       cwd=cwd,
-      env=env,
       start_new_session=os.name == "posix",
     )
     stdout, stderr = process.communicate(timeout=timeout_s)

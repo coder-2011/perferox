@@ -18,11 +18,12 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
+from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, CREATE_POD_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.tools import (
   WEB_SEARCH_TOOL,
   connect_remote_session,
+  local_terminal,
   log_anomaly_tool,
   log_experiment_tool,
   remote_terminal,
@@ -104,10 +105,10 @@ def build_subagent_graph(
   repository: str,
   commit: str,
   *,
-  create_pod_tools: Sequence[BaseTool],
-  create_pod_prompt: str,
+  create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
   attempt_cap: int = 1,
   trace_ref: str = "",
+  create_pod_tools: Sequence[BaseTool] = (local_terminal,),
   setup_tools: Sequence[BaseTool] = (),
   benchmark_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:

@@ -24,7 +24,7 @@ from perferox.agent_runner import main as run_agent
 from perferox.auth import cloud_provider, read_cloud_key, write_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
-from perferox.tools import lambda_labs_tool, runpodctl_tool, sglang_bench_serving
+from perferox.tools import sglang_bench_serving
 from perferox.tui import read_dashboard, read_trace_tail, request_end
 
 
@@ -126,8 +126,8 @@ class CloudProviderTests(unittest.TestCase):
     self.assertEqual(first_request.get_header("Authorization"), "Bearer secret_test")
     self.assertEqual(json.loads(first_request.data), body)
 
-  def test_provider_key_is_one_use_and_tools_are_exclusive(self) -> None:
-    """Check provider inference, secret handoff, and model-visible tool choice."""
+  def test_provider_key_is_one_use(self) -> None:
+    """Check provider inference and secret handoff."""
     key_path = write_cloud_key("secret_lambda")
     mode = stat.S_IMODE(key_path.stat().st_mode)
     api_key = read_cloud_key(key_path)
@@ -135,13 +135,6 @@ class CloudProviderTests(unittest.TestCase):
     self.assertEqual(cloud_provider(api_key), "lambda")
     self.assertEqual(mode, 0o600)
     self.assertFalse(key_path.exists())
-    lambda_tool = lambda_labs_tool(api_key, set())
-    runpod_tool = runpodctl_tool("rpa_test")
-    self.assertEqual(lambda_tool.name, "lambda_labs")
-    self.assertEqual(runpod_tool.name, "runpodctl")
-    self.assertNotIn(api_key, json.dumps(lambda_tool.args_schema.model_json_schema()))
-    self.assertNotIn("rpa_test", json.dumps(runpod_tool.args_schema.model_json_schema()))
-
     with tempfile.TemporaryDirectory() as directory, patch("perferox.agent_runner.shutil.which", return_value="/usr/bin/tmux"), patch(
       "perferox.agent_runner.subprocess.run",
       side_effect=(subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0, "", "")),
