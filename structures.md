@@ -13,7 +13,7 @@ flowchart LR
   runner --> main["Main agent in tmux"]
   main --> source["Persistent ./sglang checkout"]
   main --> workers["Benchmark subagents in tmux"]
-  workers --> pod["RunPod machine"]
+  workers --> pod["RunPod / Lambda instance"]
   workers --> ssh["Host-owned SSH session"]
   ssh --> pod
 
@@ -49,7 +49,7 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
-The TUI and CLI both launch `perferox.agent_runner`. The runner creates persistent tmux processes so the UI can exit or reconnect without owning the agent loop.
+The TUI and CLI both launch `perferox.agent_runner`. The API-key prefix selects RunPod or Lambda, and the runner passes the key to detached tmux processes through a one-use file. Workers expose only the selected provider's environment variable.
 
 The main process uses two roots:
 
@@ -96,8 +96,8 @@ Each subagent receives one exact repository, commit, goal, and hard attempt cap.
 
 ```mermaid
 flowchart TD
-  start["START"] --> create["Create RunPod pod"]
-  create -->|"runpodctl / connect SSH"| create_tools["Create-pod tools"]
+  start["START"] --> create["Create cloud instance"]
+  create -->|"provider CLI / connect SSH"| create_tools["Create-instance tools"]
   create_tools --> create
   create -->|"SSH connected"| setup["Basic setup"]
 
@@ -118,7 +118,7 @@ flowchart TD
 
 The normal setup path is:
 
-1. choose a RunPod environment
+1. choose a RunPod or Lambda environment
 2. optionally use a container when it clearly reduces setup work
 3. clone the delegated repository into `/workspace/target`
 4. check out the exact commit in detached HEAD state
@@ -131,7 +131,7 @@ Worker tools are deliberately phase-scoped:
 
 | Phase | Mutating capabilities |
 | --- | --- |
-| create pod | local `runpodctl`, connect host SSH session |
+| create instance | local `runpodctl` or `lambda-labs`, connect host SSH session |
 | setup / intervention | remote shell over the registered SSH session |
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
@@ -211,5 +211,6 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
 | `remote.py` | Paramiko SSH session and in-process session registry |
-| `auth.py` | persisted ChatGPT OAuth and Codex chat model construction |
-| `prompts.py` | RunPod reference and phase-specific worker constraints |
+| `auth.py` | persisted ChatGPT OAuth, cloud-key validation and one-use handoff |
+| `prompts.py` | provider-specific instance creation and worker constraints |
+| `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |
