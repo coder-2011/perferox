@@ -56,23 +56,36 @@ _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 class BenchServingArgs(BaseModel):
   """Typed inputs for SGLang's serving benchmark CLI."""
 
-  model_config = ConfigDict(extra="forbid")
+  model_config = ConfigDict(
+    extra="forbid",
+    json_schema_extra={
+      "examples": [{
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "dataset_name": "random",
+        "random_input_len": 1024,
+        "random_output_len": 256,
+        "num_prompts": 100,
+        "host": "127.0.0.1",
+        "port": 30000,
+      }],
+    },
+  )
 
   backend: BenchBackend = Field("sglang", description="Serving backend/API shape to benchmark.")
-  base_url: str | None = Field(None, description="Full server base URL; use instead of host/port when needed.")
-  host: str | None = Field(None, description="Server host when base_url is not provided.")
-  port: int | None = Field(None, ge=1, le=65535, description="Server port when base_url is not provided.")
+  base_url: str | None = Field(None, description="Full server base URL; use instead of host/port when needed.", examples=["http://127.0.0.1:30000"])
+  host: str | None = Field(None, description="Server host when base_url is not provided; SGLang normally uses 127.0.0.1.", examples=["127.0.0.1"])
+  port: int | None = Field(None, ge=1, le=65535, description="Server port when base_url is not provided; SGLang normally uses 30000.", examples=[30000])
   ready_check_timeout_sec: int | None = Field(None, ge=0, description="Seconds to wait for readiness; 0 skips readiness polling.")
-  dataset_name: BenchDataset = Field("sharegpt", description="Dataset generator or dataset format.")
-  dataset_path: str | None = Field(None, description="Path to dataset file when the selected dataset needs one.")
+  dataset_name: BenchDataset = Field("sharegpt", description="Dataset generator or format; random is the simplest self-contained smoke test.")
+  dataset_path: str | None = Field(None, description="Dataset file path; ShareGPT downloads its default data when omitted.")
   dataset_offset: int | None = Field(None, description="Rotate agentic-trace conversations by this many entries.")
   agentic_max_turns: int | None = Field(None, ge=1, description="Maximum turns per agentic-trace conversation.")
   speed_bench_category: Literal["low_entropy", "mixed", "high_entropy"] | None = Field(None, description="speed-bench category filter.")
   speed_bench_output_len: int | None = Field(None, ge=1, description="Fixed speed-bench output length.")
-  model: str | None = Field(None, description="Model name or path.")
+  model: str | None = Field(None, description="Exact served model name or path; normally pass this explicitly.", examples=["meta-llama/Llama-3.1-8B-Instruct"])
   served_model_name: str | None = Field(None, description="Model name exposed by the serving API.")
   tokenizer: str | None = Field(None, description="Tokenizer name or path.")
-  num_prompts: int | None = Field(None, ge=1, description="Number of benchmark requests.")
+  num_prompts: int = Field(..., ge=1, description="Number of benchmark requests; required to bound the run.", examples=[100])
   sharegpt_output_len: int | None = Field(None, ge=4, description="Override ShareGPT output length.")
   sharegpt_context_len: int | None = Field(None, ge=1, description="Drop ShareGPT requests longer than this context length.")
   random_input_len: int | None = Field(None, ge=1, description="Random/image dataset input tokens per request.")
@@ -90,8 +103,8 @@ class BenchServingArgs(BaseModel):
   request_rate: float | None = Field(None, gt=0, description="Requests per second; omit for bench_serving's all-at-once default.")
   use_trace_timestamps: bool = Field(False, description="Replay mooncake trace timestamps.")
   max_concurrency: int | None = Field(None, ge=0, description="Maximum concurrent in-flight requests; 0 behaves like unset.")
-  output_file: str | None = Field(None, description="JSONL output file path.")
-  output_details: bool = Field(True, description="Write per-request benchmark details.")
+  output_file: str | None = Field(None, description="JSONL output path; SGLang chooses a name when details are enabled and this is omitted.")
+  output_details: bool = Field(True, description="Write per-request inputs, outputs, errors, and latency details.")
   print_requests: bool = Field(False, description="Print each request while benchmarking.")
   disable_tqdm: bool = Field(False, description="Disable tqdm progress bar.")
   disable_stream: bool = Field(False, description="Use non-streaming requests where supported.")
@@ -100,7 +113,7 @@ class BenchServingArgs(BaseModel):
   token_ids_logprob: list[TokenId] | None = Field(None, description="Specific token IDs to probe for logprob.")
   logprob_start_len: int | None = Field(None, ge=-1, description="Input logprob start position; -1 disables input logprobs.")
   return_routed_experts: bool = Field(False, description="Return routed expert metadata.")
-  cache_report: bool = Field(True, description="Collect cache hit statistics.")
+  cache_report: bool = Field(True, description="Collect cache hit statistics; useful for SGLang backends when the server enables cache reporting.")
   seed: int | None = Field(None, ge=0, le=4294967295, description="Random seed accepted by numpy.")
   disable_ignore_eos: bool = Field(False, description="Respect EOS instead of forcing fixed output length.")
   temperature: float | None = Field(None, ge=0, description="Sampling temperature.")
@@ -145,7 +158,7 @@ class BenchServingArgs(BaseModel):
   fake_prefill: bool = Field(False, description="Use fake prefill mode for decode-only benchmarking.")
   tag: str | None = Field(None, description="Tag written to benchmark output.")
   header: dict[str, str] | None = Field(None, description="Custom HTTP headers as key/value pairs.")
-  timeout_s: float | None = Field(BENCH_TIMEOUT_S, gt=0, description="Host-side SSH command timeout; not a bench_serving flag.")
+  timeout_s: float = Field(BENCH_TIMEOUT_S, gt=0, le=BENCH_TIMEOUT_S, description="Host-side SSH timeout, capped at six hours; not a bench_serving flag.")
 
   @model_validator(mode="after")
   def check_serving_constraints(self) -> Self:
@@ -170,6 +183,54 @@ class BenchServingArgs(BaseModel):
       requirement = "lora_name" if not self.lora_name else "more than one lora_name"
       raise ValueError(f"distinct/skewed LoRA distribution requires {requirement}")
     return self
+
+
+class BenchmarkRunArgs(BaseModel):
+  """Expose a compact common-case benchmark schema with validated advanced flags."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  intent_key: str = Field(..., min_length=3, description="Concise semantic purpose that distinguishes this experiment.", examples=["random 1k input latency at concurrency 32"])
+  hardware_config: str = Field(..., min_length=2, description="Observed GPU or machine type, not the resource ID.", examples=["NVIDIA A100-SXM4-80GB"])
+  server_config: str = Field(..., min_length=2, description="Exact server launch configuration that can affect results.", examples=["python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --tp 1"])
+  num_prompts: int = Field(..., ge=1, description="Number of requests; required to bound the run.", examples=[100])
+  model: str | None = Field(None, description="Exact served model name or path.")
+  backend: BenchBackend = Field("sglang", description="Serving backend/API shape.")
+  base_url: str | None = Field(None, description="Full server URL; use instead of host/port when needed.")
+  host: str | None = Field(None, description="Server host, normally 127.0.0.1.")
+  port: int | None = Field(None, ge=1, le=65535, description="Server port, normally 30000.")
+  dataset_name: BenchDataset = Field("sharegpt", description="Dataset generator or format; random is self-contained.")
+  dataset_path: str | None = Field(None, description="Dataset file path when required.")
+  random_input_len: int | None = Field(None, ge=1, description="Random dataset input tokens.")
+  random_output_len: int | None = Field(None, ge=0, description="Random dataset output tokens.")
+  request_rate: float | None = Field(None, gt=0, description="Requests per second; omit for all-at-once.")
+  max_concurrency: int | None = Field(None, ge=0, description="Maximum in-flight requests.")
+  seed: int | None = Field(None, ge=0, le=4294967295)
+  output_details: bool = Field(True, description="Write per-request details.")
+  cache_report: bool = Field(True, description="Collect cache hit statistics.")
+  timeout_s: float = Field(BENCH_TIMEOUT_S, gt=0, le=BENCH_TIMEOUT_S, description="Host SSH timeout, capped at six hours.")
+  advanced_args: dict[str, Any] = Field(default_factory=dict, description="Rare BenchServingArgs fields only; names and values are still strictly validated.")
+
+
+class ExperimentMetrics(BaseModel):
+  """Expose the normalized metric keys accepted by SQLite to the model."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  request_rps: float | None = Field(None, ge=0)
+  input_tps: float | None = Field(None, ge=0)
+  output_tps: float | None = Field(None, ge=0)
+  ttft_p50_ms: float | None = Field(None, ge=0)
+  ttft_p99_ms: float | None = Field(None, ge=0)
+  tpot_p50_ms: float | None = Field(None, ge=0)
+  tpot_p99_ms: float | None = Field(None, ge=0)
+  error_rate: float | None = Field(None, ge=0, le=1)
+  cache_hit_rate: float | None = Field(None, ge=0, le=1)
+  peak_gpu_mem_gb: float | None = Field(None, ge=0)
+  startup_s: float | None = Field(None, ge=0)
+  warmup_s: float | None = Field(None, ge=0)
+  accept_length: float | None = Field(None, ge=0)
+  correctness_score: float | None = Field(None, ge=0)
 
 
 def bench_serving_argv(args: BenchServingArgs) -> list[str]:

@@ -5,16 +5,18 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 from collections.abc import Sequence
 from itertools import islice
 from pathlib import Path
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -24,9 +26,14 @@ from langgraph.prebuilt import ToolNode
 from perferox import db
 from perferox.auth import write_cloud_key
 from perferox.semantic import document_index
-from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
+from perferox.tools import WEB_SEARCH_TOOL, cleanup_cloud_resources, run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
+MAX_ATTEMPTS_PER_SUBAGENT = 8
+MAX_OBJECTIVE_ATTEMPTS = 24
+MAX_MAIN_MESSAGES = 24
+MAX_MAIN_MODEL_CALLS = 32
+MAX_EXPLORER_LINES = 120
 MAX_EXPLORER_LINE_CHARS = 120
 MAX_FILE_LINES = 240
 SQL_ROW_LIMIT = 100
@@ -57,11 +64,19 @@ documentation.
 """
 
 
+def _merge_messages(left: list[AnyMessage], right: list[AnyMessage]) -> list[AnyMessage]:
+  """Merge coordinator messages while retaining a protocol-valid recent window."""
+  recent = list(add_messages(left, right)[-MAX_MAIN_MESSAGES:])
+  while recent and recent[0].type == "tool":
+    recent.pop(0)
+  return recent
+
+
 class MainAgentState(TypedDict, total=False):
   """Graph-safe state for the main coordinator."""
 
   objective: str
-  messages: Annotated[list[AnyMessage], add_messages]
+  messages: Annotated[list[AnyMessage], _merge_messages]
 
 
 def build_main_agent_graph(
@@ -74,6 +89,7 @@ def build_main_agent_graph(
   runtime_cwd: str | Path | None = None,
   trace_dir: str | Path = "traces",
   extra_tools: Sequence[BaseTool] = (),
+  checkpointer: Any = None,
 ) -> CompiledStateGraph:
   """Compile the main coordinator graph with ExplorerState hydration."""
   root = Path(cwd).resolve()
@@ -86,6 +102,7 @@ def build_main_agent_graph(
 
   with db.open_db(database) as conn:
     db.init_db(conn)
+  reserved_attempts = 0
 
   def refresh_sessions(conn) -> None:
     """Mark running tmux sessions missing when tmux no longer has them."""
@@ -101,6 +118,10 @@ def build_main_agent_graph(
       if alive:
         continue
       if db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
+        if row["agent_id"] is not None:
+          cleanup_errors = cleanup_cloud_resources(database, int(row["agent_id"]), cloud_provider, cloud_api_key)
+          if cleanup_errors:
+            db.append_explorer_state(conn, agent_id=row["agent_id"], line=_shorten(f"resource cleanup failed: {'; '.join(cleanup_errors)}", MAX_EXPLORER_LINE_CHARS))
         label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
         line = _shorten(f"{label} tmux missing; trace {Path(row['trace_ref']).name}", MAX_EXPLORER_LINE_CHARS)
         db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
@@ -145,7 +166,7 @@ def build_main_agent_graph(
         rows = cursor.fetchmany(row_limit)
     except Exception as exc:
       return f"query_sql failed: {type(exc).__name__}: {exc}"
-    return json.dumps([dict(row) for row in rows], indent=2, default=str)
+    return _shorten(json.dumps([dict(row) for row in rows], indent=2, default=str), 5000)
 
   @tool("query_sglang_docs", description="Search locally ingested SGLang docs chunks by semantic similarity.")
   def query_sglang_docs(query: str, limit: int = 5) -> str:
@@ -177,11 +198,11 @@ def build_main_agent_graph(
       return f"query_intent_embeddings failed: {type(exc).__name__}: {exc}"
     return json.dumps(matches, indent=2, default=str) if matches else "no logged experiment intent embeddings"
 
-  @tool("read_explorer_state", description="Read all compact ExplorerState lines.")
+  @tool("read_explorer_state", description=f"Read the most recent {MAX_EXPLORER_LINES} compact ExplorerState lines.")
   def read_explorer_state() -> str:
-    """Return the full compact ExplorerState ledger."""
+    """Return the bounded recent ExplorerState ledger."""
     with db.open_db(database, readonly=True) as conn:
-      lines = db.read_explorer_state(conn)
+      lines = db.read_explorer_state(conn, MAX_EXPLORER_LINES)
     return "\n".join(lines) if lines else "(empty)"
 
   @tool("write_explorer_state", description="Append exactly one compact ExplorerState line, ideally 10-15 high-quality words.")
@@ -199,13 +220,20 @@ def build_main_agent_graph(
   @tool("delegate_benchmark_subagent", description="Start one benchmark subagent for an exact repository commit, goal, and attempt cap.")
   def delegate_benchmark_subagent(repository: str, commit: str, goal: str, attempt_cap: int) -> str:
     """Start one tmux-wrapped benchmark subagent for an exact revision."""
+    nonlocal reserved_attempts
     if attempt_cap < 1:
       return "attempt_cap must be >= 1"
+    if attempt_cap > MAX_ATTEMPTS_PER_SUBAGENT:
+      return f"attempt_cap must be <= {MAX_ATTEMPTS_PER_SUBAGENT}"
+    if reserved_attempts + attempt_cap > MAX_OBJECTIVE_ATTEMPTS:
+      return f"objective attempt budget exhausted ({reserved_attempts}/{MAX_OBJECTIVE_ATTEMPTS} reserved)"
     repository = repository.strip()
     commit = commit.strip()
     goal = goal.strip()
     if not repository or not commit or not goal:
       return "repository, commit, and goal must not be empty"
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", commit) is None:
+      return "commit must be a 7-40 character hexadecimal Git revision"
     tmux = shutil.which("tmux")
     if tmux is None:
       return "tmux is not installed or not on PATH"
@@ -228,7 +256,7 @@ def build_main_agent_graph(
         db.finish_agent_session(conn, session_name=session_name, status="missing")
       raise
     command = shlex.join([
-      "uv", "run", "python", "-m", "perferox.process_host", "subagent",
+      sys.executable, "-m", "perferox.process_host", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
       "--repository", repository, "--commit", commit,
@@ -255,6 +283,7 @@ def build_main_agent_graph(
       return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
     with db.open_db(database) as conn:
       db.activate_subagent(conn, agent_id=agent_id, trace_ref=str(trace_path))
+    reserved_attempts += attempt_cap
     line = _shorten(f"start agent-{agent_id} {repository}@{commit} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
     with db.open_db(database) as conn:
       db.append_explorer_state(conn, agent_id=None, line=line)
@@ -273,36 +302,49 @@ def build_main_agent_graph(
     *extra_tools,
   ]
   # Native web search executes server-side and never enters the local ToolNode.
-  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=False)
+  model_calls = 0
 
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""
+    nonlocal model_calls
+    if model_calls >= MAX_MAIN_MODEL_CALLS:
+      return {"messages": [AIMessage(content="objective host model-turn cap reached; exiting after active workers finish")]}
+    model_calls += 1
     with db.open_db(database) as conn:
       refresh_sessions(conn)
-      lines = db.read_explorer_state(conn)
+      lines = db.read_explorer_state(conn, MAX_EXPLORER_LINES)
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
     objective = state.get("objective", "") or "(none)"
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
     system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=objective), *state.get("messages", [])]
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=objective), *state.get("messages", [])[-MAX_MAIN_MESSAGES:]]
     return {"messages": [bound_model.invoke(messages)]}
 
-  def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
-    """Stop before another tool call once the host accepted End."""
+  def route_after_main(state: MainAgentState) -> Literal["tools", "cancel_tools", "__end__"]:
+    """Resolve pending calls before stopping after an accepted End."""
     if not getattr(state["messages"][-1], "tool_calls", None):
       return END
     with db.open_db(database, readonly=True) as conn:
       row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()
-    return END if row is not None and row["status"] == "ending" else "tools"
+    return "cancel_tools" if row is not None and row["status"] == "ending" else "tools"
+
+  def cancel_tools(state: MainAgentState) -> dict[str, list[ToolMessage]]:
+    """Resolve coordinator calls that arrived after a soft stop."""
+    calls = getattr(state["messages"][-1], "tool_calls", ())
+    messages = [ToolMessage(content="stop requested; tool call cancelled", tool_call_id=call["id"], name=call["name"]) for call in calls]
+    return {"messages": messages}
 
   graph = StateGraph(MainAgentState)
   graph.add_node("main", call_model)
   graph.add_node("tools", ToolNode(tools, name="main_tools"))
+  graph.add_node("cancel_tools", cancel_tools)
   graph.add_edge(START, "main")
   graph.add_conditional_edges("main", route_after_main)
   graph.add_edge("tools", "main")
-  return graph.compile(name="perferox_main_agent")
+  graph.add_edge("cancel_tools", END)
+  return graph.compile(name="perferox_main_agent", checkpointer=checkpointer)
 
 
 def _shorten(text: str, limit: int = 80) -> str:

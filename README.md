@@ -7,7 +7,7 @@
 </p>
 
 
-Perferox is a simple performance fuzzer for AI systems software, to try to spot performance bugs in prod systems. It can be used as a CI, always running agent, or extensive performance testing for package releases.
+Perferox is a simple performance fuzzer for AI systems software, to try to spot performance bugs in prod systems. It can be used in CI, scheduled objective runs, or extensive performance testing for package releases.
 
 It is geared towards:
 - Kernel libraries

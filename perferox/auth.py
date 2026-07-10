@@ -63,13 +63,18 @@ def ensure_chatgpt_auth(timeout_s: float = 300.0) -> bool:
   return True
 
 
-def build_chat_model(model: str | None = None):
-  """Build Perferox's OAuth-backed LangChain chat model."""
+def build_chat_model(model: str | None = None, *, role: str = "main"):
+  """Build the role-tuned OAuth-backed LangChain chat model."""
   from langchain_openai.chat_models.codex import _ChatOpenAICodex
   provider = _chatgpt_provider()
-  model_name = model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
+  if role not in {"main", "subagent"}:
+    raise ValueError(f"unknown model role: {role}")
+  is_subagent = role == "subagent"
+  role_model = os.environ.get("PERFEROX_SUBAGENT_MODEL") if is_subagent else None
+  model_name = model or role_model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
   return _ChatOpenAICodex(
     model=model_name,
     originator="perferox",
+    reasoning_effort="medium" if is_subagent else "high",
     token_provider=provider,
   )

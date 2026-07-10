@@ -188,11 +188,13 @@ def _doctor(cwd: Path, db_path: Path) -> int:
   """Check local launch requirements without model or cloud API calls."""
   uv = shutil.which("uv")
   tmux = shutil.which("tmux")
+  git = shutil.which("git")
   authenticated = chatgpt_auth_ready()
   checks = [
     ("workspace", "ok" if cwd.is_dir() else "fail", str(cwd)),
     ("uv", "ok" if uv else "fail", uv or "not found"),
     ("tmux", "ok" if tmux else "fail", tmux or "not found"),
+    ("git", "ok" if git else "fail", git or "not found"),
     ("ChatGPT OAuth", "ok" if authenticated else "fail", "authenticated" if authenticated else "run `perferox login`"),
   ]
   try:
@@ -203,17 +205,27 @@ def _doctor(cwd: Path, db_path: Path) -> int:
     checks.append(("SQLite", "fail", f"{type(exc).__name__}: {exc}"))
 
   configured = []
+  configured_providers = []
   for env_name, expected in (("RUNPOD_API_KEY", "runpod"), ("LAMBDA_API_KEY", "lambda")):
     api_key = os.environ.get(env_name)
     if not api_key:
       continue
     try:
-      configured.append(expected if cloud_provider(api_key) == expected else f"invalid {env_name}")
+      if cloud_provider(api_key) == expected:
+        configured.append(expected)
+        configured_providers.append(expected)
+      else:
+        configured.append(f"invalid {env_name}")
     except ValueError:
       configured.append(f"invalid {env_name}")
   invalid_cloud = any(item.startswith("invalid") for item in configured)
   cloud_state = "fail" if invalid_cloud else "ok" if configured else "warn"
   checks.append(("cloud key", cloud_state, ", ".join(configured) if configured else "prompted when a run starts"))
+  for provider, command in (("runpod", "runpodctl"), ("lambda", "lambda-labs")):
+    executable = shutil.which(command)
+    required = provider in configured_providers
+    state = "ok" if executable else "fail" if required else "warn"
+    checks.append((f"{provider} CLI", state, executable or ("required by configured key" if required else "not found")))
   checkout_ready = (cwd / "sglang" / ".git").is_dir()
   checks.append(("SGLang checkout", "ok" if checkout_ready else "warn", "ready" if checkout_ready else "cloned on first run"))
 

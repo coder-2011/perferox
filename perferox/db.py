@@ -8,7 +8,7 @@ import math
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 _EMBEDDER = None
@@ -19,6 +19,9 @@ _METRIC_COLUMNS_SQL = ", ".join(METRIC_COLUMNS)
 _METRIC_PLACEHOLDERS_SQL = ", ".join("?" for _ in METRIC_COLUMNS)
 _METRIC_SELECT_SQL = ", ".join(f"e.{column}" for column in METRIC_COLUMNS)
 _RATE_COLUMNS = {"error_rate", "cache_hit_rate"}
+INTENT_SIMILARITY_THRESHOLD = 0.90
+NOTIFICATION_CLAIM_SECONDS = 300
+MAX_NOTIFICATION_VALUE_CHARS = 1000
 
 
 def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
@@ -49,6 +52,66 @@ def init_db(conn: sqlite3.Connection) -> None:
   """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
+  _migrate_schema(conn)
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+  """Add current run and notification fields to existing databases."""
+  run_columns = {
+    "repository": "TEXT NOT NULL DEFAULT ''",
+    "target_commit": "TEXT NOT NULL DEFAULT ''",
+    "provider": "TEXT NOT NULL DEFAULT ''",
+    "resource_config": "TEXT NOT NULL DEFAULT ''",
+    "hardware_config": "TEXT NOT NULL DEFAULT ''",
+    "server_config": "TEXT NOT NULL DEFAULT ''",
+    "spec_hash": "TEXT NOT NULL DEFAULT ''",
+    "intent_key": "TEXT NOT NULL DEFAULT ''",
+    "intent_embedding": "TEXT NOT NULL DEFAULT ''",
+  }
+  existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+  for name, declaration in run_columns.items():
+    if name not in existing:
+      conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
+  notification_columns = {row["name"] for row in conn.execute("PRAGMA table_info(main_notifications)")}
+  if "claimed_at" not in notification_columns:
+    conn.execute("ALTER TABLE main_notifications ADD COLUMN claimed_at TEXT")
+  # Historical rows retain their command hash and experiment intent as the best available identity.
+  conn.execute("UPDATE runs SET spec_hash = exact_hash WHERE spec_hash = ''")
+  experiment_columns = {row["name"] for row in conn.execute("PRAGMA table_info(experiments)")}
+  if {"intent_key", "intent_embedding"} <= experiment_columns:
+    conn.execute(
+      """
+      UPDATE runs SET
+        intent_key = COALESCE((SELECT intent_key FROM experiments e WHERE e.agent_id = runs.agent_id AND e.run_id = runs.run_id), ''),
+        intent_embedding = COALESCE((SELECT intent_embedding FROM experiments e WHERE e.agent_id = runs.agent_id AND e.run_id = runs.run_id), '')
+      WHERE intent_key = ''
+      """
+    )
+    # Rebuild once so future writes have one canonical owner for intent data.
+    conn.executescript(
+      f"""
+      ALTER TABLE experiments RENAME TO experiments_legacy;
+      CREATE TABLE experiments (
+        agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL,
+        request_rps REAL, input_tps REAL, output_tps REAL,
+        ttft_p50_ms REAL, ttft_p99_ms REAL, tpot_p50_ms REAL, tpot_p99_ms REAL,
+        error_rate REAL, cache_hit_rate REAL, peak_gpu_mem_gb REAL,
+        startup_s REAL, warmup_s REAL, accept_length REAL, correctness_score REAL,
+        PRIMARY KEY(agent_id, run_id),
+        FOREIGN KEY(agent_id, run_id) REFERENCES runs(agent_id, run_id)
+      );
+      INSERT INTO experiments(agent_id, run_id, {_METRIC_COLUMNS_SQL})
+      SELECT agent_id, run_id, {_METRIC_COLUMNS_SQL} FROM experiments_legacy;
+      DROP TABLE experiments_legacy;
+      """
+    )
+  resource_columns = {row["name"] for row in conn.execute("PRAGMA table_info(cloud_resources)")}
+  if "environment" not in resource_columns:
+    conn.execute("ALTER TABLE cloud_resources ADD COLUMN environment TEXT NOT NULL DEFAULT '{}'")
+  conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_spec_hash ON runs(spec_hash)")
+  conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_intent_key ON runs(intent_key)")
+  conn.execute("CREATE INDEX IF NOT EXISTS idx_main_notifications_claimed ON main_notifications(delivered_at, claimed_at, notification_id)")
+  conn.commit()
 
 
 def embed_intent(intent_key: str) -> list[float]:
@@ -60,9 +123,12 @@ def embed_intent(intent_key: str) -> list[float]:
   return list(map(float, _EMBEDDER.encode(intent_key, normalize_embeddings=True)))
 
 
-def read_explorer_state(conn: sqlite3.Connection) -> list[str]:
-  """Return compact ExplorerState lines in insertion order."""
-  return [row["line"] for row in conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id")]
+def read_explorer_state(conn: sqlite3.Connection, limit: int | None = None) -> list[str]:
+  """Return all or a bounded recent ExplorerState window in insertion order."""
+  if limit is None:
+    return [row["line"] for row in conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id")]
+  rows = conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id DESC LIMIT ?", (limit,)).fetchall()
+  return [row["line"] for row in reversed(rows)]
 
 
 def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, line: str) -> int:
@@ -100,14 +166,18 @@ def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: s
 def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str) -> bool:
   """Mark a tmux-wrapped agent process as exited or missing."""
   with conn:
-    return conn.execute(
+    row = conn.execute(
       """
       UPDATE agent_sessions
       SET status = ?
       WHERE session_name = ? AND status IN ('starting', 'running', 'ending')
+      RETURNING agent_id
       """,
       (status, session_name),
-    ).rowcount == 1
+    ).fetchone()
+    if row is not None and row["agent_id"] is not None and status in {"failed", "missing"}:
+      _fail_unfinished_runs(conn, int(row["agent_id"]), f"worker session {status}: {session_name}")
+  return row is not None
 
 
 def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
@@ -180,27 +250,62 @@ def activate_subagent(conn: sqlite3.Connection, *, agent_id: int, trace_ref: str
     )
 
 
-def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
-  """Return unread write notifications and mark them delivered."""
+def claim_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+  """Lease unread notifications without acknowledging their delivery."""
+  if limit < 1:
+    return []
+  claimed_at = datetime.now(UTC)
+  stale_before = claimed_at - timedelta(seconds=NOTIFICATION_CLAIM_SECONDS)
   with conn:
+    # Serialize selection and claiming so two main loops cannot consume one event.
+    conn.execute("BEGIN IMMEDIATE")
     rows = conn.execute(
       """
-      SELECT * FROM main_notifications
+      SELECT notification_id FROM main_notifications
       WHERE delivered_at IS NULL
+        AND (claimed_at IS NULL OR claimed_at < ?)
       ORDER BY notification_id
       LIMIT ?
       """,
-      (limit,),
+      (stale_before.isoformat(timespec="seconds"), limit),
     ).fetchall()
-    if rows:
-      # Mark exactly the rows read above so concurrent consumers cannot lose events.
-      delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
-      placeholders = ",".join("?" for _ in rows)
-      conn.execute(
-        f"UPDATE main_notifications SET delivered_at = ? WHERE notification_id IN ({placeholders})",
-        (delivered_at, *(row["notification_id"] for row in rows)),
-      )
-  return rows
+    if not rows:
+      return []
+    notification_ids = [int(row["notification_id"]) for row in rows]
+    placeholders = ",".join("?" for _ in notification_ids)
+    conn.execute(
+      f"UPDATE main_notifications SET claimed_at = ? WHERE notification_id IN ({placeholders})",
+      (claimed_at.isoformat(timespec="seconds"), *notification_ids),
+    )
+    return conn.execute(
+      f"SELECT * FROM main_notifications WHERE notification_id IN ({placeholders}) ORDER BY notification_id",
+      notification_ids,
+    ).fetchall()
+
+
+def ack_main_notifications(conn: sqlite3.Connection, notification_ids: list[int]) -> int:
+  """Acknowledge successfully processed notification rows."""
+  if not notification_ids:
+    return 0
+  placeholders = ",".join("?" for _ in notification_ids)
+  delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    cursor = conn.execute(
+      f"UPDATE main_notifications SET delivered_at = ?, claimed_at = NULL WHERE delivered_at IS NULL AND notification_id IN ({placeholders})",
+      (delivered_at, *notification_ids),
+    )
+  return cursor.rowcount
+
+
+def release_main_notification_claims(conn: sqlite3.Connection) -> int:
+  """Release unacknowledged leases when the singleton main process starts."""
+  with conn:
+    return conn.execute("UPDATE main_notifications SET claimed_at = NULL WHERE delivered_at IS NULL AND claimed_at IS NOT NULL").rowcount
+
+
+def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+  """Claim unread notifications for compatibility with existing callers."""
+  return claim_main_notifications(conn, limit)
 
 
 def notify_main(
@@ -213,6 +318,7 @@ def notify_main(
   row: Mapping[str, object] | sqlite3.Row,
 ) -> None:
   """Queue one host event for the main agent to inspect."""
+  compact_row = _compact_notification_row(row)
   conn.execute(
     """
     INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json)
@@ -224,24 +330,65 @@ def notify_main(
       run_id,
       kind,
       table_name,
-      json.dumps(dict(row), separators=(",", ":"), default=str),
+      json.dumps(compact_row, separators=(",", ":"), default=str),
     ),
   )
+
+
+def _compact_notification_row(row: Mapping[str, object] | sqlite3.Row) -> dict[str, object]:
+  """Remove vectors and bound large values in one notification payload."""
+  compact = {}
+  for key, value in dict(row).items():
+    if key in {"embedding", "intent_embedding"}:
+      continue
+    if isinstance(value, str) and len(value) > MAX_NOTIFICATION_VALUE_CHARS:
+      value = value[:MAX_NOTIFICATION_VALUE_CHARS] + "..."
+    compact[key] = value
+  return compact
 
 
 def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
   agent_id: int,
+  repository: str,
+  target_commit: str,
+  provider: str,
+  resource_config: Mapping[str, object] | str,
+  hardware_config: Mapping[str, object] | str,
+  server_config: Mapping[str, object] | str,
   command: str,
+  intent_key: str,
   trace_ref: str = "",
   attempt_cap: int | None = None,
 ) -> int:
-  """Assign the next run id and insert the started benchmark row."""
-  exact_hash = hashlib.sha256(command.encode()).hexdigest()
+  """Reserve a non-duplicate benchmark intent and full experiment spec."""
+  repository = repository.strip()
+  target_commit = target_commit.strip()
+  provider = provider.strip()
+  command = command.strip()
+  intent_key = " ".join(intent_key.split())
+  if not all((repository, target_commit, provider, command, intent_key)):
+    raise ValueError("repository, target_commit, provider, command, and intent_key must not be empty")
+  resource = _canonical_config("resource_config", resource_config)
+  hardware = _canonical_config("hardware_config", hardware_config)
+  server = _canonical_config("server_config", server_config)
+  spec = {
+    "repository": repository,
+    "target_commit": target_commit,
+    "provider": provider,
+    "resource_config": resource,
+    "hardware_config": hardware,
+    "server_config": server,
+    "command": command,
+  }
+  spec_json = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+  spec_hash = hashlib.sha256(spec_json.encode()).hexdigest()
+  intent_embedding = embed_intent(intent_key)
+  intent_json = json.dumps(intent_embedding, separators=(",", ":"))
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
-    # Serialize the stop/cap checks and run-id assignment with the insert.
+    # Serialize stop, cap, repeat checks, run-id assignment, and reservation.
     conn.execute("BEGIN IMMEDIATE")
     if stop_requested(conn, agent_id=agent_id):
       raise ValueError("stop requested; wrap up")
@@ -252,18 +399,106 @@ def start_benchmark_run(
       ).fetchone()[0]
       if attempts >= attempt_cap:
         raise ValueError(f"attempt cap reached ({attempts}/{attempt_cap}); wrap up")
+    duplicate = conn.execute(
+      """
+      SELECT r.agent_id, r.run_id FROM runs r
+      WHERE r.spec_hash = ? AND r.error = ''
+        AND (r.finished_at IS NULL OR EXISTS (
+          SELECT 1 FROM experiments e WHERE e.agent_id = r.agent_id AND e.run_id = r.run_id
+        ))
+      LIMIT 1
+      """,
+      (spec_hash,),
+    ).fetchone()
+    if duplicate is not None:
+      raise ValueError(f"exact experiment already active or successful: agent_id={duplicate['agent_id']} run_id={duplicate['run_id']}")
+    similar = _find_blocking_intent(
+      conn,
+      intent_embedding,
+      repository=repository,
+      target_commit=target_commit,
+      provider=provider,
+      resource_config=resource,
+      hardware_config=hardware,
+      server_config=server,
+    )
+    if similar is not None:
+      raise ValueError(
+        f"similar intent already active or successful: agent_id={similar['agent_id']} "
+        f"run_id={similar['run_id']} score={similar['score']:.3f} intent={similar['intent_key']}"
+      )
+    run_id = int(conn.execute("SELECT COALESCE(MAX(run_id) + 1, 0) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0])
+    # Old databases may still enforce UNIQUE(exact_hash), so keep its compatibility value attempt-specific.
+    exact_hash = hashlib.sha256(f"{spec_hash}:{agent_id}:{run_id}".encode()).hexdigest()
     row = conn.execute(
       """
-      INSERT INTO runs(agent_id, run_id, started_at, trace_ref, command, exact_hash)
-      SELECT ?, COALESCE(MAX(run_id) + 1, 0), ?, ?, ?, ?
-      FROM runs WHERE agent_id = ?
+      INSERT INTO runs(
+        agent_id, run_id, started_at, trace_ref, command, exact_hash,
+        repository, target_commit, provider, resource_config, hardware_config,
+        server_config, spec_hash, intent_key, intent_embedding
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       RETURNING *
       """,
-      (agent_id, started_at, trace_ref, command, exact_hash, agent_id),
+      (
+        agent_id, run_id, started_at, trace_ref, command, exact_hash,
+        repository, target_commit, provider, resource, hardware, server,
+        spec_hash, intent_key, intent_json,
+      ),
     ).fetchone()
-    run_id = int(row["run_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)
   return run_id
+
+
+def _canonical_config(name: str, value: Mapping[str, object] | str) -> str:
+  """Return one stable non-empty configuration representation."""
+  if isinstance(value, str):
+    text = value.strip()
+    if not text:
+      raise ValueError(f"{name} must not be empty")
+    try:
+      parsed = json.loads(text)
+    except json.JSONDecodeError:
+      return text
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+  if not value:
+    raise ValueError(f"{name} must not be empty")
+  return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _find_blocking_intent(
+  conn: sqlite3.Connection,
+  query_embedding: list[float],
+  *,
+  repository: str,
+  target_commit: str,
+  provider: str,
+  resource_config: str,
+  hardware_config: str,
+  server_config: str,
+) -> dict[str, object] | None:
+  """Return a similar active or successful intent in the same target environment."""
+  rows = conn.execute(
+    """
+    SELECT r.agent_id, r.run_id, r.intent_key, r.intent_embedding FROM runs r
+    WHERE r.intent_embedding != '' AND r.error = ''
+      AND r.repository = ? AND r.target_commit = ? AND r.provider = ?
+      AND r.resource_config = ? AND r.hardware_config = ? AND r.server_config = ?
+      AND (r.finished_at IS NULL OR EXISTS (
+        SELECT 1 FROM experiments e WHERE e.agent_id = r.agent_id AND e.run_id = r.run_id
+      ))
+    """,
+    (repository, target_commit, provider, resource_config, hardware_config, server_config),
+  ).fetchall()
+  best = None
+  for row in rows:
+    embedding = json.loads(row["intent_embedding"])
+    if len(embedding) != len(query_embedding):
+      continue
+    score = sum(a * b for a, b in zip(query_embedding, embedding))
+    if score >= INTENT_SIMILARITY_THRESHOLD and (best is None or score > best["score"]):
+      best = {"agent_id": row["agent_id"], "run_id": row["run_id"], "intent_key": row["intent_key"], "score": score}
+  return best
 
 
 def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, error: str) -> None:
@@ -271,21 +506,43 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     row = conn.execute(
-      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ? RETURNING *",
+      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL RETURNING *",
       (finished_at, error[:2000], agent_id, run_id),
     ).fetchone()
+    if row is None:
+      raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
+
+
+def fail_unfinished_runs(conn: sqlite3.Connection, agent_id: int, error: str) -> int:
+  """Fail every unfinished run left behind by one worker."""
+  with conn:
+    return _fail_unfinished_runs(conn, agent_id, error)
+
+
+def _fail_unfinished_runs(conn: sqlite3.Connection, agent_id: int, error: str) -> int:
+  """Fail unfinished rows inside the caller's transaction."""
+  finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+  rows = conn.execute(
+    "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND finished_at IS NULL RETURNING *",
+    (finished_at, error[:2000], agent_id),
+  ).fetchall()
+  for row in rows:
+    notify_main(conn, agent_id=agent_id, run_id=int(row["run_id"]), kind="run_failed", table_name="runs", row=row)
+  return len(rows)
 
 
 def log_experiment(
   conn: sqlite3.Connection,
   *,
   agent_id: int,
-  intent_key: str,
+  run_id: int,
   metrics: Mapping[str, float | int | None] | None = None,
 ) -> int:
   """Atomically save benchmark metrics and mark the run successful."""
   metrics = metrics or {}
+  if not metrics:
+    raise ValueError("metrics must not be empty")
   unknown = sorted(set(metrics) - _METRIC_COLUMN_SET)
   if unknown:
     raise ValueError(f"unknown metric columns: {', '.join(unknown)}")
@@ -306,28 +563,16 @@ def log_experiment(
     if name in _RATE_COLUMNS and normalized > 1.0:
       raise ValueError(f"{name} must normalize to a 0..1 rate")
     normalized_metrics[name] = normalized
-
-  row = conn.execute(
-    """
-    SELECT run_id FROM runs
-    WHERE agent_id = ? AND finished_at IS NULL AND error = ''
-    ORDER BY run_id DESC
-    LIMIT 1
-    """,
-    (agent_id,),
-  ).fetchone()
-  if row is None:
-    raise ValueError(f"no unfinished successful benchmark run for agent_id={agent_id}")
-  run_id = int(row["run_id"])
+  if not normalized_metrics:
+    raise ValueError("metrics must contain at least one numeric value")
 
   values = [normalized_metrics.get(column) for column in METRIC_COLUMNS]
-  intent_embedding = embed_intent(intent_key)
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
   with conn:
     # Claim the unfinished run and persist its experiment as one transaction.
     row = conn.execute(
-      "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL RETURNING *",
+      "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL AND error = '' RETURNING *",
       (finished_at, agent_id, run_id),
     ).fetchone()
     if row is None:
@@ -335,11 +580,11 @@ def log_experiment(
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
     row = conn.execute(
       f"""
-      INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL})
-      VALUES (?, ?, ?, ?, {_METRIC_PLACEHOLDERS_SQL})
+      INSERT INTO experiments(agent_id, run_id, {_METRIC_COLUMNS_SQL})
+      VALUES (?, ?, {_METRIC_PLACEHOLDERS_SQL})
       RETURNING *
       """,
-      (agent_id, run_id, intent_key, json.dumps(intent_embedding, separators=(",", ":")), *values),
+      (agent_id, run_id, *values),
     ).fetchone()
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
@@ -350,8 +595,9 @@ def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int =
   query_embedding = embed_intent(intent)
   rows = conn.execute(
     f"""
-    SELECT e.agent_id, e.run_id, e.intent_key, e.intent_embedding, {_METRIC_SELECT_SQL},
-      r.trace_ref, r.command, r.started_at, r.finished_at, r.error
+    SELECT e.agent_id, e.run_id, r.intent_key, r.intent_embedding, {_METRIC_SELECT_SQL},
+      r.repository, r.target_commit, r.provider, r.resource_config, r.hardware_config,
+      r.server_config, r.trace_ref, r.command, r.started_at, r.finished_at, r.error
     FROM experiments e
     JOIN runs r ON r.agent_id = e.agent_id AND r.run_id = e.run_id
     """
@@ -385,3 +631,57 @@ def log_anomaly(
     anomaly_id = int(row["anomaly_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
   return anomaly_id
+
+
+def register_cloud_resource(
+  conn: sqlite3.Connection,
+  *,
+  agent_id: int,
+  provider: str,
+  resource_id: str,
+  environment: Mapping[str, object] | str,
+) -> None:
+  """Persist the one paid resource owned by a worker before SSH setup."""
+  environment_json = _canonical_config("environment", environment)
+  created_at = datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    active = conn.execute(
+      "SELECT resource_id FROM cloud_resources WHERE agent_id = ? AND terminated_at IS NULL",
+      (agent_id,),
+    ).fetchone()
+    if active is not None:
+      raise ValueError(f"agent already owns active resource {active['resource_id']}")
+    conn.execute(
+      """
+      INSERT INTO cloud_resources(agent_id, provider, resource_id, environment, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      """,
+      (agent_id, provider, resource_id, environment_json, created_at),
+    )
+
+
+def active_cloud_resources(conn: sqlite3.Connection, *, agent_id: int) -> list[sqlite3.Row]:
+  """Return resources that still require deterministic provider cleanup."""
+  return conn.execute(
+    "SELECT * FROM cloud_resources WHERE agent_id = ? AND terminated_at IS NULL ORDER BY created_at",
+    (agent_id,),
+  ).fetchall()
+
+
+def finish_cloud_resource(
+  conn: sqlite3.Connection,
+  *,
+  provider: str,
+  resource_id: str,
+  error: str = "",
+) -> None:
+  """Record successful cleanup or retain a bounded cleanup failure for retry."""
+  terminated_at = None if error else datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    conn.execute(
+      """
+      UPDATE cloud_resources SET terminated_at = ?, cleanup_error = ?
+      WHERE provider = ? AND resource_id = ? AND terminated_at IS NULL
+      """,
+      (terminated_at, error[:2000], provider, resource_id),
+    )

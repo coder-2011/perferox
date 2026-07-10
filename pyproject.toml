@@ -30,6 +30,7 @@ dependencies = [
   "pydantic",
   "numpy",
   "sentence-transformers>=5.6.0",
+  "langgraph-checkpoint-sqlite>=3.1.0",
 ]
 
 [project.scripts]

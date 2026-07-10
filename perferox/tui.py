@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -41,9 +42,7 @@ def launch_main(
 ) -> subprocess.CompletedProcess[str]:
   """Start the tmux-wrapped main graph through the existing runner CLI."""
   command = [
-    "uv",
-    "run",
-    "python",
+    sys.executable,
     "-m",
     "perferox.process_host",
     "launch-main",

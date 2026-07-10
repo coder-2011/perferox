@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections import deque
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
   """Read comprehensive status without consuming main-agent notifications."""
   with db.open_db(db_path) as conn:
     db.init_db(conn)
+    _reconcile_sessions(conn)
     sessions = [dict(row) for row in conn.execute(
         """
         SELECT s.*,
@@ -48,9 +50,8 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
         """
         SELECT r.agent_id, r.run_id, r.started_at,
           CASE WHEN r.error != '' THEN 'failed' WHEN r.finished_at IS NOT NULL THEN 'ok' ELSE 'running' END AS status,
-          COALESCE(e.intent_key, r.command, '') AS label
+          COALESCE(NULLIF(r.intent_key, ''), r.command, '') AS label
         FROM runs r
-        LEFT JOIN experiments e ON e.agent_id = r.agent_id AND e.run_id = r.run_id
         ORDER BY r.started_at DESC, r.agent_id DESC, r.run_id DESC
         LIMIT ?
         """,
@@ -84,6 +85,18 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
   return DashboardSnapshot(sessions, recent_runs, anomalies, trace_lines, main_status=main_status, **counts)
 
 
+def _reconcile_sessions(conn) -> None:
+  """Mark persisted active sessions missing when tmux no longer owns them."""
+  tmux = shutil.which("tmux")
+  if tmux is None:
+    return
+  rows = conn.execute("SELECT session_name FROM agent_sessions WHERE status IN ('starting', 'running', 'ending')").fetchall()
+  for row in rows:
+    result = subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if result.returncode != 0:
+      db.finish_agent_session(conn, session_name=row["session_name"], status="missing")
+
+
 def read_activity(db_path: str | Path, limit: int) -> list[str]:
   """Read only the bounded activity stream needed by `perferox logs`."""
   with db.open_db(db_path) as conn:
@@ -109,24 +122,28 @@ def _read_activity(conn, limit: int) -> list[str]:
     f"{row['created_at']} {row['kind']}: {row['payload'] if row['kind'] == 'explorer' else _notification_text(row['payload'])}"
     for row in rows
   ]
-  events.reverse()
   trace_refs = list(dict.fromkeys(
     row["trace_ref"]
-    for row in conn.execute("SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY role, agent_id")
+    for row in conn.execute("SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY rowid DESC LIMIT 8")
   ))
-  return [*events, *read_trace_tail(trace_refs, limit)][-limit:]
+  return sorted([*events, *read_trace_tail(trace_refs, limit)])[-limit:]
 
 
 def read_trace_tail(paths: list[str], limit: int) -> list[str]:
-  """Return compact trace lines without scanning whole JSONL files."""
-  lines: deque[str] = deque(maxlen=limit)
+  """Return the newest compact trace lines in timestamp order."""
+  lines: list[tuple[str, str]] = []
   for raw_path in paths:
     path = Path(raw_path)
     if not path.exists():
       continue
     for raw_line in _tail_lines(path, limit):
-      lines.append(format_trace_line(path, raw_line))
-  return list(lines)
+      try:
+        timestamp = str(json.loads(raw_line).get("ts", ""))
+      except json.JSONDecodeError:
+        timestamp = ""
+      lines.append((timestamp, format_trace_line(path, raw_line)))
+  lines.sort(key=lambda item: item[0])
+  return [line for _, line in lines[-limit:]]
 
 
 def _tail_lines(path: Path, limit: int) -> list[str]:

@@ -19,9 +19,9 @@ The important split is:
 | Model-owned | Host-owned |
 | --- | --- |
 | hypotheses and exploration direction | agent and run IDs |
-| repository setup strategy | attempt caps and stop state |
+| repository setup strategy | per-worker and objective attempt caps |
 | benchmark parameters | SQLite writes and transactions |
-| whether behavior looks interesting | tmux sessions, trace paths, and SSH objects |
+| whether behavior looks interesting | tmux, trace, SSH, and paid resource lifecycle |
 | concise summaries | tool schemas and command execution |
 
 Agents receive goals and immutable constraints, then choose the simplest useful path inside those bounds.
@@ -54,7 +54,7 @@ flowchart TD
   tools --> model
   model -->|"no local tool call"| wait["Runner waits for SQLite or tmux events"]
   wait -->|"notification or session change"| model
-  wait -->|"stop requested and no workers"| done["Exit"]
+  wait -->|"no pending events or workers"| done["Exit"]
 ```
 
 Before each model call, the coordinator receives:
@@ -62,7 +62,7 @@ Before each model call, the coordinator receives:
 - the user objective
 - compact ExplorerState lines
 - recent tmux session rows
-- accumulated LangGraph messages
+- bounded recent LangGraph messages
 
 Its tools are:
 
@@ -74,7 +74,7 @@ Its tools are:
 - `delegate_benchmark_subagent`
 - native server-side web search
 
-Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
+Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates the Git revision and fixed attempt budgets, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active, and stateful tool calls are serialized.
 
 ## Benchmark worker
 
@@ -93,11 +93,11 @@ flowchart LR
 
 The normal setup path is:
 
-1. choose a RunPod or Lambda environment
+1. create exactly one RunPod or Lambda resource through the host-owned provider tool
 2. optionally use a container when it clearly reduces setup work
 3. clone the delegated repository into `/workspace/target`
 4. check out the exact commit in detached HEAD state
-5. verify it with `git rev-parse HEAD`
+5. have the host independently verify `git rev-parse HEAD`
 6. follow the repository's own build instructions
 
 The container is a suggestion, not a requirement. For SGLang, the prompt points workers to `lmsysorg/sglang` image tags as a useful starting point.
@@ -106,12 +106,12 @@ Worker tools are deliberately phase-scoped:
 
 | Phase | Mutating capabilities |
 | --- | --- |
-| create instance | local `runpodctl` or `lambda-labs`, connect host SSH session |
-| setup / intervention | remote shell over the registered SSH session |
+| create instance | allowlisted provider argv, persist resource ID, connect SSH |
+| setup / intervention | provider recovery, reconnect, or remote shell |
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
 
-The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
+The worker stores only its objective, bounded messages, `agent_id`, and final summary in checkpointed LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
 
 ## One benchmark attempt
 
@@ -119,7 +119,7 @@ Real experiments go through `sglang_bench_serving`; raw remote commands are for 
 
 ```mermaid
 flowchart LR
-  args["Typed BenchServingArgs"] --> command["Normalize SGLang command"]
+  args["Compact typed request"] --> command["Validate full BenchServingArgs"]
   command --> tx["BEGIN IMMEDIATE"]
   tx --> guard{"stop or cap reached?"}
   guard -->|"yes"| refuse["Refuse new run"]
@@ -127,14 +127,14 @@ flowchart LR
   row --> remote["Execute over SSH"]
   remote -->|"failed"| failed["Mark run failed"]
   remote -->|"succeeded"| parse["Parse benchmark metrics"]
-  parse --> experiment["Log experiment + intent embedding"]
+  parse --> experiment["Finalize explicit run_id + metrics"]
   experiment --> anomaly["Optionally log anomaly"]
   failed --> notify["Notify main"]
   experiment --> notify
   anomaly --> notify
 ```
 
-Started failures count against the cap. Invalid arguments do not, because no run row is created. SQLite serializes run-number assignment and enforces the cap in the same transaction.
+Started failures count against the cap. Invalid arguments do not, because no run row is created. Before insertion, the host reserves a human-readable intent and embedding, rejects active or successful semantic repeats in the same target environment, and hashes the complete target, hardware, server, and client specification. Failed runs remain retryable. SQLite serializes repeat checks, run-number assignment, and cap enforcement in one transaction.
 
 ## Durable state
 
@@ -142,15 +142,16 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 
 | Table | Purpose |
 | --- | --- |
-| `runs` | every started benchmark, command hash, timing, trace, and failure state |
-| `experiments` | successful normalized metrics plus human-readable intent and embedding |
+| `runs` | every started benchmark, full target/environment identity, intent, timing, trace, and failure state |
+| `experiments` | successful normalized metrics for an explicit run ID |
 | `anomalies` | human-readable surprising behavior tied to a run |
 | `agent_sessions` | main/subagent tmux identity and lifecycle status |
-| `main_notifications` | durable wakeups for run, experiment, anomaly, and summary events |
+| `main_notifications` | leased then acknowledged wakeups for run, experiment, anomaly, and summary events |
+| `cloud_resources` | provider resource IDs and deterministic teardown outcomes |
 | `explorer_state_lines` | compact append-only exploration memory |
 | `doc_chunks` | locally ingested SGLang reference text and embeddings |
 
-`(agent_id, run_id)` is the run identity. `run_id` starts at zero for each agent. The command `exact_hash` is unique, preventing the same normalized benchmark command from being started twice.
+`(agent_id, run_id)` is the run identity. `run_id` starts at zero for each agent. `spec_hash` covers the repository, commit, provider environment, hardware, server configuration, and normalized command. Active and successful duplicates are refused; failed attempts may be retried.
 
 ## Soft stop
 
@@ -169,6 +170,8 @@ The End action changes running `agent_sessions` rows to `ending`. After that:
 - `start_benchmark_run` refuses new attempts
 - workers observe the stop flag and route to wrap-up
 - an already-running remote benchmark is allowed to finish
+- every emitted tool call receives a matching result, including cancelled calls
+- paid resources are terminated in host cleanup on success, stop, or failure
 - the main process exits after no worker sessions remain
 
 The host does not rely on a model voluntarily honoring the stop request, but we do encourage the agent to stop after we hit the cap

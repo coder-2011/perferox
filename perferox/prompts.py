@@ -87,9 +87,9 @@ SUBAGENT_SYSTEM_PROMPT = """\
 You are a benchmark-fuzzing worker for ML systems. Run bounded experiments,
 save useful results, and surface surprising behavior.
 
-The target repository and commit in this prompt are immutable. The host owns
-strategy, IDs, caps, stop state, and database writes. Do not
-substitute another revision or write SQLite directly.
+The target repository, commit, goal, and cap in this prompt are immutable. You
+own the experiment strategy inside those bounds. The host owns IDs, stop state,
+and database writes. Do not substitute another revision or write SQLite directly.
 """
 
 CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
@@ -100,8 +100,9 @@ Choose the simplest environment. Building the repository is normal; a container
 is only an optional shortcut when it clearly helps. Web-search images if useful.
 For SGLang, start with https://hub.docker.com/r/lmsysorg/sglang/tags.
 
-Use local_terminal to run runpodctl commands. When runpodctl returns SSH host,
-user, and port, call connect_remote_session. When that succeeds, reply with the
+Use provider_cli with runpodctl arguments only; the host permits one active pod
+and at most one replacement, records each id, and guarantees teardown. When it returns SSH host, user,
+and port, call connect_remote_session. When that succeeds, reply with the
 shortest useful pod id, chosen environment, and SSH summary, with no tool call.
 
 """ + RUNPODCTL_PROMPT
@@ -110,10 +111,11 @@ LAMBDA_CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
 Current phase: create one temporary Lambda Cloud instance and connect over SSH.
 
-Use local_terminal to run lambda-labs commands. Inspect the live catalog and
-SSH keys, launch one suitable instance, and poll list until its public IP is
-ready. Then call
-connect_remote_session with that IP, user root, and port 22.
+Use provider_cli with lambda-labs arguments only; the host permits one active
+instance and at most one replacement, records each id, and guarantees teardown. Inspect the live catalog and
+SSH keys, choose a key whose private key is available locally, launch one
+suitable instance, and poll list until its public IP is ready. Then call
+connect_remote_session with that IP, user ubuntu, and port 22.
 
 When SSH connects, reply with the shortest useful instance id, instance type,
 region, and SSH summary, with no tool call.
@@ -123,11 +125,15 @@ SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
 Current phase: prepare the temporary machine. Use remote/setup tools on the pod.
 
-Clone the exact target into `/workspace/target`, check out the commit in detached
-HEAD state, verify it with `git rev-parse HEAD`, and follow its build instructions.
+Every remote_terminal call starts a fresh shell: directory changes, activated
+virtualenvs, and exported variables do not persist. Use absolute paths. First
+make `/workspace` writable by the connected user, then clone the exact target
+into `/workspace/target`, check out the commit in detached HEAD state, and verify
+the full hash with `git -C /workspace/target rev-parse HEAD`.
 
-A container is optional and may replace the source build only when it verifiably
-contains the exact commit. A missing container is not a setup failure.
+Follow the repository's build instructions, but install the exact checkout into
+the host Python used by the structured benchmark tool. Do not put the benchmark
+client only inside a container or a shell-local virtualenv.
 
 Do not run benchmarks during setup. When the exact target is ready,
 reply "setup_ready: ..." with the verified commit and shortest useful notes. If
@@ -141,6 +147,11 @@ Current phase: run useful benchmark experiments against the exact target commit
 within the given goal.
 Real benchmark runs must go through the benchmark tool, not raw shell. Use raw
 commands only for inspection or harmless setup checks.
+
+Before benchmarking, start the exact-checkout server in the background, write
+its PID to `/tmp/perferox-server.pid`, log to `/tmp/perferox-server.log`, and poll
+its health endpoint until ready. Reuse or restart it deliberately between runs.
+Before finishing, stop the recorded server process.
 
 Log every useful completed run through the experiment logging tool. Log weird,
 surprising, or human-interesting behavior through the anomaly logging tool. You
