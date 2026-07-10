@@ -2,7 +2,7 @@
 
 This document describes the structure implemented on `master`. It is an operational map: what runs where, which layer owns each fact, and how work moves through the system.
 
-Perferox is intentionally small. Models choose what to investigate and how to set up a target; the host owns identities, limits, persistence, and process lifecycle.
+Perferox is intentionally small. I think of agentic engineering as carefully deciding how much agency to give your agent. The reason this was made, opposed to messing around with codex to get a similar thing done, is to control the agents' agency
 
 ## System map
 
@@ -44,17 +44,17 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 
 `perferox` exposes four user paths:
 
-- no command opens the Textual dashboard;
-- `perferox run <objective>` launches the main agent;
-- `perferox status` prints persisted state;
-- `perferox end` requests a soft stop.
+- no command opens the Textual dashboard
+- `perferox run <objective>` launches the main agent
+- `perferox status` prints persisted state
+- `perferox end` requests a soft stop
 
 The TUI and CLI both launch `perferox.agent_runner`. The runner creates persistent tmux processes so the UI can exit or reconnect without owning the agent loop.
 
 The main process uses two roots:
 
-- **runtime root** — the Perferox checkout containing SQLite, traces, `uv`, and worker launch code;
-- **source root** — a persistent full SGLang clone at `<runtime root>/sglang` used by the main agent's code-reading tools.
+- **runtime root** — the Perferox checkout containing SQLite, traces, `uv`, and worker launch code
+- **source root** — a persistent full SGLang clone at `<runtime root>/sglang` used by the main agent's code-reading tools
 
 ## Main coordinator
 
@@ -80,13 +80,13 @@ Before each model call, the coordinator receives:
 
 Its tools are:
 
-- `bash`, `read_file`, and `search_files` against the SGLang source root;
-- read-only SQLite queries;
-- semantic lookup over SGLang `doc_chunks`;
-- semantic lookup over prior experiment intents;
-- read/write access to compact ExplorerState;
-- `delegate_benchmark_subagent`;
-- native server-side web search.
+- `bash`, `read_file`, and `search_files` against the SGLang source root
+- read-only SQLite queries
+- semantic lookup over SGLang `doc_chunks`
+- semantic lookup over prior experiment intents
+- read/write access to compact ExplorerState
+- `delegate_benchmark_subagent`
+- native server-side web search
 
 Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, assigns the next `agent_id`, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
 
@@ -118,12 +118,12 @@ flowchart TD
 
 The normal setup path is:
 
-1. choose a RunPod environment;
-2. optionally use a container when it clearly reduces setup work;
-3. clone the delegated repository into `/workspace/target`;
-4. check out the exact commit in detached HEAD state;
-5. verify it with `git rev-parse HEAD`;
-6. follow the repository's own build instructions.
+1. choose a RunPod environment
+2. optionally use a container when it clearly reduces setup work
+3. clone the delegated repository into `/workspace/target`
+4. check out the exact commit in detached HEAD state
+5. verify it with `git rev-parse HEAD`
+6. follow the repository's own build instructions
 
 The container is a suggestion, not a requirement. For SGLang, the prompt points workers to `lmsysorg/sglang` image tags as a useful starting point.
 
@@ -190,15 +190,15 @@ stateDiagram-v2
 
 The End action changes running `agent_sessions` rows to `ending`. After that:
 
-- the main agent refuses new delegation;
-- `start_benchmark_run` refuses new attempts;
-- workers observe the stop flag and route to wrap-up;
-- an already-running remote benchmark is allowed to finish;
-- the main process exits after no worker sessions remain.
+- the main agent refuses new delegation
+- `start_benchmark_run` refuses new attempts
+- workers observe the stop flag and route to wrap-up
+- an already-running remote benchmark is allowed to finish
+- the main process exits after no worker sessions remain
 
 The host does not rely on a model voluntarily honoring the stop request, but we do encourage the agent to stop after we hit the cap
 
-## Module boundaries
+## Modules
 
 | Module | Responsibility |
 | --- | --- |
