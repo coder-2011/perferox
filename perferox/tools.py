@@ -242,7 +242,7 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
   """Create a bounded provider CLI tool that records every paid resource."""
   executable = "runpodctl" if provider == "runpod" else "lambda-labs"
 
-  @tool("provider_cli", description=f"Run the selected {provider} CLI without a shell. Pass arguments only, excluding `{executable}`. Reads, bounded creation, and deletion of the recorded resource are allowed; the host records every resource and guarantees final teardown.")
+  @tool("provider_cli", description=f"Run the selected {provider} CLI without a shell. Pass arguments only, excluding `{executable}`. Reads, bounded creation, and deletion of the recorded resource are allowed; the host records every resource, owns final teardown, and reports cleanup failures.")
   def run(arguments: list[str], timeout_s: float = DEFAULT_TIMEOUT_S) -> str:
     """Execute one allowlisted provider command and persist a created resource ID."""
     if timeout_s <= 0 or timeout_s > MAX_PROVIDER_TIMEOUT_S:

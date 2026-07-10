@@ -60,7 +60,7 @@ Current phase: create one temporary RunPod pod and connect it over SSH.
 Choose the simplest environment that can build the exact target commit.
 
 Use provider_cli with runpodctl arguments only; the host permits one active pod
-and at most one replacement, records each id, and guarantees teardown. When it
+and at most one replacement, records each id, and owns teardown. When it
 returns SSH host, user, and port, call connect_remote_session. When that
 succeeds, reply with the shortest useful pod id, chosen environment, and SSH
 summary, with no tool call.
@@ -72,11 +72,15 @@ LAMBDA_CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 Current phase: create one temporary Lambda Cloud instance and connect over SSH.
 
 Use provider_cli with lambda-labs arguments only; the host permits one active
-instance and at most one replacement, records each id, and guarantees teardown.
+instance and at most one replacement, records each id, and owns teardown.
 Inspect the live catalog and SSH keys, choose a key whose private key is
 available locally, launch one suitable instance, and poll list until its public
 IP is ready. Then call
 connect_remote_session with that IP, user ubuntu, and port 22.
+
+Accepted argument forms are `catalog`, `keys`, `ls`,
+`up <instance-type> --region <region> --key <key-name>`, and
+`rm <recorded-instance-id>`.
 
 When SSH connects, reply with the shortest useful instance id, instance type,
 region, and SSH summary, with no tool call.
