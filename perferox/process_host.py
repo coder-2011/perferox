@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
             with db.open_db(db_path) as conn:
               db.ack_main_notifications(conn, pending_notifications)
             pending_notifications.clear()
-          update, pending_notifications = _wait_for_main_event(db_path, args.poll_s, provider, api_key)
+          update, pending_notifications = _wait_for_main_event(db_path, args.poll_s, api_key)
           if update is None:
             return 0
           graph_input = {"messages": [HumanMessage(content=update)]}
@@ -168,7 +168,6 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       checkpointer.setup()
       graph = build_subagent_graph(
         build_chat_model(role="subagent"), agent_id, registry, db_path, args.repository, args.commit,
-        provider=provider,
         create_pod_prompt=create_prompt,
         attempt_cap=attempt_cap,
         trace_ref=str(trace_path),
@@ -189,7 +188,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       db.notify_main(conn, agent_id=agent_id, run_id=None, kind="subagent_failed", table_name="agent_sessions", row={"agent_id": agent_id, "error": error, "trace_ref": str(trace_path)})
   finally:
     registry.close(f"agent-{agent_id}")
-    cleanup_errors = cleanup_cloud_resources(db_path, agent_id, provider, api_key)
+    cleanup_errors = cleanup_cloud_resources(db_path, agent_id, api_key)
     if cleanup_errors:
       status = "failed"
       exit_code = 1
@@ -205,7 +204,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   return exit_code
 
 
-def _wait_for_main_event(db_path: Path, poll_s: float, provider: str = "runpod", api_key: str | None = None) -> tuple[str | None, list[int]]:
+def _wait_for_main_event(db_path: Path, poll_s: float, api_key: str | None = None) -> tuple[str | None, list[int]]:
   """Wait for a durable wakeup, returning leased notification IDs for later ack."""
   previous_running = None
   tmux = shutil.which("tmux")
@@ -221,7 +220,7 @@ def _wait_for_main_event(db_path: Path, poll_s: float, provider: str = "runpod",
         if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
           missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
           db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
-          cleanup_errors = cleanup_cloud_resources(db_path, int(row["agent_id"]), provider, api_key)
+          cleanup_errors = cleanup_cloud_resources(db_path, int(row["agent_id"]), api_key)
           if cleanup_errors:
             db.append_explorer_state(conn, agent_id=row["agent_id"], line=f"agent-{row['agent_id']} resource cleanup failed")
           continue

@@ -219,7 +219,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     db.register_cloud_resource(self.conn, agent_id=7, provider="runpod", resource_id="pod-7", environment={"gpu": "A100"})
     db.register_cloud_resource(self.conn, agent_id=8, provider="runpod", resource_id="pod-8", environment={"gpu": "A100"})
     registry.add(FakeRemoteSession("fail", RemoteResult(exit_status=2, stdout="", stderr="benchmark exploded")))
-    fail_tool = sglang_bench_serving(registry, "fail", self.db_path, 7, "repo", "a" * 40, "runpod", trace_ref="traces/agent-7.jsonl")
+    fail_tool = sglang_bench_serving(registry, "fail", self.db_path, 7, "repo", "a" * 40, trace_ref="traces/agent-7.jsonl")
     with patch.object(db, "embed_intent", return_value=[1.0, 0.0]):
       failed = fail_tool.invoke({"intent_key": "failure smoke test", "hardware_config": "A100", "server_config": "tp=1", "num_prompts": 1, "timeout_s": 3.0})
 
@@ -233,7 +233,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
         ),
       ),
     )
-    ok_tool = sglang_bench_serving(registry, "ok", self.db_path, 8, "repo", "a" * 40, "runpod")
+    ok_tool = sglang_bench_serving(registry, "ok", self.db_path, 8, "repo", "a" * 40)
     with patch.object(db, "embed_intent", return_value=[0.0, 1.0]):
       succeeded = ok_tool.invoke({"intent_key": "throughput smoke test", "hardware_config": "A100", "server_config": "tp=1", "num_prompts": 20})
 
@@ -270,7 +270,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     outputs = ["exit_code=0\n{\"id\":\"pod-4\"}", "exit_code=0\ndeleted"]
     with patch("perferox.tools._run_argv", side_effect=outputs):
       created = tool.invoke({"arguments": ["pod", "create", "--gpu-id", "A100"]})
-      errors = cleanup_cloud_resources(self.db_path, 4, "runpod", "rpa_test")
+      errors = cleanup_cloud_resources(self.db_path, 4, "rpa_test")
     resource = self.conn.execute("SELECT * FROM cloud_resources WHERE agent_id = 4").fetchone()
     self.assertIn("resource_id=pod-4", created)
     self.assertEqual(errors, [])
@@ -333,7 +333,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
       AIMessage(content="benchmark complete"),
       AIMessage(content="run 0 completed and logged"),
     ])
-    graph = build_subagent_graph(model, 10, registry, self.db_path, "repo", "a" * 40, provider="runpod", attempt_cap=1)
+    graph = build_subagent_graph(model, 10, registry, self.db_path, "repo", "a" * 40, attempt_cap=1)
     with patch.object(db, "embed_intent", return_value=[1.0, 0.0]):
       result = graph.invoke({"agent_id": 10, "objective": "cap boundary", "messages": []})
 

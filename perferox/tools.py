@@ -82,12 +82,6 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
   return search_files
 
 
-@tool("local_terminal", description="Run one shell command on the local host. Use for local files and local setup; directory changes do not persist.")
-def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-  """Run one shell command on the local host."""
-  return run_local_command(command, timeout_s)
-
-
 def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTool:
   """Create the tool that owns one host-assigned SSH session id."""
   @tool("connect_remote_session", description="Open the persistent SSH session after the selected cloud provider returns host, user, and port.")
@@ -128,7 +122,6 @@ def sglang_bench_serving(
   agent_id: int,
   repository: str,
   target_commit: str,
-  provider: str,
   trace_ref: str = "",
   attempt_cap: int | None = None,
 ) -> BaseTool:
@@ -161,7 +154,7 @@ def sglang_bench_serving(
           agent_id=agent_id,
           repository=repository,
           target_commit=target_commit,
-          provider=provider,
+          provider=resource[0]["provider"],
           resource_config=resource[0]["environment"],
           hardware_config=identity["hardware_config"],
           server_config=identity["server_config"],
@@ -272,9 +265,10 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
         return "stop requested; provider creation refused"
       if creating and active:
         return "provider_cli permits one active cloud resource per subagent"
-      created_count = conn.execute("SELECT COUNT(*) FROM cloud_resources WHERE agent_id = ?", (agent_id,)).fetchone()[0]
-      if creating and created_count >= MAX_RESOURCES_PER_AGENT:
-        return f"provider_cli resource cap reached ({created_count}/{MAX_RESOURCES_PER_AGENT})"
+      if creating:
+        created_count = conn.execute("SELECT COUNT(*) FROM cloud_resources WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+        if created_count >= MAX_RESOURCES_PER_AGENT:
+          return f"provider_cli resource cap reached ({created_count}/{MAX_RESOURCES_PER_AGENT})"
       if deleting:
         resource_id = arguments[len(delete_prefix)] if len(arguments) > len(delete_prefix) else ""
         if len(arguments) != len(delete_prefix) + 1 or len(active) != 1 or resource_id != active[0]["resource_id"]:
@@ -304,15 +298,15 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
   return run
 
 
-def cleanup_cloud_resources(db_path: str | Path, agent_id: int, provider: str, api_key: str | None = None) -> list[str]:
+def cleanup_cloud_resources(db_path: str | Path, agent_id: int, api_key: str | None = None) -> list[str]:
   """Terminate every recorded live resource for one worker and persist the outcome."""
-  env = os.environ.copy()
-  if api_key:
-    env["RUNPOD_API_KEY" if provider == "runpod" else "LAMBDA_API_KEY"] = api_key
   with db.open_db(db_path) as conn:
     resources = db.active_cloud_resources(conn, agent_id=agent_id)
   errors = []
   for resource in resources:
+    env = os.environ.copy()
+    if api_key:
+      env["RUNPOD_API_KEY" if resource["provider"] == "runpod" else "LAMBDA_API_KEY"] = api_key
     result = _terminate_resource(resource["provider"], resource["resource_id"], env)
     error = "" if result.startswith("exit_code=0\n") else result
     with db.open_db(db_path) as conn:
@@ -371,7 +365,7 @@ def _terminate_resource(provider: str, resource_id: str, env: dict[str, str]) ->
 def _run_remote(session: RemoteSession, command: str, timeout_s: float | None) -> str:
   """Run a command through SSH."""
   try:
-    result = session.run(f"bash -lc {shlex.quote(command)}", timeout_s=timeout_s)
+    result = session.run(command, timeout_s=timeout_s)
   except Exception as exc:
     return _format_result(None, "", f"{type(exc).__name__}: {exc}")
   if result.exit_status in {None, 124} and timeout_s is not None:

@@ -119,7 +119,7 @@ def build_main_agent_graph(
         continue
       if db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
         if row["agent_id"] is not None:
-          cleanup_errors = cleanup_cloud_resources(database, int(row["agent_id"]), cloud_provider, cloud_api_key)
+          cleanup_errors = cleanup_cloud_resources(database, int(row["agent_id"]), cloud_api_key)
           if cleanup_errors:
             db.append_explorer_state(conn, agent_id=row["agent_id"], line=_shorten(f"resource cleanup failed: {'; '.join(cleanup_errors)}", MAX_EXPLORER_LINE_CHARS))
         label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
@@ -197,13 +197,6 @@ def build_main_agent_graph(
     except Exception as exc:
       return f"query_intent_embeddings failed: {type(exc).__name__}: {exc}"
     return json.dumps(matches, indent=2, default=str) if matches else "no logged experiment intent embeddings"
-
-  @tool("read_explorer_state", description=f"Read the most recent {MAX_EXPLORER_LINES} compact ExplorerState lines.")
-  def read_explorer_state() -> str:
-    """Return the bounded recent ExplorerState ledger."""
-    with db.open_db(database, readonly=True) as conn:
-      lines = db.read_explorer_state(conn, MAX_EXPLORER_LINES)
-    return "\n".join(lines) if lines else "(empty)"
 
   @tool("write_explorer_state", description="Append exactly one compact ExplorerState line, ideally 10-15 high-quality words.")
   def write_explorer_state(line: str, agent_id: int | None = None) -> str:
@@ -296,7 +289,6 @@ def build_main_agent_graph(
     query_sql,
     query_sglang_docs,
     query_intent_embeddings,
-    read_explorer_state,
     write_explorer_state,
     delegate_benchmark_subagent,
     *extra_tools,
@@ -319,7 +311,7 @@ def build_main_agent_graph(
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
     system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=objective), *state.get("messages", [])[-MAX_MAIN_MESSAGES:]]
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=objective), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 
   def route_after_main(state: MainAgentState) -> Literal["tools", "cancel_tools", "__end__"]:

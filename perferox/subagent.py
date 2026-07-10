@@ -116,19 +116,11 @@ def _model_node(
     if model_calls >= model_call_cap:
       return {"messages": [AIMessage(content=exhausted_message)]}
     model_calls += 1
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "(none)")), *_recent_messages(state.get("messages", []))]
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "(none)")), *state.get("messages", [])]
     response = bound_model.invoke(messages)
     return {"messages": [response]}
 
   return call_model
-
-
-def _recent_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
-  """Keep a bounded protocol-valid suffix for model context."""
-  recent = list(messages[-MAX_WORKER_MESSAGES:])
-  while recent and recent[0].type == "tool":
-    recent.pop(0)
-  return recent
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -157,7 +149,6 @@ def build_subagent_graph(
   repository: str,
   commit: str,
   *,
-  provider: str = "runpod",
   create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
   attempt_cap: int = 1,
   trace_ref: str = "",
@@ -184,7 +175,6 @@ def build_subagent_graph(
       agent_id,
       repository,
       commit,
-      provider,
       trace_ref,
       attempt_cap,
     ),
@@ -232,9 +222,9 @@ def build_subagent_graph(
     stopped, _ = runtime_status()
     if stopped:
       return "wrap_up"
-    if "setup_ready" in text and target_ready():
-      return "benchmark_loop"
-    if "setup_failed" in text or not target_ready():
+    if "setup_ready" in text:
+      return "benchmark_loop" if target_ready() else "setup_intervention"
+    if "setup_failed" in text:
       return "setup_intervention"
     return "basic_setup"
 
@@ -268,7 +258,7 @@ def build_subagent_graph(
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
       f"Agent: {agent_id}\nRepository: {repository}\nCommit: {commit}\nObjective:\n{objective}\nLoop cap: {attempt_cap}"
     )
-    response = model.invoke([SystemMessage(content=summary_prompt), *_recent_messages(state_messages)])
+    response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
     summary = _message_text(response)
     _, started_attempts = runtime_status()
     row = {

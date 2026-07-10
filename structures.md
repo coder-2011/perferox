@@ -70,7 +70,7 @@ Its tools are:
 - read-only SQLite queries
 - semantic lookup over SGLang `doc_chunks`
 - semantic lookup over prior experiment intents
-- read/write access to compact ExplorerState
+- write access to the compact ExplorerState already injected each turn
 - `delegate_benchmark_subagent`
 - native server-side web search
 

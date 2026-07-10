@@ -303,11 +303,6 @@ def release_main_notification_claims(conn: sqlite3.Connection) -> int:
     return conn.execute("UPDATE main_notifications SET claimed_at = NULL WHERE delivered_at IS NULL AND claimed_at IS NOT NULL").rowcount
 
 
-def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
-  """Claim unread notifications for compatibility with existing callers."""
-  return claim_main_notifications(conn, limit)
-
-
 def notify_main(
   conn: sqlite3.Connection,
   *,

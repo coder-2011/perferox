@@ -54,11 +54,12 @@ class RemoteSession:
         deadline = None if timeout_s is None else monotonic() + timeout_s + REMOTE_KILL_GRACE_S + 1.0
         channel = transport.open_session(timeout=min(timeout_s or 30.0, 30.0))
 
+        command = f"bash -lc {shlex.quote(command)}"
         if timeout_s is not None:
             # GNU timeout owns a new process group and escalates if TERM is ignored.
             command = (
                 f"timeout --signal=TERM --kill-after={REMOTE_KILL_GRACE_S}s "
-                f"{timeout_s}s bash -lc {shlex.quote(command)}"
+                f"{timeout_s}s {command}"
             )
 
         def drain() -> bool:

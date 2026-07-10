@@ -56,20 +56,7 @@ _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 class BenchServingArgs(BaseModel):
   """Typed inputs for SGLang's serving benchmark CLI."""
 
-  model_config = ConfigDict(
-    extra="forbid",
-    json_schema_extra={
-      "examples": [{
-        "model": "meta-llama/Llama-3.1-8B-Instruct",
-        "dataset_name": "random",
-        "random_input_len": 1024,
-        "random_output_len": 256,
-        "num_prompts": 100,
-        "host": "127.0.0.1",
-        "port": 30000,
-      }],
-    },
-  )
+  model_config = ConfigDict(extra="forbid")
 
   backend: BenchBackend = Field("sglang", description="Serving backend/API shape to benchmark.")
   base_url: str | None = Field(None, description="Full server base URL; use instead of host/port when needed.", examples=["http://127.0.0.1:30000"])
