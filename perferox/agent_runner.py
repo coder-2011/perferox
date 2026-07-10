@@ -58,6 +58,11 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
     key_path = write_cloud_key(api_key)
+    with closing(db.connect(db_path)) as conn:
+      db.init_db(conn)
+      # Register before tmux starts so an immediate End request cannot be lost.
+      db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
+      db.record_agent_session(conn, session_name=MAIN_SESSION, role="main")
     command = shlex.join([
       "uv", "run", "python", "-m", "perferox.agent_runner", "main",
       "--db-path", str(db_path), "--trace-dir", str(trace_dir),
@@ -69,9 +74,13 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     except OSError:
       # Delete a secret handoff that tmux never delivered.
       key_path.unlink(missing_ok=True)
+      with closing(db.connect(db_path)) as conn:
+        db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       raise
     if result.returncode != 0:
       key_path.unlink(missing_ok=True)
+      with closing(db.connect(db_path)) as conn:
+        db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
     print(f"started {MAIN_SESSION}; attach with: tmux attach -t {MAIN_SESSION}" if result.returncode == 0 else (result.stderr or result.stdout).strip())
     return result.returncode
 
@@ -81,13 +90,16 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
-    # Preserve the shared checkout so agents can keep branches, commits, and edits.
-    if not (workspace / ".git").is_dir():
-      subprocess.run(["git", "clone", "https://github.com/sgl-project/sglang.git", str(workspace)], check=True)
     try:
       with closing(db.connect(db_path)) as conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+        session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
+        if session["status"] == "ending":
+          return 0
+      # Preserve the shared checkout so agents can keep branches, commits, and edits.
+      if not (workspace / ".git").is_dir():
+        subprocess.run(["git", "clone", "https://github.com/sgl-project/sglang.git", str(workspace)], check=True)
       graph = build_main_agent_graph(
         build_chat_model(), db_path,
         cloud_provider=provider, cloud_api_key=api_key,
@@ -159,7 +171,21 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
     with closing(db.connect(db_path)) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
       notifications = db.take_main_notifications(conn)
-      if notifications:
+      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
+      rows = conn.execute(active_query).fetchall()
+      active_rows = []
+      missing_line = ""
+      for row in rows:
+        alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+        if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
+          missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
+          db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
+          continue
+        active_rows.append(row)
+      ending = main_row is not None and main_row["status"] == "ending"
+      if ending and not active_rows:
+        return None
+      if notifications and not ending:
         lines = ["Subagent SQLite write notifications:"]
         for row in notifications:
           prefix = "ANOMALY " if row["kind"] == "anomaly_logged" else ""
@@ -169,21 +195,12 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
           )
           lines.append(row["row_json"])
         return "\n".join(lines)
-      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
-      rows = conn.execute(active_query).fetchall()
-      for row in rows:
-        alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
-        if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-          line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
-          db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
-          return f"Tmux session update:\n{line}"
-      ending = main_row is not None and main_row["status"] == "ending"
-      if ending and not rows:
-        return None
+      if missing_line:
+        return f"Tmux session update:\n{missing_line}"
     if ending:
       time.sleep(poll_s)
-      return "End requested. Do not delegate new subagents; wait for active subagents to wrap up, then summarize."
-    running = {row["session_name"] for row in rows}
+      continue
+    running = {row["session_name"] for row in active_rows}
     if previous_running is not None and running != previous_running:
       return "Tmux session update:\nsubagent tmux sessions changed" if running else "Tmux session update:\nall subagent tmux sessions completed"
     if not running:

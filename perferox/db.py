@@ -69,12 +69,17 @@ def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, lin
 
 
 def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: str, agent_id: int | None = None, trace_ref: str = "") -> None:
-  """Record one tmux-wrapped agent process as running."""
+  """Record one tmux-wrapped process without clearing an accepted stop."""
   with conn:
     conn.execute(
       """
-      INSERT OR REPLACE INTO agent_sessions(session_name, role, agent_id, status, trace_ref)
+      INSERT INTO agent_sessions(session_name, role, agent_id, status, trace_ref)
       VALUES (?, ?, ?, 'running', ?)
+      ON CONFLICT(session_name) DO UPDATE SET
+        role = excluded.role,
+        agent_id = excluded.agent_id,
+        status = CASE WHEN agent_sessions.status = 'ending' THEN 'ending' ELSE 'running' END,
+        trace_ref = excluded.trace_ref
       """,
       (session_name, role, agent_id, trace_ref),
     )

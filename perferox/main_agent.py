@@ -292,10 +292,12 @@ def build_main_agent_graph(
     return {"messages": [bound_model.invoke(messages)]}
 
   def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
-    """Route to tools when the model requested tool calls."""
-    if getattr(state["messages"][-1], "tool_calls", None):
-      return "tools"
-    return END
+    """Stop before another tool call once the host accepted End."""
+    if not getattr(state["messages"][-1], "tool_calls", None):
+      return END
+    with closing(db.connect(database, readonly=True)) as conn:
+      row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()
+    return END if row is not None and row["status"] == "ending" else "tools"
 
   graph = StateGraph(MainAgentState)
   graph.add_node("main", call_model)

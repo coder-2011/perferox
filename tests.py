@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from perferox import db
 from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
+from perferox.subagent import build_subagent_graph
 from perferox.tools import sglang_bench_serving
 from perferox.tui import read_dashboard, read_trace_tail, request_end
 
@@ -30,6 +36,14 @@ class FakeRemoteSession:
   def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
     """Return the configured remote result."""
     return self.result
+
+
+class ToolBindingFakeModel(FakeMessagesListChatModel):
+  """Let deterministic test messages pass through LangChain tool binding."""
+
+  def bind_tools(self, tools: Any, **kwargs: Any) -> ToolBindingFakeModel:
+    """Return this fake because its responses already contain tool calls."""
+    return self
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -178,6 +192,30 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertEqual([match["intent_key"] for match in matches], ["CUDA cache throughput", "scheduler tail latency"])
     self.assertEqual(anomaly["summary"], "cache-hit collapse on MI250")
 
+  def test_soft_stop_blocks_pending_provisioning_tool(self) -> None:
+    """Route a stopped worker to summary without executing its requested tool."""
+    calls = []
+
+    @tool
+    def provision() -> str:
+      """Record whether a provisioning tool was incorrectly executed."""
+      calls.append("provisioned")
+      return "provisioned"
+
+    model = ToolBindingFakeModel(responses=[
+      AIMessage(content="", tool_calls=[{"name": "provision", "args": {}, "id": "call-1", "type": "tool_call"}]),
+      AIMessage(content="stopped before provisioning"),
+    ])
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
+    db.record_agent_session(self.conn, session_name="perferox-agent-9", role="subagent", agent_id=9)
+    db.request_soft_stop(self.conn)
+    graph = build_subagent_graph(model, 9, SessionRegistry(), self.db_path, "repo", "commit", create_pod_tools=(provision,))
+
+    result = graph.invoke({"agent_id": 9, "messages": [HumanMessage(content="benchmark goal")]})
+
+    self.assertEqual(calls, [])
+    self.assertEqual(result["summary"], "stopped before provisioning")
+
 
 class TUIWiringTests(DatabaseTestCase):
   """Protect the TUI bridge without model, browser, SSH, or cloud work."""
@@ -197,7 +235,7 @@ class TUIWiringTests(DatabaseTestCase):
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
     db.take_main_notifications(self.conn)
     with patch("perferox.agent_runner.shutil.which", return_value=True), patch("perferox.agent_runner.subprocess.run") as run:
-      run.return_value.returncode = 0
+      run.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
       stopped = request_end(self.db_path)
       update = _wait_for_main_event(self.db_path, poll_s=0)
 
@@ -214,7 +252,7 @@ class TUIWiringTests(DatabaseTestCase):
     self.assertIn("cache pressure 25", tail_lines[0])
     self.assertIn("cache pressure 29", tail_lines[-1])
     self.assertEqual(stopped, 2)
-    self.assertIn("End requested", update)
+    self.assertIsNone(update)
 
 
 if __name__ == "__main__":

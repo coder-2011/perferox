@@ -136,8 +136,11 @@ def build_subagent_graph(
       attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     return stopped, int(attempts)
 
-  def route_after_create_pod(state: SubagentState) -> Literal["create_pod_tools", "basic_setup"]:
-    """Route pod creation through tools until SSH details are ready."""
+  def route_after_create_pod(state: SubagentState) -> Literal["create_pod_tools", "basic_setup", "wrap_up"]:
+    """Prevent another provisioning action after a soft stop."""
+    stopped, _ = runtime_status()
+    if stopped:
+      return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "create_pod_tools"
@@ -145,18 +148,21 @@ def build_subagent_graph(
 
   def route_after_basic_setup(state: SubagentState) -> Literal["basic_setup_tools", "setup_intervention", "benchmark_loop", "wrap_up"]:
     """Choose setup tools, intervention, benchmark, or wrap-up."""
+    stopped, attempts = runtime_status()
+    if stopped or attempts >= attempt_cap:
+      return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "basic_setup_tools"
     if "setup_failed" in _message_text(last_message).lower():
       return "setup_intervention"
-    stopped, attempts = runtime_status()
-    if stopped or attempts >= attempt_cap:
-      return "wrap_up"
     return "benchmark_loop"
 
   def route_after_setup_intervention(state: SubagentState) -> Literal["setup_intervention_tools", "basic_setup", "wrap_up"]:
     """Route setup intervention back to setup or out to wrap-up."""
+    stopped, _ = runtime_status()
+    if stopped:
+      return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "setup_intervention_tools"
