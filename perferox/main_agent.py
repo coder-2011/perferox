@@ -25,8 +25,8 @@ from langgraph.prebuilt import ToolNode
 
 from perferox import db
 from perferox.auth import write_cloud_key
-from perferox.semantic import document_index
-from perferox.tools import WEB_SEARCH_TOOL, cleanup_cloud_resources, run_local_command, search_files_tool
+from perferox.semantic import search_documents
+from perferox.tools import WEB_SEARCH_TOOL, cleanup_cloud_resources, reconcile_tmux_sessions, run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
 MAX_ATTEMPTS_PER_SUBAGENT = 8
@@ -106,25 +106,14 @@ def build_main_agent_graph(
 
   def refresh_sessions(conn) -> None:
     """Mark running tmux sessions missing when tmux no longer has them."""
-    tmux = shutil.which("tmux")
-    rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending')").fetchall()
-    for row in rows:
-      alive = tmux and subprocess.run(
-        [tmux, "has-session", "-t", row["session_name"]],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-      ).returncode == 0
-      if alive:
-        continue
-      if db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-        if row["agent_id"] is not None:
-          cleanup_errors = cleanup_cloud_resources(database, int(row["agent_id"]), cloud_api_key)
-          if cleanup_errors:
-            db.append_explorer_state(conn, agent_id=row["agent_id"], line=_shorten(f"resource cleanup failed: {'; '.join(cleanup_errors)}", MAX_EXPLORER_LINE_CHARS))
-        label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
-        line = _shorten(f"{label} tmux missing; trace {Path(row['trace_ref']).name}", MAX_EXPLORER_LINE_CHARS)
-        db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
+    for row in reconcile_tmux_sessions(conn):
+      if row["agent_id"] is not None:
+        cleanup_errors = cleanup_cloud_resources(database, int(row["agent_id"]), cloud_api_key)
+        if cleanup_errors:
+          db.append_explorer_state(conn, agent_id=row["agent_id"], line=_shorten(f"resource cleanup failed: {'; '.join(cleanup_errors)}", MAX_EXPLORER_LINE_CHARS))
+      label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
+      line = _shorten(f"{label} tmux missing; trace {Path(row['trace_ref']).name}", MAX_EXPLORER_LINE_CHARS)
+      db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
 
   @tool("bash", description="Run one local bash command from the repository root.")
   def bash(command: str, timeout_s: float = 30.0) -> str:
@@ -174,7 +163,7 @@ def build_main_agent_graph(
     if limit < 1 or limit > 10:
       return "limit must be between 1 and 10"
     try:
-      scored = document_index().search(db.embed_intent(query), limit)
+      scored = search_documents(db.embed_intent(query), limit)
     except Exception as exc:
       return f"query_sglang_docs failed: {type(exc).__name__}: {exc}"
     if not scored:

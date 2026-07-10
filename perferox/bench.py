@@ -193,31 +193,8 @@ class BenchmarkRunArgs(BaseModel):
   request_rate: float | None = Field(None, gt=0, description="Requests per second; omit for all-at-once.")
   max_concurrency: int | None = Field(None, ge=0, description="Maximum in-flight requests.")
   seed: int | None = Field(None, ge=0, le=4294967295)
-  output_details: bool = Field(True, description="Write per-request details.")
-  cache_report: bool = Field(True, description="Collect cache hit statistics.")
   timeout_s: float = Field(BENCH_TIMEOUT_S, gt=0, le=BENCH_TIMEOUT_S, description="Host SSH timeout, capped at six hours.")
   advanced_args: dict[str, Any] = Field(default_factory=dict, description="Rare BenchServingArgs fields only; names and values are still strictly validated.")
-
-
-class ExperimentMetrics(BaseModel):
-  """Expose the normalized metric keys accepted by SQLite to the model."""
-
-  model_config = ConfigDict(extra="forbid")
-
-  request_rps: float | None = Field(None, ge=0)
-  input_tps: float | None = Field(None, ge=0)
-  output_tps: float | None = Field(None, ge=0)
-  ttft_p50_ms: float | None = Field(None, ge=0)
-  ttft_p99_ms: float | None = Field(None, ge=0)
-  tpot_p50_ms: float | None = Field(None, ge=0)
-  tpot_p99_ms: float | None = Field(None, ge=0)
-  error_rate: float | None = Field(None, ge=0, le=1)
-  cache_hit_rate: float | None = Field(None, ge=0, le=1)
-  peak_gpu_mem_gb: float | None = Field(None, ge=0)
-  startup_s: float | None = Field(None, ge=0)
-  warmup_s: float | None = Field(None, ge=0)
-  accept_length: float | None = Field(None, ge=0)
-  correctness_score: float | None = Field(None, ge=0)
 
 
 def bench_serving_argv(args: BenchServingArgs, module: str = "sglang.benchmark.serving") -> list[str]:

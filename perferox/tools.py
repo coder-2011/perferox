@@ -4,7 +4,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
+import sqlite3
 import subprocess
 from heapq import nsmallest
 from pathlib import Path
@@ -13,7 +15,7 @@ from typing import Any
 from langchain_core.tools import BaseTool, tool
 
 from perferox import db
-from perferox.bench import BenchmarkRunArgs, BenchServingArgs, ExperimentMetrics, bench_serving_argv, parse_bench_serving_metrics
+from perferox.bench import BenchmarkRunArgs, BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteSession, SessionRegistry
 
 DEFAULT_TIMEOUT_S = 30.0
@@ -154,12 +156,14 @@ def sglang_bench_serving(
         run_id = db.start_benchmark_run(
           conn,
           agent_id=agent_id,
-          repository=repository,
-          target_commit=target_commit,
-          provider=resource[0]["provider"],
-          resource_config=resource[0]["environment"],
-          hardware_config=identity["hardware_config"],
-          server_config=identity["server_config"],
+          environment={
+            "hardware_config": identity["hardware_config"],
+            "provider": resource[0]["provider"],
+            "repository": repository,
+            "resource_config": resource[0]["environment"],
+            "server_config": identity["server_config"],
+            "target_commit": target_commit,
+          },
           command=command,
           intent_key=identity["intent_key"],
           trace_ref=trace_ref,
@@ -186,11 +190,11 @@ def log_experiment_tool(db_path: str | Path, agent_id: int) -> BaseTool:
     "log_experiment",
     description="Finalize exactly one successful run_id with the non-empty typed parsed_metrics returned by sglang_bench_serving.",
   )
-  def log_experiment(run_id: int, metrics: ExperimentMetrics) -> str:
+  def log_experiment(run_id: int, metrics: dict[db.MetricName, float | None]) -> str:
     """Log normalized metrics for the explicitly selected run."""
     try:
       with db.open_db(db_path) as conn:
-        logged_run_id = db.log_experiment(conn, agent_id=agent_id, run_id=run_id, metrics=metrics.model_dump(exclude_none=True))
+        logged_run_id = db.log_experiment(conn, agent_id=agent_id, run_id=run_id, metrics=metrics)
     except Exception as exc:
       return f"log_experiment failed: {type(exc).__name__}: {exc}"
     return f"logged experiment agent_id={agent_id} run_id={logged_run_id}"
@@ -214,6 +218,24 @@ def log_anomaly_tool(db_path: str | Path, agent_id: int) -> BaseTool:
     return f"logged anomaly anomaly_id={anomaly_id} agent_id={agent_id} run_id={run_id}"
 
   return log_anomaly
+
+
+def reconcile_tmux_sessions(conn: sqlite3.Connection, *, role: str | None = None) -> list[sqlite3.Row]:
+  """Mark active persisted sessions missing when tmux no longer owns them."""
+  tmux = shutil.which("tmux")
+  if tmux is None:
+    return []
+  query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending')"
+  params = ()
+  if role is not None:
+    query += " AND role = ?"
+    params = (role,)
+  missing = []
+  for row in conn.execute(query, params):
+    result = subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if result.returncode != 0 and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
+      missing.append(row)
+  return missing
 
 
 def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | None = None) -> str:

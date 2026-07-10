@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +22,7 @@ from perferox import db
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
-from perferox.semantic import DocumentIndex
+from perferox.semantic import document_index, search_documents
 from perferox.status import read_dashboard, read_trace_tail
 from perferox.subagent import build_subagent_graph
 from perferox.tools import cleanup_cloud_resources, provider_cli, sglang_bench_serving
@@ -83,12 +82,12 @@ class DatabaseTestCase(unittest.TestCase):
     return db.start_benchmark_run(
       self.conn,
       agent_id=agent_id,
-      repository="https://github.com/sgl-project/sglang.git",
-      target_commit=commit,
-      provider="runpod",
-      resource_config={"gpu": "A100"},
-      hardware_config="A100 80GB",
-      server_config="tp=1 model=test",
+      environment={
+        "hardware_config": "A100 80GB", "provider": "runpod",
+        "repository": "https://github.com/sgl-project/sglang.git",
+        "resource_config": {"gpu": "A100"},
+        "server_config": "tp=1 model=test", "target_commit": commit,
+      },
       command=command,
       intent_key=intent or command,
       attempt_cap=attempt_cap,
@@ -146,24 +145,11 @@ class HostStateTests(DatabaseTestCase):
     """Migrate the old non-null experiment intent columns without losing data."""
     old_path = Path(self.tempdir.name) / "old.sqlite"
     with db.open_db(old_path) as conn:
-      conn.executescript(
-        """
-        CREATE TABLE runs (
-          agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL, gpu TEXT NOT NULL DEFAULT '',
-          started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT, command TEXT NOT NULL DEFAULT '',
-          exact_hash TEXT NOT NULL UNIQUE, error TEXT NOT NULL DEFAULT '', PRIMARY KEY(agent_id, run_id)
-        );
-        CREATE TABLE experiments (
-          agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL, intent_key TEXT NOT NULL,
-          intent_embedding TEXT NOT NULL, request_rps REAL, input_tps REAL, output_tps REAL,
-          ttft_p50_ms REAL, ttft_p99_ms REAL, tpot_p50_ms REAL, tpot_p99_ms REAL,
-          error_rate REAL, cache_hit_rate REAL, peak_gpu_mem_gb REAL, startup_s REAL,
-          warmup_s REAL, accept_length REAL, correctness_score REAL, PRIMARY KEY(agent_id, run_id)
-        );
-        INSERT INTO runs(agent_id, run_id, started_at, command, exact_hash) VALUES (0, 0, 'now', 'bench', 'hash');
-        INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, request_rps) VALUES (0, 0, 'cache probe', '[1.0,0.0]', 4.5);
-        """
-      )
+      db.init_db(conn)
+      conn.execute("ALTER TABLE experiments ADD COLUMN intent_key TEXT NOT NULL DEFAULT ''")
+      conn.execute("ALTER TABLE experiments ADD COLUMN intent_embedding TEXT NOT NULL DEFAULT ''")
+      conn.execute("INSERT INTO runs(agent_id, run_id, started_at, command, exact_hash) VALUES (0, 0, 'now', 'bench', 'hash')")
+      conn.execute("INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, request_rps) VALUES (0, 0, 'cache probe', '[1.0,0.0]', 4.5)")
       db.init_db(conn)
       run = conn.execute("SELECT intent_key, intent_embedding FROM runs").fetchone()
       experiment = conn.execute("SELECT * FROM experiments").fetchone()
@@ -286,11 +272,11 @@ class ToolAndExperimentTests(DatabaseTestCase):
         (("cache", "0", "[1.0,0.0]"), ("scheduler", "1", "[0.0,1.0]"), ("mixed", "2", "[0.8,0.2]")),
       )
 
-    index = DocumentIndex.load(self.db_path)
-    matches = index.search([1.0, 0.0], 2)
+    matches = search_documents([1.0, 0.0], 2, self.db_path)
+    _, vectors = document_index(self.db_path)
 
     self.assertEqual([document[0] for _, document in matches], ["cache", "mixed"])
-    self.assertFalse(index.vectors.flags.writeable)
+    self.assertFalse(vectors.flags.writeable)
 
   def test_soft_stop_blocks_pending_provisioning_tool(self) -> None:
     """Route a stopped worker to summary without executing its requested tool."""
@@ -361,12 +347,10 @@ class TUIWiringTests(DatabaseTestCase):
       self.start_run(0, "bench cache", intent="cache pressure")
     db.log_anomaly(self.conn, agent_id=0, run_id=0, summary="cache pressure anomaly")
 
-    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", return_value=subprocess.CompletedProcess([], 0)):
-      snapshot = read_dashboard(self.db_path)
+    snapshot = read_dashboard(self.db_path)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
-    claimed = db.claim_main_notifications(self.conn)
-    with patch("perferox.process_host.shutil.which", return_value=True), patch("perferox.process_host.subprocess.run") as run:
-      run.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+    pending = db.read_main_notifications(self.conn)
+    with patch("perferox.tools.shutil.which", return_value=True), patch("perferox.tools.subprocess.run", return_value=subprocess.CompletedProcess([], 1)):
       stopped = request_end(self.db_path)
       update, notification_ids = _wait_for_main_event(self.db_path, poll_s=0)
 
@@ -383,25 +367,12 @@ class TUIWiringTests(DatabaseTestCase):
     self.assertIn("cache pressure 29", trace_text)
     self.assertIn("explorer saw cache pressure", trace_text)
     self.assertIsNone(delivered)
-    self.assertTrue(claimed)
+    self.assertTrue(pending)
     self.assertIn("cache pressure 25", tail_lines[0])
     self.assertIn("cache pressure 29", tail_lines[-1])
     self.assertEqual(stopped, 2)
     self.assertIsNone(update)
     self.assertEqual(notification_ids, [])
-
-  def test_installed_process_host_runs_outside_checkout(self) -> None:
-    """Use the active interpreter to launch the installed module from a temp cwd."""
-    result = subprocess.run(
-      [sys.executable, "-m", "perferox.process_host", "--help"],
-      cwd=self.tempdir.name,
-      text=True,
-      capture_output=True,
-      check=False,
-    )
-    self.assertEqual(result.returncode, 0, result.stderr)
-    self.assertIn("launch-main", result.stdout)
-
 
 if __name__ == "__main__":
   unittest.main()

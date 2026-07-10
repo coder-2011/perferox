@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,7 +31,6 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
   """Read comprehensive status without consuming main-agent notifications."""
   with db.open_db(db_path) as conn:
     db.init_db(conn)
-    _reconcile_sessions(conn)
     sessions = [dict(row) for row in conn.execute(
         """
         SELECT s.*,
@@ -83,18 +80,6 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
 
   main_status = next((str(session["status"]) for session in sessions if session["role"] == "main"), "idle")
   return DashboardSnapshot(sessions, recent_runs, anomalies, trace_lines, main_status=main_status, **counts)
-
-
-def _reconcile_sessions(conn) -> None:
-  """Mark persisted active sessions missing when tmux no longer owns them."""
-  tmux = shutil.which("tmux")
-  if tmux is None:
-    return
-  rows = conn.execute("SELECT session_name FROM agent_sessions WHERE status IN ('starting', 'running', 'ending')").fetchall()
-  for row in rows:
-    result = subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    if result.returncode != 0:
-      db.finish_agent_session(conn, session_name=row["session_name"], status="missing")
 
 
 def read_activity(db_path: str | Path, limit: int) -> list[str]:

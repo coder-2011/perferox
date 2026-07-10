@@ -184,12 +184,10 @@ def build_subagent_graph(
   with db.open_db(db_path) as conn:
     db.init_db(conn)
 
-  def runtime_status() -> tuple[bool, int]:
-    """Read the host-owned stop flag and started-attempt count together."""
+  def stop_requested() -> bool:
+    """Read the host-owned stop flag."""
     with db.open_db(db_path, readonly=True) as conn:
-      stopped = db.stop_requested(conn, agent_id=agent_id)
-      attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
-    return stopped, int(attempts)
+      return db.stop_requested(conn, agent_id=agent_id)
 
   def target_ready() -> bool:
     """Verify the live checkout resolves to the delegated immutable commit."""
@@ -204,10 +202,9 @@ def build_subagent_graph(
   def route_after_create_pod(state: SubagentState) -> Literal["create_pod_tools", "cancel_tools", "basic_setup", "setup_intervention", "wrap_up"]:
     """Execute emitted calls, then advance only with a live SSH session."""
     last_message = state["messages"][-1]
+    stopped = stop_requested()
     if getattr(last_message, "tool_calls", None):
-      stopped, _ = runtime_status()
       return "cancel_tools" if stopped else "create_pod_tools"
-    stopped, _ = runtime_status()
     if stopped:
       return "wrap_up"
     return "basic_setup" if session_registry.connected(session_id) else "setup_intervention"
@@ -215,11 +212,10 @@ def build_subagent_graph(
   def route_after_basic_setup(state: SubagentState) -> Literal["basic_setup_tools", "cancel_tools", "basic_setup", "setup_intervention", "benchmark_loop", "wrap_up"]:
     """Choose setup tools, intervention, benchmark, or wrap-up."""
     last_message = state["messages"][-1]
+    stopped = stop_requested()
     if getattr(last_message, "tool_calls", None):
-      stopped, _ = runtime_status()
       return "cancel_tools" if stopped else "basic_setup_tools"
     text = _message_text(last_message).lower()
-    stopped, _ = runtime_status()
     if stopped:
       return "wrap_up"
     if "setup_ready" in text:
@@ -231,11 +227,10 @@ def build_subagent_graph(
   def route_after_setup_intervention(state: SubagentState) -> Literal["setup_intervention_tools", "cancel_tools", "basic_setup", "benchmark_loop", "wrap_up"]:
     """Route setup intervention back to setup or out to wrap-up."""
     last_message = state["messages"][-1]
+    stopped = stop_requested()
     if getattr(last_message, "tool_calls", None):
-      stopped, _ = runtime_status()
       return "cancel_tools" if stopped else "setup_intervention_tools"
     text = _message_text(last_message).lower()
-    stopped, _ = runtime_status()
     if stopped or "setup_failed" in text:
       return "wrap_up"
     if "setup_ready" in text and target_ready():
@@ -260,7 +255,8 @@ def build_subagent_graph(
     )
     response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
     summary = _message_text(response)
-    _, started_attempts = runtime_status()
+    with db.open_db(db_path, readonly=True) as conn:
+      started_attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     row = {
       "agent_id": agent_id,
       "repository": repository,

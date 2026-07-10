@@ -4,9 +4,7 @@ CREATE TABLE IF NOT EXISTS runs (
   agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL CHECK(run_id >= 0),
   gpu TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT,
   command TEXT NOT NULL DEFAULT '', exact_hash TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
-  repository TEXT NOT NULL DEFAULT '', target_commit TEXT NOT NULL DEFAULT '',
-  provider TEXT NOT NULL DEFAULT '', resource_config TEXT NOT NULL DEFAULT '',
-  hardware_config TEXT NOT NULL DEFAULT '', server_config TEXT NOT NULL DEFAULT '',
+  environment TEXT NOT NULL DEFAULT '',
   spec_hash TEXT NOT NULL DEFAULT '', intent_key TEXT NOT NULL DEFAULT '',
   intent_embedding TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(agent_id, run_id)
@@ -39,7 +37,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS main_notifications (
-  notification_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, claimed_at TEXT, delivered_at TEXT,
+  notification_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, delivered_at TEXT,
   agent_id INTEGER, run_id INTEGER, kind TEXT NOT NULL,
   table_name TEXT NOT NULL, row_json TEXT NOT NULL
 );

@@ -22,7 +22,7 @@ from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
-from perferox.tools import cleanup_cloud_resources, provider_cli
+from perferox.tools import cleanup_cloud_resources, provider_cli, reconcile_tmux_sessions
 
 MAIN_SESSION = "perferox-main"
 CONSOLE = Console()
@@ -103,7 +103,6 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       with db.open_db(db_path) as conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
-        db.release_main_notification_claims(conn)
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
         if session["status"] == "ending":
           return 0
@@ -205,30 +204,23 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
 
 
 def _wait_for_main_event(db_path: Path, poll_s: float, api_key: str | None = None) -> tuple[str | None, list[int]]:
-  """Wait for a durable wakeup, returning leased notification IDs for later ack."""
+  """Wait for a durable wakeup, returning notification IDs for later ack."""
   previous_running = None
-  tmux = shutil.which("tmux")
   while True:
     with db.open_db(db_path) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
-      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
-      rows = conn.execute(active_query).fetchall()
-      active_rows = []
       missing_line = ""
-      for row in rows:
-        alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
-        if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-          missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
-          db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
-          cleanup_errors = cleanup_cloud_resources(db_path, int(row["agent_id"]), api_key)
-          if cleanup_errors:
-            db.append_explorer_state(conn, agent_id=row["agent_id"], line=f"agent-{row['agent_id']} resource cleanup failed")
-          continue
-        active_rows.append(row)
+      for row in reconcile_tmux_sessions(conn, role="subagent"):
+        missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
+        db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
+        cleanup_errors = cleanup_cloud_resources(db_path, int(row["agent_id"]), api_key)
+        if cleanup_errors:
+          db.append_explorer_state(conn, agent_id=row["agent_id"], line=f"agent-{row['agent_id']} resource cleanup failed")
+      active_rows = conn.execute("SELECT session_name FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
       if ending and not active_rows:
         return None, []
-      notifications = [] if ending else db.claim_main_notifications(conn)
+      notifications = [] if ending else db.read_main_notifications(conn)
       if notifications:
         lines = ["Subagent SQLite write notifications:"]
         for row in notifications:
