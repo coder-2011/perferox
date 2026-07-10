@@ -78,8 +78,6 @@ class BenchmarkContractTests(unittest.TestCase):
   def test_serving_args_and_metrics_stay_stable(self) -> None:
     """Check the command/hash boundary and parsed metrics in one fixture."""
     args = BenchServingArgs(
-      output_details=True,
-      cache_report=True,
       num_prompts=8,
       request_rate=2.5,
       extra_request_body={"mode": "stress", "seed": 7},
