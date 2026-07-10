@@ -19,6 +19,7 @@ from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
 
 MAIN_SESSION = "perferox-main"
+SGLANG_REPO = "https://github.com/sgl-project/sglang.git"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     subparser.add_argument("--cwd", default=".")
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
-  for name in ("agent-id", "db-path", "trace-path", "goal-file", "attempt-cap"):
+  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "attempt-cap"):
     subagent.add_argument(f"--{name}", required=True)
   args = parser.parse_args(argv)
 
@@ -59,12 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     db_path = (cwd / args.db_path).resolve()
     trace_dir = (cwd / args.trace_dir).resolve()
     trace_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
+    started_at = int(time.time())
+    trace_path = trace_dir / f"{MAIN_SESSION}-{started_at}.jsonl"
+    workspace = cwd / "sglang"
+    # Preserve the shared checkout so agents can keep branches, commits, and edits.
+    if not (workspace / ".git").is_dir():
+      subprocess.run(["git", "clone", SGLANG_REPO, str(workspace)], check=True)
     try:
       with closing(db.connect(db_path)) as conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
-      graph = build_main_agent_graph(build_chat_model(), db_path, cwd=cwd, trace_dir=trace_dir)
+      graph = build_main_agent_graph(build_chat_model(), db_path, cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir)
       state = {"objective": args.objective, "messages": [HumanMessage(content=args.objective)]}
       while True:
         for event in stream_with_trace(graph, state, trace_path):
@@ -87,7 +93,10 @@ def main(argv: list[str] | None = None) -> int:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
     attempt_cap = int(args.attempt_cap)
-    graph = build_subagent_graph(build_chat_model(), agent_id, registry, db_path, attempt_cap=attempt_cap, trace_ref=str(trace_path))
+    graph = build_subagent_graph(
+      build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
+      attempt_cap=attempt_cap, trace_ref=str(trace_path),
+    )
     state = {"agent_id": agent_id, "loop_cap": attempt_cap, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
     for _ in stream_with_trace(graph, state, trace_path):
       pass

@@ -22,7 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.tools import run_local_command, search_files_tool
+from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
 MAX_EXPLORER_LINE_CHARS = 120
@@ -37,6 +37,9 @@ Your job is to investigate SGLang and related systems like a performance hacker:
 read code, search docs, inspect SQLite, form hypotheses, and delegate bounded
 benchmark workers.
 
+Your repository root is a persistent full clone of upstream SGLang. Preserve
+existing edits and use normal Git operations when you need another branch.
+
 ExplorerState is injected into your context every turn. Treat it as the compact
 map of explored territory. Add one short line when you learn something that
 should affect future exploration. Do not log private reasoning; log conclusions,
@@ -46,6 +49,9 @@ ideas, and weakly different variants.
 Subagents are tools. Delegate with one rich goal and an attempt cap. Started
 benchmark runs count against the cap whether they pass or fail. Do not ask for
 human approval inside the configured run bounds.
+
+Use live web search when useful for current repositories, commits, issues, and
+documentation. Container images are optional setup shortcuts, not requirements.
 """
 
 
@@ -61,15 +67,18 @@ def build_main_agent_graph(
   db_path: str | Path,
   *,
   cwd: str | Path = ".",
+  runtime_cwd: str | Path | None = None,
   trace_dir: str | Path = "traces",
   extra_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
   """Compile the main coordinator graph with ExplorerState hydration."""
   root = Path(cwd).resolve()
+  # Keep Perferox process launches separate from the SGLang source workspace.
+  runtime_root = Path(runtime_cwd).resolve() if runtime_cwd is not None else root
   traces = Path(trace_dir)
-  traces = traces if traces.is_absolute() else (root / traces).resolve()
+  traces = traces if traces.is_absolute() else (runtime_root / traces).resolve()
   database = Path(db_path)
-  database = database if database.is_absolute() else (root / database).resolve()
+  database = database if database.is_absolute() else (runtime_root / database).resolve()
 
   with closing(db.connect(database)) as conn:
     db.init_db(conn)
@@ -195,11 +204,17 @@ def build_main_agent_graph(
       line_id = db.append_explorer_state(conn, agent_id=agent_id, line=line)
     return f"wrote ExplorerState line X{line_id:04d}"
 
-  @tool("delegate_benchmark_subagent", description="Start one benchmark subagent with a rich goal and started-attempt cap.")
-  def delegate_benchmark_subagent(goal: str, attempt_cap: int) -> str:
-    """Start one tmux-wrapped benchmark subagent process."""
+  @tool("delegate_benchmark_subagent", description="Start one benchmark subagent for an exact repository commit, goal, and attempt cap.")
+  def delegate_benchmark_subagent(repository: str, commit: str, goal: str, attempt_cap: int) -> str:
+    """Start one tmux-wrapped benchmark subagent for an exact revision."""
     if attempt_cap < 1:
       return "attempt_cap must be >= 1"
+    repository = repository.strip()
+    commit = commit.strip()
+    if not repository:
+      return "repository must not be empty"
+    if not commit:
+      return "commit must not be empty"
     if not goal.strip():
       return "goal must not be empty"
     with closing(db.connect(database)) as conn:
@@ -230,21 +245,22 @@ def build_main_agent_graph(
       "uv", "run", "python", "-m", "perferox.agent_runner", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
+      "--repository", repository, "--commit", commit,
       "--attempt-cap", str(attempt_cap),
     ])
     result = subprocess.run(
-      [tmux, "new-session", "-d", "-s", session_name, "-c", str(root), "--", "bash", "-lc", command],
+      [tmux, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command],
       text=True,
       capture_output=True,
       check=False,
     )
     if result.returncode != 0:
       return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
-    line = _shorten(f"start agent-{agent_id} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
+    line = _shorten(f"start agent-{agent_id} {repository}@{commit} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
     with closing(db.connect(database)) as conn:
       db.init_db(conn)
       db.append_explorer_state(conn, agent_id=None, line=line)
-    return f"started agent_id={agent_id} attempt_cap={attempt_cap} session={session_name} trace={trace_path} attach='tmux attach -t {session_name}'"
+    return f"started agent_id={agent_id} repository={repository} commit={commit} attempt_cap={attempt_cap} session={session_name} trace={trace_path} attach='tmux attach -t {session_name}'"
 
   tools = [
     bash,
@@ -258,7 +274,8 @@ def build_main_agent_graph(
     delegate_benchmark_subagent,
     *extra_tools,
   ]
-  bound_model = model.bind_tools(list(tools))
+  # Native web search executes server-side and never enters the local ToolNode.
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
 
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""

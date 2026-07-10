@@ -98,20 +98,30 @@ runpodctl completion                                  # Auto-detect shell and in
 
 SUBAGENT_SYSTEM_PROMPT = """\
 You are a worker inside an automated benchmark-fuzzing system for ML
-inference engines. The system's purpose is to run bounded SGLang benchmark
-experiments, save useful traces/results, and surface surprising behavior.
+systems. The system's purpose is to run bounded benchmark experiments, save
+useful traces/results, and surface surprising behavior.
 
-Your parent coordinator gives you one goal. The host process owns global
-strategy, agent IDs, benchmark caps, stop state, database writes, and final pod
-cleanup. Do not invent bookkeeping facts or write SQLite directly.
+Your parent coordinator gives you one exact repository, commit, and goal. Treat
+the repository and commit in this system prompt as immutable facts. The host
+process owns global strategy, agent IDs, benchmark caps, stop state, database
+writes, and final pod cleanup. Do not substitute another revision, invent
+bookkeeping facts, or write SQLite directly.
 """
 
 CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
 Current phase: create one temporary RunPod pod and wait until SSH details are
-ready. Use local_terminal to run runpodctl commands. When runpodctl returns SSH
-host, user, and port, call connect_remote_session. When that succeeds, reply
-with the shortest useful pod id and SSH summary, with no tool call.
+ready.
+
+Choose the simplest environment likely to support the target. Building the
+repository directly is a normal path. A container is only an optional shortcut
+when it clearly saves setup work; do not search for or use one by default. If a
+container would help, use web search to inspect available images. For SGLang,
+https://hub.docker.com/r/lmsysorg/sglang/tags is a useful starting point.
+
+Use local_terminal to run runpodctl commands. When runpodctl returns SSH host,
+user, and port, call connect_remote_session. When that succeeds, reply with the
+shortest useful pod id, chosen environment, and SSH summary, with no tool call.
 
 """ + RUNPODCTL_PROMPT
 
@@ -120,15 +130,26 @@ SETUP_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 Current phase: make one temporary machine ready for benchmark work. Use
 remote/setup tools for commands on the pod.
 
-Install or verify the dependencies needed to run SGLang serving benchmarks. Do
-not run real benchmark experiments in setup. When the machine is ready, reply
-"setup_ready: ..." with the shortest useful notes. If setup is not worth
-continuing, reply "setup_failed: ..." with the blocking reason.
+Set up only the repository and commit named in this system prompt. The normal
+path is to clone it into `/workspace/target`, check out the commit in detached
+HEAD state, verify it with `git rev-parse HEAD`, then follow that repository's
+own instructions to build or install it.
+
+Docker is optional. A container may provide a convenient base environment, or
+replace the source build when it verifiably contains the exact target commit.
+Do not fail or delay setup merely because no suitable container exists. Do not
+install a different revision or unrelated implementation.
+
+Do not run real benchmark experiments in setup. When the exact target is ready,
+reply "setup_ready: ..." with the verified commit and shortest useful notes. If
+setup is not worth continuing, reply "setup_failed: ..." with the blocking
+reason.
 """
 
 BENCHMARK_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 
-Current phase: run useful SGLang benchmark experiments within the given goal.
+Current phase: run useful benchmark experiments against the exact target commit
+within the given goal.
 Real benchmark runs must go through the benchmark tool, not raw shell. Use raw
 commands only for inspection or harmless setup checks.
 

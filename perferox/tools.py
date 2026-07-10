@@ -20,6 +20,7 @@ DEFAULT_TIMEOUT_S = 30.0
 MAX_OUTPUT_CHARS = 10000
 MAX_SEARCH_RESULTS = 50
 SKIP_SEARCH_DIRS = {".git", ".ruff_cache", ".venv", "__pycache__"}
+WEB_SEARCH_TOOL = {"type": "web_search", "external_web_access": True, "search_context_size": "high"}
 
 
 def search_files_tool(cwd: str | Path) -> BaseTool:

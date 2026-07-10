@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from perferox import db
 from perferox.agent_runner import MAIN_SESSION, _wait_for_main_event
+from perferox.agent_runner import main as run_agent
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.tools import sglang_bench_serving
@@ -102,6 +103,38 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertEqual(metrics["cache_hit_rate"], 0.75)
     self.assertEqual(metrics["error_rate"], 0.1)
 
+
+class MainAgentWorkspaceTests(unittest.TestCase):
+  """Protect the main agent's host-owned SGLang checkout."""
+
+  def test_main_reuses_existing_sglang_checkout(self) -> None:
+    """Preserve an existing checkout as the main agent's code root."""
+    with tempfile.TemporaryDirectory() as tempdir:
+      root = Path(tempdir).resolve()
+      trace_dir = root / "traces"
+      workspace = root / "sglang"
+      (workspace / ".git").mkdir(parents=True)
+      model = object()
+      graph = object()
+      with (
+        patch("perferox.agent_runner.time.time", return_value=1234),
+        patch("perferox.agent_runner.subprocess.run") as clone,
+        patch("perferox.agent_runner.build_chat_model", return_value=model),
+        patch("perferox.agent_runner.build_main_agent_graph", return_value=graph) as build_graph,
+        patch("perferox.agent_runner.stream_with_trace", return_value=()),
+        patch("perferox.agent_runner._wait_for_main_event", return_value=None),
+      ):
+        exit_code = run_agent([
+          "main",
+          "--cwd", str(root),
+          "--db-path", "state.sqlite",
+          "--trace-dir", "traces",
+          "--objective", "find regressions",
+        ])
+
+      self.assertEqual(exit_code, 0)
+      clone.assert_not_called()
+      build_graph.assert_called_once_with(model, root / "state.sqlite", cwd=workspace, runtime_cwd=root, trace_dir=trace_dir)
 
 class HostStateTests(DatabaseTestCase):
   """Protect deterministic SQLite-owned state transitions."""

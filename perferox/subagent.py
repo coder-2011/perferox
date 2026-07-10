@@ -21,6 +21,7 @@ from perferox import db
 from perferox.prompts import BENCHMARK_SYSTEM_PROMPT, CREATE_POD_SYSTEM_PROMPT, SETUP_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.tools import (
+  WEB_SEARCH_TOOL,
   connect_remote_session,
   local_terminal,
   log_anomaly_tool,
@@ -71,7 +72,8 @@ def stream_with_trace(
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
   """Return a LangGraph node that invokes one chat model step."""
-  bound_model = model.bind_tools(list(tools)) if tools else model
+  # Native web search completes inside the model call; ToolNode handles local tools.
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
     """Invoke the model with the subagent goal in the system prompt."""
@@ -96,28 +98,13 @@ def _message_text(message: BaseMessage) -> str:
   return repr(content)
 
 
-def _started_attempts(state: SubagentState) -> int:
-  """Count benchmark attempts that actually started."""
-  return sum(
-    getattr(message, "type", "") == "tool"
-    and getattr(message, "name", "") == "sglang_bench_serving"
-    and str(getattr(message, "content", "")).startswith("run_id=")
-    for message in state.get("messages", [])
-  )
-
-
-def _stop_requested(db_path: str | Path, agent_id: int) -> bool:
-  """Check the host-owned stop flag before starting more benchmark work."""
-  with closing(db.connect(db_path)) as conn:
-    db.init_db(conn)
-    return db.stop_requested(conn, agent_id=agent_id)
-
-
 def build_subagent_graph(
   model: BaseChatModel,
   agent_id: int,
   session_registry: SessionRegistry,
   db_path: str | Path,
+  repository: str,
+  commit: str,
   attempt_cap: int = 1,
   trace_ref: str = "",
   create_pod_tools: Sequence[BaseTool] = (local_terminal,),
@@ -126,6 +113,7 @@ def build_subagent_graph(
 ) -> CompiledStateGraph:
   """Compile the fixed subagent lifecycle graph."""
   session_id = f"agent-{agent_id}"
+  target_prompt = f"\n\nTarget repository:\n{repository}\n\nTarget commit:\n{commit}"
   graph = StateGraph(SubagentState)
   create_tool_list = list(create_pod_tools)
   setup_tool_list = list(setup_tools)
@@ -141,6 +129,15 @@ def build_subagent_graph(
   benchmark_tool_list.append(sglang_bench_serving(session_registry, session_id, db_path, agent_id, trace_ref, attempt_cap))
   benchmark_tool_list.append(log_experiment_tool(db_path, agent_id))
   benchmark_tool_list.append(log_anomaly_tool(db_path, agent_id))
+  with closing(db.connect(db_path)) as conn:
+    db.init_db(conn)
+
+  def runtime_status() -> tuple[bool, int]:
+    """Read the host-owned stop flag and attempt count in one connection."""
+    with closing(db.connect(db_path, readonly=True)) as conn:
+      stopped = db.stop_requested(conn, agent_id=agent_id)
+      attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+    return stopped, int(attempts)
 
   def route_after_create_pod(state: SubagentState) -> str:
     """Route pod creation through tools until SSH details are ready."""
@@ -156,7 +153,8 @@ def build_subagent_graph(
       return "basic_setup_tools"
     if "setup_failed" in _message_text(last_message).lower():
       return "setup_intervention"
-    if _stop_requested(db_path, agent_id) or _started_attempts(state) >= attempt_cap:
+    stopped, attempts = runtime_status()
+    if stopped or attempts >= attempt_cap:
       return "wrap_up"
     return "benchmark_loop"
 
@@ -171,7 +169,8 @@ def build_subagent_graph(
 
   def route_after_benchmark(state: SubagentState) -> str:
     """Keep benchmarking until the started-attempt cap is reached."""
-    if _stop_requested(db_path, agent_id) or _started_attempts(state) >= attempt_cap:
+    stopped, attempts = runtime_status()
+    if stopped or attempts >= attempt_cap:
       return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
@@ -185,15 +184,18 @@ def build_subagent_graph(
     summary_prompt = (
       "Close out this Perferox benchmark subagent with a concise factual summary. "
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
-      f"Agent: {agent_id}\nObjective:\n{objective}\nLoop cap: {state.get('loop_cap', attempt_cap)}"
+      f"Agent: {agent_id}\nRepository: {repository}\nCommit: {commit}\nObjective:\n{objective}\nLoop cap: {state.get('loop_cap', attempt_cap)}"
     )
-    response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
+    response = model.bind_tools([WEB_SEARCH_TOOL]).invoke([SystemMessage(content=summary_prompt), *state_messages])
     summary = _message_text(response)
+    _, started_attempts = runtime_status()
     row = {
       "agent_id": agent_id,
+      "repository": repository,
+      "commit": commit,
       "objective": objective,
       "summary": summary,
-      "started_attempts": _started_attempts(state),
+      "started_attempts": started_attempts,
       "loop_cap": state.get("loop_cap", attempt_cap),
       "trace_ref": trace_ref,
     }
@@ -209,7 +211,7 @@ def build_subagent_graph(
     ("setup_intervention", "setup_intervention_tools", setup_tool_list, SETUP_SYSTEM_PROMPT),
     ("benchmark_loop", "benchmark_tools", benchmark_tool_list, benchmark_prompt),
   ):
-    graph.add_node(name, _model_node(model, tools, prompt))
+    graph.add_node(name, _model_node(model, tools, prompt + target_prompt))
     graph.add_node(tool_node, ToolNode(tools, name=tool_node))
   graph.add_node("wrap_up", wrap_up)
 
