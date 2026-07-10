@@ -23,7 +23,7 @@ from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_
 from perferox.remote import SessionRegistry
 from perferox.status import refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
-from perferox.tools import create_cloud_resource_tool, local_terminal, terminate_cloud_resources
+from perferox.tools import cleanup_cloud_resources, provider_cli
 
 MAIN_SESSION = "perferox-main"
 CONSOLE = Console()
@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   registry = SessionRegistry()
   api_key = read_cloud_key(args.cloud_key_file)
   provider = cloud_provider(api_key)
-  # Expose only the selected CLI credential to local_terminal.
+  # Expose only the selected credential to the bounded provider CLI.
   for name in ("LAMBDA_API_KEY", "RUNPOD_API_KEY"):
     os.environ.pop(name, None)
   os.environ["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       create_pod_prompt=create_prompt,
       attempt_cap=attempt_cap,
       trace_ref=str(trace_path),
-      create_pod_tools=(local_terminal, create_cloud_resource_tool(provider, db_path, agent_id)),
+      create_pod_tools=(provider_cli(provider, db_path, agent_id),),
     )
     state = {"agent_id": agent_id, "objective": Path(args.goal_file).read_text(encoding="utf-8"), "messages": []}
     for _ in stream_with_trace(graph, state, trace_path):
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
-    terminate_cloud_resources(db_path, agent_id)
+    cleanup_cloud_resources(db_path, agent_id)
     with closing(db.connect(db_path)) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
@@ -187,19 +187,30 @@ def _wait_for_main_event(db_path: Path, poll_s: float, cloud_api_key: str | None
       missing = refresh_sessions(conn)
       active_rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
-      if ending and not active_rows:
-        return None
-      if notifications and not ending:
-        return "Subagent SQLite write notifications:\n" + "\n".join(
-          f"{'ANOMALY ' if row['kind'] == 'anomaly_logged' else ''}notification_id={row['notification_id']} "
-          f"kind={row['kind']} agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}\n{row['row_json']}"
-          for row in notifications
-        )
-      if missing:
-        missing_agents = conn.execute("SELECT agent_id FROM agent_sessions WHERE role = 'subagent' AND status = 'missing'").fetchall()
-        for row in missing_agents:
-          terminate_cloud_resources(db_path, row["agent_id"], cloud_api_key)
-        return "Tmux session update:\n" + "\n".join(missing)
+      cleanup_agents = conn.execute(
+        """
+        SELECT DISTINCT c.agent_id FROM cloud_resources c
+        JOIN agent_sessions s ON s.agent_id = c.agent_id
+        WHERE c.terminated_at IS NULL AND s.role = 'subagent' AND s.status NOT IN ('running', 'ending')
+        """
+      ).fetchall()
+    cleanup_errors = []
+    # Provider I/O must not retain the coordinator's SQLite connection.
+    for row in cleanup_agents:
+      cleanup_errors.extend(cleanup_cloud_resources(db_path, row["agent_id"], cloud_api_key))
+    if ending and not active_rows:
+      if cleanup_errors:
+        time.sleep(poll_s)
+        continue
+      return None
+    if notifications and not ending:
+      return "Subagent SQLite write notifications:\n" + "\n".join(
+        f"{'ANOMALY ' if row['kind'] == 'anomaly_logged' else ''}notification_id={row['notification_id']} "
+        f"kind={row['kind']} agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}\n{row['row_json']}"
+        for row in notifications
+      )
+    if missing:
+      return "Tmux session update:\n" + "\n".join(missing)
     if ending:
       time.sleep(poll_s)
       continue

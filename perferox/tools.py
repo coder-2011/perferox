@@ -5,6 +5,7 @@ import os
 import shlex
 import signal
 import subprocess
+from collections.abc import Mapping
 from contextlib import closing
 from heapq import nsmallest
 from pathlib import Path
@@ -21,6 +22,14 @@ MAX_OUTPUT_CHARS = 10000
 MAX_SEARCH_RESULTS = 50
 SKIP_SEARCH_DIRS = {".git", ".ruff_cache", ".venv", "__pycache__"}
 WEB_SEARCH_TOOL = {"type": "web_search", "external_web_access": True, "search_context_size": "high"}
+_PROVIDER_COMMANDS = {
+  "runpod": (
+    "runpodctl",
+    ("pod", "create"),
+    (("--help",), ("doctor",), ("version",), ("gpu", "list"), ("pod", "list"), ("pod", "get"), ("template", "list"), ("template", "search"), ("template", "get"), ("ssh", "info"), ("ssh", "list-keys")),
+  ),
+  "lambda": ("lambda-labs", ("up",), (("--help",), ("catalog",), ("keys",), ("ls",))),
+}
 
 
 def search_files_tool(cwd: str | Path) -> BaseTool:
@@ -70,18 +79,6 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
     return "\n".join(f"score={score} {rel_path}" for rel_path, score in matches) or "no matches"
 
   return search_files
-
-
-@tool("local_terminal", description="Run one shell command on the local host. Use for local files and local setup; directory changes do not persist.")
-def local_terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-  """Run one shell command on the local host."""
-  try:
-    argv = shlex.split(command)
-  except ValueError as exc:
-    return f"invalid shell command: {exc}"
-  if argv[:3] == ["runpodctl", "pod", "create"] or argv[:2] == ["lambda-labs", "up"]:
-    return "cloud creation refused; use create_cloud_resource so the host can guarantee teardown"
-  return run_local_command(command, timeout_s)
 
 
 def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTool:
@@ -167,85 +164,93 @@ def sglang_bench_serving(
   return run
 
 
-def create_cloud_resource_tool(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
-  """Create and immediately persist one provider resource ID."""
-  if provider == "lambda":
-    @tool("create_cloud_resource", description="Launch exactly one Lambda instance and persist its ID for guaranteed host teardown.")
-    def create_lambda(instance_type: str, region: str, ssh_key: str) -> str:
-      """Launch one Lambda instance through the bundled CLI."""
-      command = ["lambda-labs", "up", instance_type, "--region", region, "--key", ssh_key]
-      result = subprocess.run(command, text=True, capture_output=True, check=False)
-      output = result.stdout.strip()
-      if result.returncode != 0:
-        return _format_result(result.returncode, result.stdout, result.stderr)
-      resource_ids = output.removeprefix("launched ").split(", ")
-      if len(resource_ids) != 1 or resource_ids[0] == output:
-        return f"instance launched but resource id was not recognized; stop and clean up manually: {output}"
-      resource_id = resource_ids[0]
-      persistence_error = _persist_cloud_resource(db_path, agent_id, provider, resource_id)
-      if persistence_error:
-        return persistence_error
-      return f"created lambda resource_id={resource_id}"
+def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
+  """Create one bounded provider CLI that records every paid resource."""
+  executable, create_prefix, read_prefixes = _PROVIDER_COMMANDS[provider]
 
-    return create_lambda
-
-  @tool("create_cloud_resource", description="Create one RunPod pod and persist its ID for guaranteed host teardown.")
-  def create_runpod(arguments: list[str]) -> str:
-    """Create one RunPod pod from explicit CLI arguments."""
-    command = ["runpodctl", "pod", "create", *arguments, "--output", "json"]
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
-    if result.returncode != 0:
-      return _format_result(result.returncode, result.stdout, result.stderr)
+  @tool("provider_cli", description=f"Run allowlisted {provider} CLI arguments without a shell; the host records creation and owns teardown.")
+  def run(arguments: list[str]) -> str:
+    """Run one read or create command through the selected provider CLI."""
+    if not arguments or any(not argument for argument in arguments):
+      return "provider_cli arguments must be non-empty strings"
+    prefix = tuple(arguments)
+    creating = prefix[:len(create_prefix)] == create_prefix and "--help" not in arguments
+    readable = "--help" in arguments or any(prefix[:len(allowed)] == allowed for allowed in read_prefixes)
+    if not creating and not readable:
+      return f"provider_cli refused unsupported or mutating {provider} command"
+    if provider == "lambda" and creating and "--count" in arguments:
+      return "provider_cli permits exactly one Lambda instance"
+    if creating:
+      with closing(db.connect(db_path)) as conn:
+        if db.stop_requested(conn, agent_id=agent_id):
+          return "stop requested; provider creation refused"
+        if db.pending_cloud_resources(conn, agent_id=agent_id):
+          return "provider_cli permits one active cloud resource per subagent"
+    argv = [executable, *arguments]
+    if provider == "runpod" and creating and not {"--output", "-o"} & set(arguments):
+      argv.extend(("--output", "json"))
+    result = _run_argv(argv)
+    if not creating or not result.startswith("exit_code=0\n"):
+      return result
+    resource_id = _created_resource_id(provider, result.partition("\n")[2])
+    if not resource_id:
+      return f"{result}\nprovider_cli could not identify the created resource; inspect provider inventory immediately"
     try:
-      resource_id = str(json.loads(result.stdout)["id"])
-    except (KeyError, TypeError, ValueError):
-      return f"pod created but resource id was not recognized; stop and clean up manually: {result.stdout.strip()}"
-    persistence_error = _persist_cloud_resource(db_path, agent_id, provider, resource_id)
-    if persistence_error:
-      return persistence_error
-    return f"created runpod resource_id={resource_id}\n{result.stdout.strip()}"
+      with closing(db.connect(db_path)) as conn:
+        db.record_cloud_resource(conn, agent_id=agent_id, provider=provider, resource_id=resource_id)
+    except Exception as exc:
+      cleanup = _terminate_resource(provider, resource_id, os.environ)
+      return f"provider resource registration failed: {type(exc).__name__}: {exc}\ncompensating cleanup: {cleanup}"
+    return f"resource_id={resource_id}\n{result}"
 
-  return create_runpod
-
-
-def _persist_cloud_resource(db_path: str | Path, agent_id: int, provider: str, resource_id: str) -> str:
-  """Persist a new resource ID or immediately delete the untracked resource."""
-  try:
-    with closing(db.connect(db_path)) as conn:
-      db.record_cloud_resource(conn, agent_id=agent_id, provider=provider, resource_id=resource_id)
-  except Exception as exc:
-    cleanup = subprocess.run(_cloud_delete_command(provider, resource_id), text=True, capture_output=True, check=False)
-    outcome = "deleted" if cleanup.returncode == 0 else (cleanup.stderr or cleanup.stdout).strip()
-    return f"resource persistence failed: {type(exc).__name__}: {exc}; immediate cleanup: {outcome}"
-  return ""
+  return run
 
 
-def _cloud_delete_command(provider: str, resource_id: str) -> list[str]:
-  """Return the provider CLI command that permanently deletes one resource."""
-  return ["lambda-labs", "rm", resource_id] if provider == "lambda" else ["runpodctl", "pod", "delete", resource_id]
-
-
-def terminate_cloud_resources(db_path: str | Path, agent_id: int, api_key: str | None = None) -> list[str]:
-  """Terminate every persisted paid resource owned by one worker."""
+def cleanup_cloud_resources(db_path: str | Path, agent_id: int, api_key: str | None = None) -> list[str]:
+  """Terminate one worker's persisted resources and return cleanup failures."""
   with closing(db.connect(db_path, readonly=True)) as conn:
     resources = db.pending_cloud_resources(conn, agent_id=agent_id)
-  results = []
+  errors = []
   for resource in resources:
     provider = resource["provider"]
     resource_id = resource["resource_id"]
-    command = _cloud_delete_command(provider, resource_id)
     env = os.environ.copy()
     if api_key:
       env["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
-    try:
-      result = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
-      error = "" if result.returncode == 0 else (result.stderr or result.stdout).strip()
-    except OSError as exc:
-      error = f"{type(exc).__name__}: {exc}"
+    result = _terminate_resource(provider, resource_id, env)
+    error = "" if result.startswith("exit_code=0\n") else result
     with closing(db.connect(db_path)) as conn:
       db.finish_cloud_resource(conn, provider=provider, resource_id=resource_id, error=error)
-    results.append(f"{provider} {resource_id}: {'terminated' if not error else error}")
-  return results
+    if error:
+      errors.append(f"{provider} {resource_id}: {error}")
+  return errors
+
+
+def _run_argv(argv: list[str], env: Mapping[str, str] | None = None) -> str:
+  """Run one argv command without shell interpretation."""
+  try:
+    result = subprocess.run(argv, text=True, capture_output=True, check=False, env=env)
+  except OSError as exc:
+    return _format_result(None, "", f"{type(exc).__name__}: {exc}")
+  return _format_result(result.returncode, result.stdout, result.stderr)
+
+
+def _created_resource_id(provider: str, output: str) -> str | None:
+  """Extract one resource ID from a successful provider response."""
+  if provider == "lambda":
+    parts = output.split()
+    return parts[1] if len(parts) == 2 and parts[0] == "launched" else None
+  try:
+    resource_id = json.loads(output)["id"]
+  except (KeyError, TypeError, ValueError):
+    return None
+  return str(resource_id)
+
+
+def _terminate_resource(provider: str, resource_id: str, env: Mapping[str, str]) -> str:
+  """Permanently delete one recorded provider resource."""
+  argv = ["lambda-labs", "rm", resource_id] if provider == "lambda" else ["runpodctl", "pod", "delete", resource_id]
+  return _run_argv(argv, env)
 
 
 def log_experiment_tool(db_path: str | Path, agent_id: int) -> BaseTool:

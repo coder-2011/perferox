@@ -23,7 +23,6 @@ from perferox.remote import SessionRegistry
 from perferox.tools import (
   WEB_SEARCH_TOOL,
   connect_remote_session,
-  local_terminal,
   log_anomaly_tool,
   log_experiment_tool,
   remote_terminal,
@@ -106,7 +105,7 @@ def build_subagent_graph(
   create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
   attempt_cap: int = 1,
   trace_ref: str = "",
-  create_pod_tools: Sequence[BaseTool] = (local_terminal,),
+  create_pod_tools: Sequence[BaseTool] = (),
   setup_tools: Sequence[BaseTool] = (),
   benchmark_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
@@ -183,9 +182,6 @@ def build_subagent_graph(
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "benchmark_tools"
-    stopped, attempts = runtime_status()
-    if stopped or attempts >= attempt_cap:
-      return "wrap_up"
     return "wrap_up"
 
   def wrap_up(state: SubagentState) -> dict[str, Any]:
