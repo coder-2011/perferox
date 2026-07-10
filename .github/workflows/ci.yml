@@ -32,11 +32,11 @@ jobs:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run python -m unittest tests.py
+      - run: uv run pre-commit run --all-files
 
   local-mac:
     name: Local Mac / Python 3.13
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push'
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
@@ -44,4 +44,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --locked
-      - run: uv run python -m unittest tests.py
+      - run: uv run pre-commit run --all-files

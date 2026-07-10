@@ -50,3 +50,8 @@ indent-width = 2
 
 [tool.ruff.format]
 exclude = ["*"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+]
