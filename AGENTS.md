@@ -10,9 +10,9 @@ The system should run bounded benchmark experiments, preserve useful traces, det
 
 ## Source of Truth
 
-- `arch.md` is the current architecture source of truth.
+- `structures.md` is the current architecture source of truth.
 - `README.md` is project context, but it may lag behind recent stack decisions.
-- If `README.md` and `arch.md` conflict, follow `arch.md` and surface the conflict before broad changes.
+- If `README.md` and `structures.md` conflict, follow `structures.md` and surface the conflict before broad changes.
 - Do not create new docs unless they remove real ambiguity.
 
 ## Current Stack
