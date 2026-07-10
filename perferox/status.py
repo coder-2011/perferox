@@ -5,13 +5,10 @@ from __future__ import annotations
 import json
 import os
 from collections import deque
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
 from perferox import db
-
-TRACE_LIMIT = 80
 
 
 @dataclass(slots=True)
@@ -31,9 +28,9 @@ class DashboardSnapshot:
   main_status: str
 
 
-def read_dashboard(db_path: str | Path, *, trace_limit: int = TRACE_LIMIT) -> DashboardSnapshot:
+def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSnapshot:
   """Read comprehensive status without consuming main-agent notifications."""
-  with closing(db.connect(db_path)) as conn:
+  with db.open_db(db_path) as conn:
     db.init_db(conn)
     sessions = [dict(row) for row in conn.execute(
         """
@@ -89,7 +86,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = TRACE_LIMIT) -> Da
 
 def read_activity(db_path: str | Path, limit: int) -> list[str]:
   """Read only the bounded activity stream needed by `perferox logs`."""
-  with closing(db.connect(db_path)) as conn:
+  with db.open_db(db_path) as conn:
     db.init_db(conn)
     return _read_activity(conn, limit)
 
@@ -111,7 +108,8 @@ def _read_activity(conn, limit: int) -> list[str]:
   events = [
     f"{row['created_at']} {row['kind']}: {row['payload'] if row['kind'] == 'explorer' else _notification_text(row['payload'])}"
     for row in rows
-  ][::-1]
+  ]
+  events.reverse()
   trace_refs = list(dict.fromkeys(
     row["trace_ref"]
     for row in conn.execute("SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY role, agent_id")

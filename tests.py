@@ -7,13 +7,14 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from pydantic import ValidationError
 
@@ -21,6 +22,7 @@ from perferox import db
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
+from perferox.semantic import DocumentIndex
 from perferox.status import read_dashboard, read_trace_tail
 from perferox.subagent import build_subagent_graph
 from perferox.tools import sglang_bench_serving
@@ -139,6 +141,22 @@ class HostStateTests(DatabaseTestCase):
       db.start_benchmark_run(self.conn, agent_id=2, command="should not start")
     self.assertIn("remote crashed", self.run_row(agent_id=2)["error"])
 
+  def test_subagent_reservations_are_serialized(self) -> None:
+    """Reserve distinct agent ids across concurrent delegations."""
+    def reserve() -> int:
+      """Reserve through an independent process-style connection."""
+      with db.open_db(self.db_path) as conn:
+        return db.reserve_subagent(conn, active_cap=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      agent_ids = sorted(pool.map(lambda _: reserve(), range(2)))
+
+    self.assertEqual(agent_ids, [0, 1])
+    self.assertEqual([row["status"] for row in self.conn.execute("SELECT status FROM agent_sessions ORDER BY agent_id")], ["starting", "starting"])
+    with db.open_db(self.db_path) as conn, self.assertRaisesRegex(ValueError, "max active subagents reached"):
+      db.reserve_subagent(conn, active_cap=2)
+    self.assertEqual(db.request_soft_stop(self.conn), 2)
+
 class ToolAndExperimentTests(DatabaseTestCase):
   """Exercise benchmark tools through fake SSH and real SQLite writes."""
 
@@ -191,6 +209,20 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertEqual([match["intent_key"] for match in matches], ["CUDA cache throughput", "scheduler tail latency"])
     self.assertEqual(anomaly["summary"], "cache-hit collapse on MI250")
 
+  def test_document_index_keeps_rows_aligned_with_vectors(self) -> None:
+    """Rank cached documents without mutating their vector matrix."""
+    with self.conn:
+      self.conn.executemany(
+        "INSERT INTO doc_chunks(source, chunk_id, text, embedding, updated_at) VALUES (?, ?, '', ?, '')",
+        (("cache", "0", "[1.0,0.0]"), ("scheduler", "1", "[0.0,1.0]"), ("mixed", "2", "[0.8,0.2]")),
+      )
+
+    index = DocumentIndex.load(self.db_path)
+    matches = index.search([1.0, 0.0], 2)
+
+    self.assertEqual([document[0] for _, document in matches], ["cache", "mixed"])
+    self.assertFalse(index.vectors.flags.writeable)
+
   def test_soft_stop_blocks_pending_provisioning_tool(self) -> None:
     """Route a stopped worker to summary without executing its requested tool."""
     calls = []
@@ -210,7 +242,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     db.request_soft_stop(self.conn)
     graph = build_subagent_graph(model, 9, SessionRegistry(), self.db_path, "repo", "commit", create_pod_tools=(provision,))
 
-    result = graph.invoke({"agent_id": 9, "messages": [HumanMessage(content="benchmark goal")]})
+    result = graph.invoke({"agent_id": 9, "objective": "benchmark goal", "messages": []})
 
     self.assertEqual(calls, [])
     self.assertEqual(result["summary"], "stopped before provisioning")

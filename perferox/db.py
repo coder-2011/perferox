@@ -6,7 +6,8 @@ import hashlib
 import json
 import math
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,6 +35,16 @@ def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
   return conn
 
 
+@contextmanager
+def open_db(path: str | Path, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
+  """Open and always close one configured SQLite connection."""
+  conn = connect(path, readonly=readonly)
+  try:
+    yield conn
+  finally:
+    conn.close()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
   """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
@@ -58,14 +69,15 @@ def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, lin
   """Append one compact ExplorerState line."""
   created_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
-    cursor = conn.execute(
+    row = conn.execute(
       """
       INSERT INTO explorer_state_lines(agent_id, created_at, line)
       VALUES (?, ?, ?)
+      RETURNING line_id
       """,
       (agent_id, created_at, line),
-    )
-  return int(cursor.lastrowid)
+    ).fetchone()
+  return int(row["line_id"])
 
 
 def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: str, agent_id: int | None = None, trace_ref: str = "") -> None:
@@ -92,25 +104,25 @@ def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status:
       """
       UPDATE agent_sessions
       SET status = ?
-      WHERE session_name = ? AND status IN ('running', 'ending')
+      WHERE session_name = ? AND status IN ('starting', 'running', 'ending')
       """,
       (status, session_name),
     ).rowcount == 1
 
 
 def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
-  """Mark a running agent session ending after a human End action."""
+  """Mark an active agent session ending after a human End action."""
   with conn:
     return conn.execute(
-      "UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status = 'running'",
+      "UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status IN ('starting', 'running')",
       (session_name,),
     ).rowcount == 1
 
 
 def request_soft_stop(conn: sqlite3.Connection) -> int:
-  """Mark every running tmux-wrapped agent session as ending."""
+  """Mark every active tmux-wrapped agent session as ending."""
   with conn:
-    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status = 'running'").rowcount
+    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status IN ('starting', 'running')").rowcount
 
 
 def stop_requested(conn: sqlite3.Connection, *, agent_id: int) -> bool:
@@ -125,6 +137,47 @@ def stop_requested(conn: sqlite3.Connection, *, agent_id: int) -> bool:
     (agent_id,),
   ).fetchone()
   return row is not None
+
+
+def reserve_subagent(conn: sqlite3.Connection, *, active_cap: int) -> int:
+  """Atomically enforce stop/cap state and reserve the next agent id."""
+  with conn:
+    # The write lock keeps concurrent ToolNode delegations from choosing one id.
+    conn.execute("BEGIN IMMEDIATE")
+    main = conn.execute("SELECT status FROM agent_sessions WHERE session_name = 'perferox-main'").fetchone()
+    if main is not None and main["status"] == "ending":
+      raise ValueError("stop requested; not starting a new benchmark subagent")
+    active = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status IN ('starting', 'running', 'ending') AND role = 'subagent'").fetchone()[0]
+    if active >= active_cap:
+      raise ValueError(f"max active subagents reached ({active}/{active_cap})")
+    row = conn.execute(
+      """
+      INSERT INTO agent_sessions(session_name, role, agent_id, status)
+      SELECT 'perferox-agent-' || agent_id, 'subagent', agent_id, 'starting'
+      FROM (
+        SELECT COALESCE(MAX(agent_id) + 1, 0) AS agent_id FROM (
+          SELECT agent_id FROM agent_sessions WHERE agent_id IS NOT NULL
+          UNION ALL
+          SELECT agent_id FROM runs
+        )
+      )
+      RETURNING agent_id
+      """
+    ).fetchone()
+  return int(row["agent_id"])
+
+
+def activate_subagent(conn: sqlite3.Connection, *, agent_id: int, trace_ref: str) -> None:
+  """Attach the trace and activate a successfully launched reservation."""
+  with conn:
+    conn.execute(
+      """
+      UPDATE agent_sessions
+      SET trace_ref = ?, status = CASE WHEN status = 'starting' THEN 'running' ELSE status END
+      WHERE role = 'subagent' AND agent_id = ?
+      """,
+      (trace_ref, agent_id),
+    )
 
 
 def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
@@ -200,18 +253,15 @@ def start_benchmark_run(
       if attempts >= attempt_cap:
         raise ValueError(f"attempt cap reached ({attempts}/{attempt_cap}); wrap up")
     row = conn.execute(
-      "SELECT COALESCE(MAX(run_id) + 1, 0) AS run_id FROM runs WHERE agent_id = ?",
-      (agent_id,),
-    ).fetchone()
-    run_id = int(row["run_id"])
-    conn.execute(
       """
       INSERT INTO runs(agent_id, run_id, started_at, trace_ref, command, exact_hash)
-      VALUES (?, ?, ?, ?, ?, ?)
+      SELECT ?, COALESCE(MAX(run_id) + 1, 0), ?, ?, ?, ?
+      FROM runs WHERE agent_id = ?
+      RETURNING *
       """,
-      (agent_id, run_id, started_at, trace_ref, command, exact_hash),
-    )
-    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+      (agent_id, started_at, trace_ref, command, exact_hash, agent_id),
+    ).fetchone()
+    run_id = int(row["run_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)
   return run_id
 
@@ -220,11 +270,10 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
   """Mark a started benchmark run as finished with an error."""
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
-    conn.execute(
-      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ?",
+    row = conn.execute(
+      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ? RETURNING *",
       (finished_at, error[:2000], agent_id, run_id),
-    )
-    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    ).fetchone()
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
 
 
@@ -277,22 +326,21 @@ def log_experiment(
 
   with conn:
     # Claim the unfinished run and persist its experiment as one transaction.
-    cursor = conn.execute(
-      "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL",
+    row = conn.execute(
+      "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL RETURNING *",
       (finished_at, agent_id, run_id),
-    )
-    if cursor.rowcount != 1:
+    ).fetchone()
+    if row is None:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
-    row = conn.execute("SELECT * FROM runs WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
-    conn.execute(
+    row = conn.execute(
       f"""
       INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL})
       VALUES (?, ?, ?, ?, {_METRIC_PLACEHOLDERS_SQL})
+      RETURNING *
       """,
       (agent_id, run_id, intent_key, json.dumps(intent_embedding, separators=(",", ":")), *values),
-    )
-    row = conn.execute("SELECT * FROM experiments WHERE agent_id = ? AND run_id = ?", (agent_id, run_id)).fetchone()
+    ).fetchone()
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
 
@@ -330,11 +378,10 @@ def log_anomaly(
   """Save a human-readable anomaly tied to a benchmark run."""
   date = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
-    cursor = conn.execute(
-      "INSERT INTO anomalies(agent_id, run_id, date, summary) VALUES (?, ?, ?, ?)",
+    row = conn.execute(
+      "INSERT INTO anomalies(agent_id, run_id, date, summary) VALUES (?, ?, ?, ?) RETURNING *",
       (agent_id, run_id, date, summary),
-    )
-    anomaly_id = int(cursor.lastrowid)
-    row = conn.execute("SELECT * FROM anomalies WHERE anomaly_id = ?", (anomaly_id,)).fetchone()
+    ).fetchone()
+    anomaly_id = int(row["anomaly_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
   return anomaly_id

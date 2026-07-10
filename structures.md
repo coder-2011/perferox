@@ -74,7 +74,7 @@ Its tools are:
 - `delegate_benchmark_subagent`
 - native server-side web search
 
-Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, assigns the next `agent_id`, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
+Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
 
 ## Benchmark worker
 
@@ -111,7 +111,7 @@ Worker tools are deliberately phase-scoped:
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
 
-The worker stores only messages, `agent_id`, and its final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
+The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
 
 ## One benchmark attempt
 
@@ -186,6 +186,7 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
 | `remote.py` | Paramiko SSH session and in-process session registry |
+| `semantic.py` | immutable cached SGLang documentation vector index |
 | `auth.py` | persisted ChatGPT OAuth, cloud-key validation and one-use handoff |
 | `prompts.py` | provider-specific instance creation and worker constraints |
 | `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |

@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import closing
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
@@ -62,7 +61,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
     key_path = write_cloud_key(api_key)
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       db.init_db(conn)
       # Register before tmux starts so an immediate End request cannot be lost.
       db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
@@ -78,12 +77,12 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     except OSError:
       # Delete a secret handoff that tmux never delivered.
       key_path.unlink(missing_ok=True)
-      with closing(db.connect(db_path)) as conn:
+      with db.open_db(db_path) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       raise
     if result.returncode != 0:
       key_path.unlink(missing_ok=True)
-      with closing(db.connect(db_path)) as conn:
+      with db.open_db(db_path) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
     if result.returncode == 0:
       CONSOLE.print(f"[green]started {MAIN_SESSION}[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
@@ -98,7 +97,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
     try:
-      with closing(db.connect(db_path)) as conn:
+      with db.open_db(db_path) as conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
@@ -112,7 +111,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
         cloud_provider=provider, cloud_api_key=api_key,
         cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir,
       )
-      state = {"objective": args.objective, "messages": [HumanMessage(content=args.objective)]}
+      state = {"objective": args.objective, "messages": []}
       while True:
         for event in stream_with_trace(graph, state, trace_path):
           _collect_update(state, event)
@@ -121,7 +120,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
           return 0
         state.setdefault("messages", []).append(HumanMessage(content=update))
     finally:
-      with closing(db.connect(db_path)) as conn:
+      with db.open_db(db_path) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="exited")
 
   agent_id = int(args.agent_id)
@@ -136,7 +135,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     os.environ.pop(name, None)
   os.environ["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
   try:
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
     attempt_cap = int(args.attempt_cap)
@@ -145,13 +144,13 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
       create_pod_prompt=create_prompt, attempt_cap=attempt_cap, trace_ref=str(trace_path),
     )
-    state = {"agent_id": agent_id, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
+    state = {"agent_id": agent_id, "objective": Path(args.goal_file).read_text(encoding="utf-8"), "messages": []}
     for _ in stream_with_trace(graph, state, trace_path):
       pass
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
 
@@ -175,7 +174,7 @@ def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
   previous_running = None
   tmux = shutil.which("tmux")
   while True:
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
       notifications = db.take_main_notifications(conn)
       active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"

@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -35,6 +34,7 @@ class SubagentState(TypedDict, total=False):
   """Graph-safe state for one benchmark subagent."""
 
   agent_id: int
+  objective: str
   messages: Annotated[list[AnyMessage], add_messages]
   summary: str
 
@@ -57,7 +57,7 @@ def stream_with_trace(
   agent_id = state.get("agent_id")
   trace_file = Path(path)
   trace_file.parent.mkdir(parents=True, exist_ok=True)
-  with trace_file.open("a", encoding="utf-8") as file:
+  with trace_file.open("a", encoding="utf-8", buffering=1) as file:
     for event in graph.stream(state, stream_mode="updates"):
       record = {
         "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -66,20 +66,17 @@ def stream_with_trace(
         "payload": event,
       }
       file.write(json.dumps(record, separators=(",", ":"), default=trace_jsonable) + "\n")
-      file.flush()
       yield event
 
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
   """Return a LangGraph node that invokes one chat model step."""
   # Native web search completes inside the model call; ToolNode handles local tools.
-  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=False)
 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
     """Invoke the model with the subagent goal in the system prompt."""
-    state_messages = state.get("messages", [])
-    objective = _message_text(state_messages[0]) if state_messages else "(none)"
-    messages = [SystemMessage(content=f"{system_prompt}\n\nObjective:\n{objective}"), *state_messages]
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "(none)")), *state.get("messages", [])]
     response = bound_model.invoke(messages)
     return {"messages": [response]}
 
@@ -126,12 +123,12 @@ def build_subagent_graph(
     log_experiment_tool(db_path, agent_id),
     log_anomaly_tool(db_path, agent_id),
   ]
-  with closing(db.connect(db_path)) as conn:
+  with db.open_db(db_path) as conn:
     db.init_db(conn)
 
   def runtime_status() -> tuple[bool, int]:
     """Read the host-owned stop flag and started-attempt count together."""
-    with closing(db.connect(db_path, readonly=True)) as conn:
+    with db.open_db(db_path, readonly=True) as conn:
       stopped = db.stop_requested(conn, agent_id=agent_id)
       attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     return stopped, int(attempts)
@@ -183,7 +180,7 @@ def build_subagent_graph(
   def wrap_up(state: SubagentState) -> dict[str, Any]:
     """Generate and notify the main agent with a final worker summary."""
     state_messages = state.get("messages", [])
-    objective = _message_text(state_messages[0]) if state_messages else "(none)"
+    objective = state.get("objective", "(none)")
     summary_prompt = (
       "Close out this Perferox benchmark subagent with a concise factual summary. "
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
@@ -202,7 +199,7 @@ def build_subagent_graph(
       "loop_cap": attempt_cap,
       "trace_ref": trace_ref,
     }
-    with closing(db.connect(db_path)) as conn, conn:
+    with db.open_db(db_path) as conn, conn:
       db.notify_main(conn, agent_id=agent_id, run_id=None, kind="subagent_summary", table_name="subagent_summary", row=row)
     return {"summary": summary, "messages": [response]}
 

@@ -6,7 +6,6 @@ import argparse
 import os
 import shutil
 import sqlite3
-from contextlib import closing
 from importlib.metadata import version
 from pathlib import Path
 
@@ -24,7 +23,7 @@ CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
 BRAND = "#fabd2f"
 DIM = "#928374"
-STATUS_STYLES = {"running": "green", "ok": "green", "ending": "yellow", "warn": "yellow", "failed": "red", "fail": "red", "exited": DIM, "missing": "red", "idle": DIM}
+STATUS_STYLES = {"starting": "yellow", "running": "green", "ok": "green", "ending": "yellow", "warn": "yellow", "failed": "red", "fail": "red", "exited": DIM, "missing": "red", "idle": DIM}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     return _run(args, cwd, db_path, trace_dir)
 
   try:
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       db.init_db(conn)
       stopped = db.request_soft_stop(conn)
       db.append_explorer_state(conn, agent_id=None, line="soft stop requested from CLI")
@@ -127,7 +126,7 @@ def _status(db_path: Path) -> int:
     snapshot = read_dashboard(db_path, trace_limit=10)
   except (OSError, sqlite3.Error) as exc:
     return _error(f"status failed: {exc}")
-  active_agents = sum(1 for session in snapshot.sessions if session["role"] == "subagent" and session["status"] in {"running", "ending"})
+  active_agents = sum(1 for session in snapshot.sessions if session["role"] == "subagent" and session["status"] in {"starting", "running", "ending"})
   summary = Table.grid(expand=True)
   summary.add_row(Text.assemble(("● ", STATUS_STYLES.get(snapshot.main_status, "white")), (f"main {snapshot.main_status}", "bold"), f"  ·  {active_agents} active subagent(s)"))
   summary.add_row(f"{snapshot.runs} runs  ·  {snapshot.running_runs} running  ·  {snapshot.succeeded_runs} ok  ·  {snapshot.failed_runs} failed  ·  {snapshot.experiments} experiments  ·  {snapshot.anomaly_count} anomalies")
@@ -197,7 +196,7 @@ def _doctor(cwd: Path, db_path: Path) -> int:
     ("ChatGPT OAuth", "ok" if authenticated else "fail", "authenticated" if authenticated else "run `perferox login`"),
   ]
   try:
-    with closing(db.connect(db_path)) as conn:
+    with db.open_db(db_path) as conn:
       db.init_db(conn)
     checks.append(("SQLite", "ok", str(db_path)))
   except Exception as exc:  # noqa: BLE001
