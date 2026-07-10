@@ -153,7 +153,7 @@ def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: s
       ON CONFLICT(session_name) DO UPDATE SET
         role = excluded.role,
         agent_id = excluded.agent_id,
-        status = CASE WHEN agent_sessions.status = 'ending' THEN 'ending' ELSE 'running' END,
+        status = CASE WHEN agent_sessions.status = 'ending' OR (agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed')) THEN agent_sessions.status ELSE 'running' END,
         trace_ref = excluded.trace_ref
       """,
       (session_name, role, agent_id, trace_ref),
