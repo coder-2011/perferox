@@ -74,7 +74,7 @@ Its tools are:
 - `delegate_benchmark_subagent`
 - native server-side web search
 
-Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, assigns the next `agent_id`, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
+Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
 
 ## Benchmark worker
 
@@ -111,7 +111,7 @@ Worker tools are deliberately phase-scoped:
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
 
-The worker stores only messages, `agent_id`, and its final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
+The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
 
 ## One benchmark attempt
 

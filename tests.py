@@ -7,13 +7,15 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from pydantic import ValidationError
 
@@ -21,7 +23,7 @@ from perferox import db
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
-from perferox.status import read_dashboard, read_trace_tail
+from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
 from perferox.subagent import build_subagent_graph
 from perferox.tools import sglang_bench_serving
 from perferox.tui import request_end
@@ -132,12 +134,36 @@ class HostStateTests(DatabaseTestCase):
     with self.assertRaisesRegex(ValueError, "attempt cap reached"):
       db.start_benchmark_run(self.conn, agent_id=2, command="second", attempt_cap=1)
 
+    def reserve(_: int) -> int:
+      """Reserve through an independent process-style connection."""
+      with closing(db.connect(self.db_path)) as conn:
+        return db.reserve_subagent(conn, active_cap=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      self.assertEqual(sorted(pool.map(reserve, range(2))), [3, 4])
+    with self.assertRaisesRegex(ValueError, "max active subagents reached"):
+      db.reserve_subagent(self.conn, active_cap=2)
     db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main")
     db.record_agent_session(self.conn, session_name="perferox-agent-2", role="subagent", agent_id=2)
-    self.assertEqual(db.request_soft_stop(self.conn), 2)
+    self.assertEqual(db.request_soft_stop(self.conn), 4)
     with self.assertRaisesRegex(ValueError, "stop requested"):
       db.start_benchmark_run(self.conn, agent_id=2, command="should not start")
     self.assertIn("remote crashed", self.run_row(agent_id=2)["error"])
+
+  def test_refresh_preserves_sessions_registered_after_its_snapshot(self) -> None:
+    """Keep workers registered after the list snapshot live."""
+    db.record_agent_session(self.conn, session_name="old", role="subagent", agent_id=0, trace_ref="old.jsonl")
+
+    def probe(*args, **kwargs):
+      """Register a worker after refresh selected its candidate rows."""
+      db.record_agent_session(self.conn, session_name="old", role="subagent", agent_id=0, trace_ref="old.jsonl")
+      db.record_agent_session(self.conn, session_name="new", role="subagent", agent_id=1, trace_ref="new.jsonl")
+      return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=probe):
+      missing = refresh_sessions(self.conn)
+    self.assertEqual(missing, [])
+    self.assertEqual(dict(self.conn.execute("SELECT session_name, status FROM agent_sessions")), {"old": "running", "new": "running"})
 
 class ToolAndExperimentTests(DatabaseTestCase):
   """Exercise benchmark tools through fake SSH and real SQLite writes."""
@@ -210,7 +236,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     db.request_soft_stop(self.conn)
     graph = build_subagent_graph(model, 9, SessionRegistry(), self.db_path, "repo", "commit", create_pod_tools=(provision,))
 
-    result = graph.invoke({"agent_id": 9, "messages": [HumanMessage(content="benchmark goal")]})
+    result = graph.invoke({"agent_id": 9, "objective": "benchmark goal", "messages": []})
 
     self.assertEqual(calls, [])
     self.assertEqual(result["summary"], "stopped before provisioning")
@@ -233,8 +259,7 @@ class TUIWiringTests(DatabaseTestCase):
     snapshot = read_dashboard(self.db_path)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
     db.take_main_notifications(self.conn)
-    with patch("perferox.process_host.shutil.which", return_value=True), patch("perferox.process_host.subprocess.run") as run:
-      run.side_effect = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=[subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\n", stderr=""), subprocess.CompletedProcess([], 1)]):
       stopped = request_end(self.db_path)
       update = _wait_for_main_event(self.db_path, poll_s=0)
 

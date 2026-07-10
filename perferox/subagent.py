@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -35,6 +35,7 @@ class SubagentState(TypedDict, total=False):
   """Graph-safe state for one benchmark subagent."""
 
   agent_id: int
+  objective: str
   messages: Annotated[list[AnyMessage], add_messages]
   summary: str
 
@@ -57,7 +58,7 @@ def stream_with_trace(
   agent_id = state.get("agent_id")
   trace_file = Path(path)
   trace_file.parent.mkdir(parents=True, exist_ok=True)
-  with trace_file.open("a", encoding="utf-8") as file:
+  with trace_file.open("a", encoding="utf-8", buffering=1) as file:
     for event in graph.stream(state, stream_mode="updates"):
       record = {
         "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -66,22 +67,18 @@ def stream_with_trace(
         "payload": event,
       }
       file.write(json.dumps(record, separators=(",", ":"), default=trace_jsonable) + "\n")
-      file.flush()
       yield event
 
 
 def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: str) -> Callable[[SubagentState], dict[str, list[BaseMessage]]]:
   """Return a LangGraph node that invokes one chat model step."""
   # Native web search completes inside the model call; ToolNode handles local tools.
-  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=False)
 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
     """Invoke the model with the subagent goal in the system prompt."""
-    state_messages = state.get("messages", [])
-    objective = _message_text(state_messages[0]) if state_messages else "(none)"
-    messages = [SystemMessage(content=f"{system_prompt}\n\nObjective:\n{objective}"), *state_messages]
-    response = bound_model.invoke(messages)
-    return {"messages": [response]}
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "(none)")), *state.get("messages", [])]
+    return {"messages": [bound_model.invoke(messages)]}
 
   return call_model
 
@@ -183,7 +180,7 @@ def build_subagent_graph(
   def wrap_up(state: SubagentState) -> dict[str, Any]:
     """Generate and notify the main agent with a final worker summary."""
     state_messages = state.get("messages", [])
-    objective = _message_text(state_messages[0]) if state_messages else "(none)"
+    objective = state.get("objective", "(none)")
     summary_prompt = (
       "Close out this Perferox benchmark subagent with a concise factual summary. "
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
@@ -214,7 +211,7 @@ def build_subagent_graph(
   ):
     phase_prompt = f"{prompt}{target_prompt}\n\nHard cap: start at most {attempt_cap} benchmark attempt(s), then summarize."
     graph.add_node(name, _model_node(model, tools, phase_prompt))
-    graph.add_node(tool_node, ToolNode(tools, name=tool_node))
+    graph.add_node(tool_node, ToolNode(tools, name=tool_node).with_config({"max_concurrency": 1}))
   graph.add_node("wrap_up", wrap_up)
 
   graph.add_edge(START, "create_pod")

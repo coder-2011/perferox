@@ -10,11 +10,13 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 from contextlib import closing
+from itertools import islice
 from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
+import numpy as np
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -23,6 +25,7 @@ from langgraph.prebuilt import ToolNode
 
 from perferox import db
 from perferox.auth import write_cloud_key
+from perferox.status import refresh_sessions
 from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
 
 MAX_ACTIVE_SUBAGENTS = 3
@@ -83,26 +86,11 @@ def build_main_agent_graph(
   database = Path(db_path)
   database = database if database.is_absolute() else (runtime_root / database).resolve()
 
-  with closing(db.connect(database)) as conn:
+  with closing(db.connect(database)) as conn, conn:
     db.init_db(conn)
-
-  def refresh_sessions(conn) -> None:
-    """Mark running tmux sessions missing when tmux no longer has them."""
-    tmux = shutil.which("tmux")
-    rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending')").fetchall()
-    for row in rows:
-      alive = tmux and subprocess.run(
-        [tmux, "has-session", "-t", row["session_name"]],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-      ).returncode == 0
-      if alive:
-        continue
-      if db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-        label = f"agent-{row['agent_id']}" if row["agent_id"] is not None else row["session_name"]
-        line = _shorten(f"{label} tmux missing; trace {Path(row['trace_ref']).name}", MAX_EXPLORER_LINE_CHARS)
-        db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
+    # Release reservations left before tmux received a trace.
+    conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status = 'running' AND trace_ref = ''")
+  document_index = None
 
   @tool("bash", description="Run one local bash command from the repository root.")
   def bash(command: str, timeout_s: float = 30.0) -> str:
@@ -121,13 +109,13 @@ def build_main_agent_graph(
       file_path.relative_to(root)
     except ValueError:
       return f"path escapes repository root: {path}"
+    start = start_line - 1
     try:
-      lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+      with file_path.open(encoding="utf-8", errors="replace") as file:
+        lines = (line.rstrip("\r\n") for line in islice(file, start, start + line_count))
+        return "\n".join(f"{line_number}: {line}" for line_number, line in enumerate(lines, start_line))
     except OSError as exc:
       return f"read_file failed: {type(exc).__name__}: {exc}"
-    start = start_line - 1
-    selected = lines[start:start + line_count]
-    return "\n".join(f"{start + index + 1}: {line}" for index, line in enumerate(selected))
 
   @tool("query_sql", description="Run read-only SQLite against the Perferox database and return rows when available.")
   def query_sql(query: str, row_limit: int = SQL_ROW_LIMIT) -> str:
@@ -149,26 +137,26 @@ def build_main_agent_graph(
   @tool("query_sglang_docs", description="Search locally ingested SGLang docs chunks by semantic similarity.")
   def query_sglang_docs(query: str, limit: int = 5) -> str:
     """Search doc chunks with the existing embedding path."""
+    nonlocal document_index
     if limit < 1 or limit > 10:
       return "limit must be between 1 and 10"
     try:
-      query_embedding = db.embed_intent(query)
-      with closing(db.connect(database, readonly=True)) as conn:
-        rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
+      if document_index is None:
+        with closing(db.connect(Path(__file__).with_name("sglang_docs") / "perferox-docs.sqlite", readonly=True)) as conn:
+          rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
+        documents = tuple((row["source"], row["title"], row["url"], row["text"]) for row in rows)
+        document_index = documents, np.stack([np.asarray(json.loads(row["embedding"]), dtype=np.float32) for row in rows]) if rows else np.empty((0, 0), dtype=np.float32)
+      documents, vectors = document_index
+      if not documents:
+        return "no SGLang doc chunks ingested"
+      scores = vectors @ np.asarray(db.embed_intent(query), dtype=np.float32)
+      indices = np.argsort(-scores, kind="stable")[:limit]
     except Exception as exc:
       return f"query_sglang_docs failed: {type(exc).__name__}: {exc}"
-    scored = [
-      (sum(a * b for a, b in zip(query_embedding, json.loads(row["embedding"]))), row)
-      for row in rows
-    ]
-    scored.sort(key=lambda item: item[0], reverse=True)
-    if not scored:
-      return "no SGLang doc chunks ingested"
     lines = []
-    for score, row in scored[:limit]:
-      title = row["title"] or row["source"]
-      location = row["url"] or row["source"]
-      lines.append(f"score={score:.3f} {title} {location}\n{_shorten(str(row['text']), 500)}")
+    for index in indices:
+      source, title, url, text = documents[index]
+      lines.append(f"score={scores[index]:.3f} {title or source} {url or source}\n{_shorten(text, 500)}")
     return "\n\n".join(lines)
 
   @tool("query_intent_embeddings", description="Find logged experiments with semantically similar intent keys.")
@@ -214,28 +202,28 @@ def build_main_agent_graph(
     goal = goal.strip()
     if not repository or not commit or not goal:
       return "repository, commit, and goal must not be empty"
-    with closing(db.connect(database)) as conn:
-      refresh_sessions(conn)
-      main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()
-      if main_row is not None and main_row["status"] == "ending":
-        return "stop requested; not starting a new benchmark subagent"
-      active_count = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status = 'running' AND role = 'subagent'").fetchone()[0]
-      if active_count >= MAX_ACTIVE_SUBAGENTS:
-        return f"max active subagents reached ({active_count}/{MAX_ACTIVE_SUBAGENTS})"
-      tmux = shutil.which("tmux")
-      if tmux is None:
-        return "tmux is not installed or not on PATH"
-      db_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM runs").fetchone()[0]
-      session_next = conn.execute("SELECT COALESCE(MAX(agent_id) + 1, 0) FROM agent_sessions WHERE agent_id IS NOT NULL").fetchone()[0]
+    tmux = shutil.which("tmux")
+    if tmux is None:
+      return "tmux is not installed or not on PATH"
     traces.mkdir(parents=True, exist_ok=True)
     trace_next = max((int(path.stem[6:]) for path in traces.glob("agent-*.jsonl") if path.stem[6:].isdigit()), default=-1) + 1
-    agent_id = max(db_next, session_next, trace_next)
+    with closing(db.connect(database)) as conn:
+      refresh_sessions(conn)
+      try:
+        agent_id = db.reserve_subagent(conn, active_cap=MAX_ACTIVE_SUBAGENTS, minimum_id=trace_next)
+      except ValueError as exc:
+        return str(exc)
     trace_path = traces / f"agent-{agent_id}.jsonl"
     goal_path = traces / f"agent-{agent_id}.goal.txt"
     session_name = f"{SUBAGENT_SESSION_PREFIX}{agent_id}"
-    trace_path.touch(exist_ok=False)
-    goal_path.write_text(goal, encoding="utf-8")
-    key_path = write_cloud_key(cloud_api_key)
+    try:
+      trace_path.touch(exist_ok=False)
+      goal_path.write_text(goal, encoding="utf-8")
+      key_path = write_cloud_key(cloud_api_key)
+    except OSError:
+      with closing(db.connect(database)) as conn:
+        db.finish_agent_session(conn, session_name=session_name, status="missing")
+      raise
     command = shlex.join([
       "uv", "run", "python", "-m", "perferox.process_host", "subagent",
       "--agent-id", str(agent_id), "--db-path", str(database),
@@ -244,20 +232,25 @@ def build_main_agent_graph(
       "--cloud-key-file", str(key_path),
       "--attempt-cap", str(attempt_cap),
     ])
-    try:
-      result = subprocess.run(
-        [tmux, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command],
-        text=True,
-        capture_output=True,
-        check=False,
-      )
-    except OSError:
-      # Delete a secret handoff that tmux never delivered.
-      key_path.unlink(missing_ok=True)
-      raise
-    if result.returncode != 0:
-      key_path.unlink(missing_ok=True)
-      return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
+    with closing(db.connect(database)) as conn, conn:
+      # Serialize the last stop check with tmux creation so End cannot slip between them.
+      conn.execute("BEGIN IMMEDIATE")
+      if db.stop_requested(conn, agent_id=agent_id):
+        key_path.unlink(missing_ok=True)
+        conn.execute("UPDATE agent_sessions SET status = 'exited' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
+        return "stop requested; subagent not launched"
+      try:
+        result = subprocess.run([tmux, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
+      except OSError:
+        key_path.unlink(missing_ok=True)
+        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
+        conn.commit()
+        raise
+      if result.returncode != 0:
+        key_path.unlink(missing_ok=True)
+        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
+        return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
+      conn.execute("UPDATE agent_sessions SET trace_ref = ? WHERE role = 'subagent' AND agent_id = ?", (str(trace_path), agent_id))
     line = _shorten(f"start agent-{agent_id} {repository}@{commit} attempts={attempt_cap}: {goal}", MAX_EXPLORER_LINE_CHARS)
     with closing(db.connect(database)) as conn:
       db.append_explorer_state(conn, agent_id=None, line=line)
@@ -284,11 +277,10 @@ def build_main_agent_graph(
       refresh_sessions(conn)
       lines = db.read_explorer_state(conn)
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
-    objective = state.get("objective", "") or "(none)"
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
-    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nObjective:\n{objective}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
-    messages = [SystemMessage(content=system_prompt), *state.get("messages", [])]
+    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "") or "(none)"), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 
   def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
@@ -311,6 +303,4 @@ def build_main_agent_graph(
 def _shorten(text: str, limit: int = 80) -> str:
   """Shorten text for compact ExplorerState lines."""
   compact = " ".join(text.split())
-  if len(compact) <= limit:
-    return compact
-  return compact[:limit - 1].rstrip() + "..."
+  return compact if len(compact) <= limit else compact[:limit - 1].rstrip() + "..."

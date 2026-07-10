@@ -21,6 +21,7 @@ from perferox.auth import build_chat_model, cloud_provider, read_cloud_key, writ
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
+from perferox.status import refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
 
 MAIN_SESSION = "perferox-main"
@@ -98,9 +99,11 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
     try:
-      with closing(db.connect(db_path)) as conn:
+      with closing(db.connect(db_path)) as conn, conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+        # A prior coordinator may have died after reserving but before launching tmux.
+        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status IN ('running', 'ending') AND trace_ref = ''")
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
         if session["status"] == "ending":
           return 0
@@ -112,7 +115,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
         cloud_provider=provider, cloud_api_key=api_key,
         cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir,
       )
-      state = {"objective": args.objective, "messages": [HumanMessage(content=args.objective)]}
+      state = {"objective": args.objective, "messages": []}
       while True:
         for event in stream_with_trace(graph, state, trace_path):
           _collect_update(state, event)
@@ -139,13 +142,15 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
+      if conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()["status"] == "ending":
+        return 0
     attempt_cap = int(args.attempt_cap)
     create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
     graph = build_subagent_graph(
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
       create_pod_prompt=create_prompt, attempt_cap=attempt_cap, trace_ref=str(trace_path),
     )
-    state = {"agent_id": agent_id, "messages": [HumanMessage(content=Path(args.goal_file).read_text(encoding="utf-8"))]}
+    state = {"agent_id": agent_id, "objective": Path(args.goal_file).read_text(encoding="utf-8"), "messages": []}
     for _ in stream_with_trace(graph, state, trace_path):
       pass
     return 0
@@ -158,52 +163,34 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
 
 def _collect_update(state: dict, event: object) -> None:
   """Merge one streamed LangGraph update into a reusable graph state."""
-  if not isinstance(event, dict):
-    return
-  for update in event.values():
+  for update in event.values() if isinstance(event, dict) else ():
     if not isinstance(update, dict):
       continue
-    for key, value in update.items():
-      if key == "messages":
-        state.setdefault(key, []).extend(value)
-      else:
-        state[key] = value
+    if "messages" in update:
+      state.setdefault("messages", []).extend(update["messages"])
+    state.update((key, value) for key, value in update.items() if key != "messages")
 
 
 def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
   """Wait for a main-agent wakeup or a human End request."""
   previous_running = None
-  tmux = shutil.which("tmux")
   while True:
     with closing(db.connect(db_path)) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
       notifications = db.take_main_notifications(conn)
-      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
-      rows = conn.execute(active_query).fetchall()
-      active_rows = []
-      missing_line = ""
-      for row in rows:
-        alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
-        if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-          missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
-          db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
-          continue
-        active_rows.append(row)
+      missing = refresh_sessions(conn)
+      active_rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
       if ending and not active_rows:
         return None
       if notifications and not ending:
-        lines = ["Subagent SQLite write notifications:"]
-        for row in notifications:
-          prefix = "ANOMALY " if row["kind"] == "anomaly_logged" else ""
-          lines.append(
-            f"{prefix}notification_id={row['notification_id']} kind={row['kind']} "
-            f"agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}"
-          )
-          lines.append(row["row_json"])
-        return "\n".join(lines)
-      if missing_line:
-        return f"Tmux session update:\n{missing_line}"
+        return "Subagent SQLite write notifications:\n" + "\n".join(
+          f"{'ANOMALY ' if row['kind'] == 'anomaly_logged' else ''}notification_id={row['notification_id']} "
+          f"kind={row['kind']} agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}\n{row['row_json']}"
+          for row in notifications
+        )
+      if missing:
+        return "Tmux session update:\n" + "\n".join(missing)
     if ending:
       time.sleep(poll_s)
       continue

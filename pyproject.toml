@@ -45,7 +45,7 @@ lambda-labs = { path = "packages/lambda-labs", editable = true }
 include = ["perferox*"]
 
 [tool.setuptools.package-data]
-perferox = ["init-db.sql", "perferox-tui-demo.gif"]
+perferox = ["init-db.sql", "perferox-tui-demo.gif", "sglang_docs/perferox-docs.sqlite"]
 
 [tool.ruff]
 preview = true
