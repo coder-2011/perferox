@@ -19,7 +19,6 @@ from perferox.remote import SessionRegistry
 from perferox.subagent import build_subagent_graph, stream_with_trace
 
 MAIN_SESSION = "perferox-main"
-SGLANG_REPO = "https://github.com/sgl-project/sglang.git"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,12 +58,11 @@ def main(argv: list[str] | None = None) -> int:
 
   if args.command == "main":
     trace_dir.mkdir(parents=True, exist_ok=True)
-    started_at = int(time.time())
-    trace_path = trace_dir / f"{MAIN_SESSION}-{started_at}.jsonl"
+    trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
     # Preserve the shared checkout so agents can keep branches, commits, and edits.
     if not (workspace / ".git").is_dir():
-      subprocess.run(["git", "clone", SGLANG_REPO, str(workspace)], check=True)
+      subprocess.run(["git", "clone", "https://github.com/sgl-project/sglang.git", str(workspace)], check=True)
     try:
       with closing(db.connect(db_path)) as conn:
         db.init_db(conn)

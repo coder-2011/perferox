@@ -51,7 +51,7 @@ benchmark runs count against the cap whether they pass or fail. Do not ask for
 human approval inside the configured run bounds.
 
 Use live web search when useful for current repositories, commits, issues, and
-documentation. Container images are optional setup shortcuts, not requirements.
+documentation.
 """
 
 
@@ -208,12 +208,9 @@ def build_main_agent_graph(
       return "attempt_cap must be >= 1"
     repository = repository.strip()
     commit = commit.strip()
-    if not repository:
-      return "repository must not be empty"
-    if not commit:
-      return "commit must not be empty"
-    if not goal.strip():
-      return "goal must not be empty"
+    goal = goal.strip()
+    if not repository or not commit or not goal:
+      return "repository, commit, and goal must not be empty"
     with closing(db.connect(database)) as conn:
       refresh_sessions(conn)
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", ("perferox-main",)).fetchone()

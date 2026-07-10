@@ -181,7 +181,7 @@ def build_subagent_graph(
       "Include what was attempted, useful run IDs, anomalies, blockers, and the best next step.\n\n"
       f"Agent: {agent_id}\nRepository: {repository}\nCommit: {commit}\nObjective:\n{objective}\nLoop cap: {attempt_cap}"
     )
-    response = model.bind_tools([WEB_SEARCH_TOOL]).invoke([SystemMessage(content=summary_prompt), *state_messages])
+    response = model.invoke([SystemMessage(content=summary_prompt), *state_messages])
     summary = _message_text(response)
     _, started_attempts = runtime_status()
     row = {
