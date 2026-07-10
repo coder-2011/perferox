@@ -52,4 +52,3 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
 CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_main_notifications_delivered ON main_notifications(delivered_at, notification_id);
-CREATE INDEX IF NOT EXISTS idx_doc_chunks_source ON doc_chunks(source);

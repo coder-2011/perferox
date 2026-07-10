@@ -29,19 +29,19 @@ def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys = ON")
   conn.execute("PRAGMA busy_timeout = 5000")
-  if readonly:
-    conn.execute("PRAGMA query_only = ON")
-  else:
-    conn.execute("PRAGMA journal_mode = WAL")
+  mode_pragma = "PRAGMA query_only = ON" if readonly else "PRAGMA journal_mode = WAL"
+  conn.execute(mode_pragma)
   return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+  """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
 
 
 def embed_intent(intent_key: str) -> list[float]:
+  """Encode one intent with the process-wide normalized embedding model."""
   global _EMBEDDER
   if _EMBEDDER is None:
     from sentence_transformers import SentenceTransformer
@@ -51,8 +51,7 @@ def embed_intent(intent_key: str) -> list[float]:
 
 def read_explorer_state(conn: sqlite3.Connection) -> list[str]:
   """Return compact ExplorerState lines in insertion order."""
-  rows = conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id").fetchall()
-  return [str(row["line"]) for row in rows]
+  return [row["line"] for row in conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id")]
 
 
 def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, line: str) -> int:
@@ -84,32 +83,29 @@ def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: s
 def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str) -> bool:
   """Mark a tmux-wrapped agent process as exited or missing."""
   with conn:
-    cursor = conn.execute(
+    return conn.execute(
       """
       UPDATE agent_sessions
       SET status = ?
       WHERE session_name = ? AND status IN ('running', 'ending')
       """,
       (status, session_name),
-    )
-  return cursor.rowcount == 1
+    ).rowcount == 1
 
 
 def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
   """Mark a running agent session ending after a human End action."""
   with conn:
-    cursor = conn.execute(
+    return conn.execute(
       "UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status = 'running'",
       (session_name,),
-    )
-  return cursor.rowcount == 1
+    ).rowcount == 1
 
 
 def request_soft_stop(conn: sqlite3.Connection) -> int:
   """Mark every running tmux-wrapped agent session as ending."""
   with conn:
-    cursor = conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status = 'running'")
-  return cursor.rowcount
+    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status = 'running'").rowcount
 
 
 def stop_requested(conn: sqlite3.Connection, *, agent_id: int) -> bool:
@@ -139,6 +135,7 @@ def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[s
       (limit,),
     ).fetchall()
     if rows:
+      # Mark exactly the rows read above so concurrent consumers cannot lose events.
       delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
       placeholders = ",".join("?" for _ in rows)
       conn.execute(
@@ -183,9 +180,10 @@ def start_benchmark_run(
   attempt_cap: int | None = None,
 ) -> int:
   """Assign the next run id and insert the started benchmark row."""
-  exact_hash = hashlib.sha256(command.encode("utf-8")).hexdigest()
+  exact_hash = hashlib.sha256(command.encode()).hexdigest()
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
+    # Serialize the stop/cap checks and run-id assignment with the insert.
     conn.execute("BEGIN IMMEDIATE")
     if stop_requested(conn, agent_id=agent_id):
       raise ValueError("stop requested; wrap up")
@@ -273,6 +271,7 @@ def log_experiment(
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
   with conn:
+    # Claim the unfinished run and persist its experiment as one transaction.
     cursor = conn.execute(
       "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL",
       (finished_at, agent_id, run_id),

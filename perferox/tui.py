@@ -411,24 +411,20 @@ def _anomaly_text(anomalies: list[dict[str, object]]) -> str:
 
 
 def _find_last_message(value: object) -> object | None:
-  """Find the deepest final LangChain message-shaped dict in a trace payload."""
+  """Find the final LangChain message by searching trace branches newest-first."""
   if isinstance(value, dict):
     messages = value.get("messages")
     if isinstance(messages, list) and messages:
       return messages[-1]
-    found = None
-    for child in value.values():
-      child_found = _find_last_message(child)
-      if child_found is not None:
-        found = child_found
-    return found
-  if isinstance(value, list):
-    found = None
-    for child in value:
-      child_found = _find_last_message(child)
-      if child_found is not None:
-        found = child_found
-    return found
+    children = reversed(value.values())
+  elif isinstance(value, list):
+    children = reversed(value)
+  else:
+    return None
+  for child in children:
+    found = _find_last_message(child)
+    if found is not None:
+      return found
   return None
 
 

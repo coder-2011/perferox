@@ -2,31 +2,21 @@
 
 RUNPODCTL_PROMPT = """\
 # runpodctl cli
-Runpod CLI to manage GPU workloads.
-
 Use this prompt when an agent needs to inspect or manage Runpod pods,
 serverless endpoints, templates, volumes, or models through `runpodctl`.
 
 ## Rules
 
 - Run `runpodctl doctor` for first-time setup or when auth/SSH looks broken.
-- ** Run `runpodctl --help` or a specific `--help` command before relying on flags. **
-- For SSH details, prefer `runpodctl pod get <pod-id>` or
-  `runpodctl ssh info <pod-id>`.
-- `runpodctl ssh info` returns connection details, not an interactive session.
+- Run `runpodctl --help` or a specific `--help` command before relying on flags.
 
-## Quick Start
+## Discovery and Serverless
 
 ```bash
-runpodctl doctor                    # First time setup (API key + SSH)
-runpodctl --help                    # See current top-level commands
-runpodctl pod create --help         # Inspect exact current flags before creating
 runpodctl gpu list                  # See available GPUs
 runpodctl hub search vllm           # Find a hub repo
 runpodctl serverless create --hub-id <id> --name "my-vllm"  # Deploy from hub
-runpodctl template search pytorch   # Find a template
-runpodctl pod create --template-id runpod-torch-v21 --gpu-id "NVIDIA GeForce RTX 4090"  # Create from template
-runpodctl pod list                  # List your pods```
+```
 
 ## Pods
 
@@ -45,12 +35,7 @@ runpodctl pod stop <pod-id>                           # Stop running pod
 runpodctl pod restart <pod-id>                        # Restart pod
 runpodctl pod reset <pod-id>                          # Reset pod
 runpodctl pod update <pod-id> --name "new"            # Update pod
-runpodctl pod delete <pod-id>                         # Delete pod (aliases: rm, remove)```
-
-For exact pod flags, run:
-
-```bash
-runpodctl pod <action> --help
+runpodctl pod delete <pod-id>                         # Delete pod (aliases: rm, remove)
 ```
 
 ## Templates
@@ -76,6 +61,9 @@ runpodctl template delete <template-id>               # Delete template
 
 ## SSH
 
+Prefer `pod get` or `ssh info` for SSH details. `ssh info` returns connection
+details, not an interactive session.
+
 ```bash
 runpodctl ssh info <pod-id>                           # Get SSH info (command + key, does not connect)
 runpodctl ssh list-keys                               # List SSH keys
@@ -89,7 +77,6 @@ If multiple keys share a name, remove by fingerprint to disambiguate.
 ## Utilities
 
 ```bash
-runpodctl doctor                                      # Diagnose and fix CLI issues
 runpodctl update                                      # Update CLI
 runpodctl version                                     # Show version
 runpodctl completion                                  # Auto-detect shell and install completion
