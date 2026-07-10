@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+from contextlib import closing
 from pathlib import Path
 
 # Textual reads color env vars at import time.
@@ -25,7 +26,7 @@ from perferox.status import DashboardSnapshot, read_dashboard
 
 def request_end(db_path: str | Path) -> int:
   """Ask every running agent process to stop after its current work."""
-  with db.open_db(db_path) as conn:
+  with closing(db.connect(db_path)) as conn:
     db.init_db(conn)
     stopped = db.request_soft_stop(conn)
     db.append_explorer_state(conn, agent_id=None, line="soft stop requested from TUI")
@@ -235,7 +236,7 @@ class PerferoxTUI(App[None]):
 
 def _counter_text(snapshot: DashboardSnapshot) -> str:
   """Render compact live counters."""
-  active = sum(1 for session in snapshot.sessions if session["status"] in {"starting", "running", "ending"} and session["role"] == "subagent")
+  active = sum(1 for session in snapshot.sessions if session["status"] in {"running", "ending"} and session["role"] == "subagent")
   return (
     f"\nmain: {snapshot.main_status}\n"
     f"subagents: {active} active\n"

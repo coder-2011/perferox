@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
@@ -20,6 +21,7 @@ from perferox.auth import build_chat_model, cloud_provider, read_cloud_key, writ
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
+from perferox.status import refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
 
 MAIN_SESSION = "perferox-main"
@@ -61,7 +63,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
     key_path = write_cloud_key(api_key)
-    with db.open_db(db_path) as conn:
+    with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       # Register before tmux starts so an immediate End request cannot be lost.
       db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
@@ -77,12 +79,12 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     except OSError:
       # Delete a secret handoff that tmux never delivered.
       key_path.unlink(missing_ok=True)
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       raise
     if result.returncode != 0:
       key_path.unlink(missing_ok=True)
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
     if result.returncode == 0:
       CONSOLE.print(f"[green]started {MAIN_SESSION}[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
@@ -97,9 +99,11 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
     try:
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn, conn:
         db.init_db(conn)
         db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+        # A prior coordinator may have died after reserving but before launching tmux.
+        conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status = 'running' AND trace_ref = ''")
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
         if session["status"] == "ending":
           return 0
@@ -120,7 +124,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
           return 0
         state.setdefault("messages", []).append(HumanMessage(content=update))
     finally:
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="exited")
 
   agent_id = int(args.agent_id)
@@ -135,9 +139,12 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     os.environ.pop(name, None)
   os.environ["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
   try:
-    with db.open_db(db_path) as conn:
+    with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
+      session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()
+      if session["status"] == "ending":
+        return 0
     attempt_cap = int(args.attempt_cap)
     create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
     graph = build_subagent_graph(
@@ -150,59 +157,41 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
-    with db.open_db(db_path) as conn:
+    with closing(db.connect(db_path)) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
 
 
 def _collect_update(state: dict, event: object) -> None:
   """Merge one streamed LangGraph update into a reusable graph state."""
-  if not isinstance(event, dict):
-    return
-  for update in event.values():
+  for update in event.values() if isinstance(event, dict) else ():
     if not isinstance(update, dict):
       continue
-    for key, value in update.items():
-      if key == "messages":
-        state.setdefault(key, []).extend(value)
-      else:
-        state[key] = value
+    if "messages" in update:
+      state.setdefault("messages", []).extend(update["messages"])
+    state.update((key, value) for key, value in update.items() if key != "messages")
 
 
 def _wait_for_main_event(db_path: Path, poll_s: float) -> str | None:
   """Wait for a main-agent wakeup or a human End request."""
   previous_running = None
-  tmux = shutil.which("tmux")
   while True:
-    with db.open_db(db_path) as conn:
+    with closing(db.connect(db_path)) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
       notifications = db.take_main_notifications(conn)
-      active_query = "SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'"
-      rows = conn.execute(active_query).fetchall()
-      active_rows = []
-      missing_line = ""
-      for row in rows:
-        alive = tmux and subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
-        if not alive and db.finish_agent_session(conn, session_name=row["session_name"], status="missing"):
-          missing_line = f"agent-{row['agent_id']} tmux missing; trace {Path(row['trace_ref']).name}"
-          db.append_explorer_state(conn, agent_id=row["agent_id"], line=missing_line)
-          continue
-        active_rows.append(row)
+      missing = refresh_sessions(conn)
+      active_rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
       if ending and not active_rows:
         return None
       if notifications and not ending:
-        lines = ["Subagent SQLite write notifications:"]
-        for row in notifications:
-          prefix = "ANOMALY " if row["kind"] == "anomaly_logged" else ""
-          lines.append(
-            f"{prefix}notification_id={row['notification_id']} kind={row['kind']} "
-            f"agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}"
-          )
-          lines.append(row["row_json"])
-        return "\n".join(lines)
-      if missing_line:
-        return f"Tmux session update:\n{missing_line}"
+        return "Subagent SQLite write notifications:\n" + "\n".join(
+          f"{'ANOMALY ' if row['kind'] == 'anomaly_logged' else ''}notification_id={row['notification_id']} "
+          f"kind={row['kind']} agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}\n{row['row_json']}"
+          for row in notifications
+        )
+      if missing:
+        return "Tmux session update:\n" + "\n".join(missing)
     if ending:
       time.sleep(poll_s)
       continue

@@ -186,7 +186,6 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
 | `remote.py` | Paramiko SSH session and in-process session registry |
-| `semantic.py` | immutable cached SGLang documentation vector index |
 | `auth.py` | persisted ChatGPT OAuth, cloud-key validation and one-use handoff |
 | `prompts.py` | provider-specific instance creation and worker constraints |
 | `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |

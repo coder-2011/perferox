@@ -5,6 +5,7 @@ import os
 import shlex
 import signal
 import subprocess
+from contextlib import closing
 from heapq import nsmallest
 from pathlib import Path
 from typing import Any
@@ -128,14 +129,14 @@ def sglang_bench_serving(
       return f"invalid bench_serving args: {type(exc).__name__}: {exc}"
     session = registry.get(session_id)
     try:
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         run_id = db.start_benchmark_run(conn, agent_id=agent_id, command=command, trace_ref=trace_ref, attempt_cap=attempt_cap)
     except Exception as exc:
       return f"benchmark not started: {type(exc).__name__}: {exc}"
     output = _run_remote(session, command, args.timeout_s)
     if not output.startswith("exit_code=0\n"):
       # Failed started runs still count, so mark them in SQLite.
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         db.mark_run_failed(conn, agent_id=agent_id, run_id=run_id, error=output)
       return f"run_id={run_id}\n{output}"
     metrics = parse_bench_serving_metrics(output, expected_requests=args.num_prompts)
@@ -154,7 +155,7 @@ def log_experiment_tool(db_path: str | Path, agent_id: int) -> BaseTool:
   def log_experiment(intent_key: str, metrics: dict[str, float | int | None] | None = None) -> str:
     """Log normalized metrics for the agent's latest successful run."""
     try:
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         run_id = db.log_experiment(conn, agent_id=agent_id, intent_key=intent_key, metrics=metrics)
     except Exception as exc:
       return f"log_experiment failed: {type(exc).__name__}: {exc}"
@@ -172,7 +173,7 @@ def log_anomaly_tool(db_path: str | Path, agent_id: int) -> BaseTool:
   def log_anomaly(run_id: int, summary: str) -> str:
     """Log one human-readable anomaly against an agent run."""
     try:
-      with db.open_db(db_path) as conn:
+      with closing(db.connect(db_path)) as conn:
         anomaly_id = db.log_anomaly(conn, agent_id=agent_id, run_id=run_id, summary=summary)
     except Exception as exc:
       return f"log_anomaly failed: {type(exc).__name__}: {exc}"

@@ -6,8 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,16 +34,6 @@ def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
   return conn
 
 
-@contextmanager
-def open_db(path: str | Path, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
-  """Open and always close one configured SQLite connection."""
-  conn = connect(path, readonly=readonly)
-  try:
-    yield conn
-  finally:
-    conn.close()
-
-
 def init_db(conn: sqlite3.Connection) -> None:
   """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
@@ -69,15 +58,8 @@ def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, lin
   """Append one compact ExplorerState line."""
   created_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
-    row = conn.execute(
-      """
-      INSERT INTO explorer_state_lines(agent_id, created_at, line)
-      VALUES (?, ?, ?)
-      RETURNING line_id
-      """,
-      (agent_id, created_at, line),
-    ).fetchone()
-  return int(row["line_id"])
+    row = conn.execute("INSERT INTO explorer_state_lines(agent_id, created_at, line) VALUES (?, ?, ?) RETURNING line_id", (agent_id, created_at, line)).fetchone()
+  return int(row[0])
 
 
 def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: str, agent_id: int | None = None, trace_ref: str = "") -> None:
@@ -90,117 +72,73 @@ def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: s
       ON CONFLICT(session_name) DO UPDATE SET
         role = excluded.role,
         agent_id = excluded.agent_id,
-        status = CASE WHEN agent_sessions.status = 'ending' THEN 'ending' ELSE 'running' END,
+        status = CASE WHEN agent_sessions.status = 'ending' OR (agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed')) THEN agent_sessions.status ELSE 'running' END,
         trace_ref = excluded.trace_ref
       """,
       (session_name, role, agent_id, trace_ref),
     )
 
 
-def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str) -> bool:
+def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str, trace_ref: str | None = None) -> bool:
   """Mark a tmux-wrapped agent process as exited or missing."""
   with conn:
-    return conn.execute(
-      """
-      UPDATE agent_sessions
-      SET status = ?
-      WHERE session_name = ? AND status IN ('starting', 'running', 'ending')
-      """,
-      (status, session_name),
-    ).rowcount == 1
+    return conn.execute("UPDATE agent_sessions SET status = ? WHERE session_name = ? AND status IN ('running', 'ending') AND (? IS NULL OR trace_ref = ?)", (status, session_name, trace_ref, trace_ref)).rowcount == 1
 
 
 def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
-  """Mark an active agent session ending after a human End action."""
+  """Mark a running agent session ending after a human End action."""
   with conn:
-    return conn.execute(
-      "UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status IN ('starting', 'running')",
-      (session_name,),
-    ).rowcount == 1
+    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE session_name = ? AND status = 'running'", (session_name,)).rowcount == 1
 
 
 def request_soft_stop(conn: sqlite3.Connection) -> int:
-  """Mark every active tmux-wrapped agent session as ending."""
+  """Mark every running tmux-wrapped agent session as ending."""
   with conn:
-    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status IN ('starting', 'running')").rowcount
+    return conn.execute("UPDATE agent_sessions SET status = 'ending' WHERE status = 'running'").rowcount
 
 
 def stop_requested(conn: sqlite3.Connection, *, agent_id: int) -> bool:
   """Return whether the main run or this subagent has been asked to stop."""
-  row = conn.execute(
-    """
-    SELECT 1 FROM agent_sessions
-    WHERE status = 'ending'
-      AND (session_name = 'perferox-main' OR (role = 'subagent' AND agent_id = ?))
-    LIMIT 1
-    """,
+  return conn.execute(
+    "SELECT 1 FROM agent_sessions WHERE status = 'ending' AND (session_name = 'perferox-main' OR (role = 'subagent' AND agent_id = ?)) LIMIT 1",
     (agent_id,),
-  ).fetchone()
-  return row is not None
+  ).fetchone() is not None
 
 
-def reserve_subagent(conn: sqlite3.Connection, *, active_cap: int) -> int:
+def reserve_subagent(conn: sqlite3.Connection, *, active_cap: int, minimum_id: int = 0) -> int:
   """Atomically enforce stop/cap state and reserve the next agent id."""
   with conn:
     # The write lock keeps concurrent ToolNode delegations from choosing one id.
     conn.execute("BEGIN IMMEDIATE")
-    main = conn.execute("SELECT status FROM agent_sessions WHERE session_name = 'perferox-main'").fetchone()
-    if main is not None and main["status"] == "ending":
-      raise ValueError("stop requested; not starting a new benchmark subagent")
-    active = conn.execute("SELECT COUNT(*) FROM agent_sessions WHERE status IN ('starting', 'running', 'ending') AND role = 'subagent'").fetchone()[0]
-    if active >= active_cap:
-      raise ValueError(f"max active subagents reached ({active}/{active_cap})")
-    row = conn.execute(
-      """
-      INSERT INTO agent_sessions(session_name, role, agent_id, status)
-      SELECT 'perferox-agent-' || agent_id, 'subagent', agent_id, 'starting'
-      FROM (
-        SELECT COALESCE(MAX(agent_id) + 1, 0) AS agent_id FROM (
-          SELECT agent_id FROM agent_sessions WHERE agent_id IS NOT NULL
-          UNION ALL
-          SELECT agent_id FROM runs
-        )
-      )
-      RETURNING agent_id
+    state = conn.execute(
+      """SELECT
+        EXISTS(SELECT 1 FROM agent_sessions WHERE session_name = 'perferox-main' AND status = 'ending') AS stopped,
+        (SELECT COUNT(*) FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent') AS active,
+        (SELECT COALESCE(MAX(agent_id) + 1, 0) FROM (SELECT agent_id FROM agent_sessions UNION ALL SELECT agent_id FROM runs)) AS agent_id
       """
     ).fetchone()
-  return int(row["agent_id"])
-
-
-def activate_subagent(conn: sqlite3.Connection, *, agent_id: int, trace_ref: str) -> None:
-  """Attach the trace and activate a successfully launched reservation."""
-  with conn:
+    if state["stopped"]:
+      raise ValueError("stop requested; not starting a new benchmark subagent")
+    if state["active"] >= active_cap:
+      raise ValueError(f"max active subagents reached ({state['active']}/{active_cap})")
+    agent_id = max(minimum_id, int(state["agent_id"]))
     conn.execute(
-      """
-      UPDATE agent_sessions
-      SET trace_ref = ?, status = CASE WHEN status = 'starting' THEN 'running' ELSE status END
-      WHERE role = 'subagent' AND agent_id = ?
-      """,
-      (trace_ref, agent_id),
+      "INSERT INTO agent_sessions(session_name, role, agent_id, status) VALUES (?, 'subagent', ?, 'running')",
+      (f"perferox-agent-{agent_id}", agent_id),
     )
+  return agent_id
 
 
 def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
   """Return unread write notifications and mark them delivered."""
+  delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     rows = conn.execute(
-      """
-      SELECT * FROM main_notifications
-      WHERE delivered_at IS NULL
-      ORDER BY notification_id
-      LIMIT ?
-      """,
-      (limit,),
+      "UPDATE main_notifications SET delivered_at = ? WHERE notification_id IN "
+      "(SELECT notification_id FROM main_notifications WHERE delivered_at IS NULL ORDER BY notification_id LIMIT ?) RETURNING *",
+      (delivered_at, limit),
     ).fetchall()
-    if rows:
-      # Mark exactly the rows read above so concurrent consumers cannot lose events.
-      delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
-      placeholders = ",".join("?" for _ in rows)
-      conn.execute(
-        f"UPDATE main_notifications SET delivered_at = ? WHERE notification_id IN ({placeholders})",
-        (delivered_at, *(row["notification_id"] for row in rows)),
-      )
-  return rows
+  return sorted(rows, key=lambda row: row["notification_id"])
 
 
 def notify_main(
@@ -214,16 +152,9 @@ def notify_main(
 ) -> None:
   """Queue one host event for the main agent to inspect."""
   conn.execute(
-    """
-    INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """,
+    "INSERT INTO main_notifications(created_at, agent_id, run_id, kind, table_name, row_json) VALUES (?, ?, ?, ?, ?, ?)",
     (
-      datetime.now(UTC).isoformat(timespec="seconds"),
-      agent_id,
-      run_id,
-      kind,
-      table_name,
+      datetime.now(UTC).isoformat(timespec="seconds"), agent_id, run_id, kind, table_name,
       json.dumps(dict(row), separators=(",", ":"), default=str),
     ),
   )
@@ -382,6 +313,5 @@ def log_anomaly(
       "INSERT INTO anomalies(agent_id, run_id, date, summary) VALUES (?, ?, ?, ?) RETURNING *",
       (agent_id, run_id, date, summary),
     ).fetchone()
-    anomaly_id = int(row["anomaly_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="anomaly_logged", table_name="anomalies", row=row)
-  return anomaly_id
+  return int(row["anomaly_id"])

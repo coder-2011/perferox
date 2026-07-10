@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,9 +31,29 @@ class DashboardSnapshot:
   main_status: str
 
 
+def refresh_sessions(conn) -> list[str]:
+  """Mark and return traced agent sessions that disappeared from tmux."""
+  rows = conn.execute("SELECT session_name, agent_id, trace_ref, COALESCE('agent-' || agent_id, session_name) AS label FROM agent_sessions WHERE status IN ('running', 'ending') AND trace_ref != ''").fetchall()
+  tmux = shutil.which("tmux")
+  if tmux is None:
+    return []
+  result = subprocess.run([tmux, "list-sessions", "-F", "#S"], text=True, capture_output=True, check=False)
+  if result.returncode and not any(text in (result.stderr or "").lower() for text in ("no server running", "no such file or directory")):
+    return []
+  alive = set((result.stdout or "").splitlines())
+  missing = []
+  for row in rows:
+    if row["session_name"] in alive or not db.finish_agent_session(conn, session_name=row["session_name"], status="missing", trace_ref=row["trace_ref"]):
+      continue
+    line = f"{row['label']} tmux missing; trace {Path(row['trace_ref']).name}"
+    db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
+    missing.append(line)
+  return missing
+
+
 def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSnapshot:
   """Read comprehensive status without consuming main-agent notifications."""
-  with db.open_db(db_path) as conn:
+  with closing(db.connect(db_path)) as conn:
     db.init_db(conn)
     sessions = [dict(row) for row in conn.execute(
         """
@@ -86,7 +109,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
 
 def read_activity(db_path: str | Path, limit: int) -> list[str]:
   """Read only the bounded activity stream needed by `perferox logs`."""
-  with db.open_db(db_path) as conn:
+  with closing(db.connect(db_path)) as conn:
     db.init_db(conn)
     return _read_activity(conn, limit)
 

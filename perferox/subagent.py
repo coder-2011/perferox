@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -77,8 +78,7 @@ def _model_node(model: BaseChatModel, tools: Sequence[BaseTool], system_prompt: 
   def call_model(state: SubagentState) -> dict[str, list[BaseMessage]]:
     """Invoke the model with the subagent goal in the system prompt."""
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "(none)")), *state.get("messages", [])]
-    response = bound_model.invoke(messages)
-    return {"messages": [response]}
+    return {"messages": [bound_model.invoke(messages)]}
 
   return call_model
 
@@ -123,12 +123,12 @@ def build_subagent_graph(
     log_experiment_tool(db_path, agent_id),
     log_anomaly_tool(db_path, agent_id),
   ]
-  with db.open_db(db_path) as conn:
+  with closing(db.connect(db_path)) as conn:
     db.init_db(conn)
 
   def runtime_status() -> tuple[bool, int]:
     """Read the host-owned stop flag and started-attempt count together."""
-    with db.open_db(db_path, readonly=True) as conn:
+    with closing(db.connect(db_path, readonly=True)) as conn:
       stopped = db.stop_requested(conn, agent_id=agent_id)
       attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     return stopped, int(attempts)
@@ -199,7 +199,7 @@ def build_subagent_graph(
       "loop_cap": attempt_cap,
       "trace_ref": trace_ref,
     }
-    with db.open_db(db_path) as conn, conn:
+    with closing(db.connect(db_path)) as conn, conn:
       db.notify_main(conn, agent_id=agent_id, run_id=None, kind="subagent_summary", table_name="subagent_summary", row=row)
     return {"summary": summary, "messages": [response]}
 
