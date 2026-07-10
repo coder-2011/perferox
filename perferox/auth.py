@@ -3,16 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-  from langchain_core.language_models.chat_models import BaseChatModel
-
-DEFAULT_CHAT_MODEL = "gpt-5.5"
-MODEL_ENV_VAR = "PERFEROX_CHAT_MODEL"
-ORIGINATOR = "perferox"
 
 
 def cloud_provider(api_key: str) -> str:
@@ -38,34 +31,45 @@ def read_cloud_key(path: str | Path) -> str:
     key_path.unlink(missing_ok=True)
 
 
+def _chatgpt_provider():
+  """Open the persisted provider and require a usable ChatGPT token."""
+  from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
+
+  provider = _FileChatGPTOAuthTokenProvider.from_default_store()
+  provider.get_token()
+  return provider
+
+
 def chatgpt_auth_ready() -> bool:
   """Return whether a refreshable ChatGPT OAuth token is available."""
   try:
-    from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
-
-    _FileChatGPTOAuthTokenProvider.from_default_store().get_token()
+    _chatgpt_provider()
   except Exception:  # noqa: BLE001
     return False
   return True
 
 
-def login_chatgpt_oauth(timeout_s: float = 300.0) -> None:
-  """Run the browser-based ChatGPT OAuth login flow."""
-  from langchain_openai.chatgpt_oauth import login_chatgpt
+def ensure_chatgpt_auth(timeout_s: float = 300.0) -> bool:
+  """Ensure persisted ChatGPT OAuth, returning whether login was needed."""
+  if chatgpt_auth_ready():
+    return False
+  from langchain_openai.chatgpt_oauth import login_chatgpt, login_chatgpt_device
 
-  login_chatgpt(timeout=timeout_s, open_browser=True)
+  # SSH and non-interactive sessions cannot reliably receive a loopback callback.
+  headless = os.environ.get("SSH_CONNECTION") or not sys.stdout.isatty()
+  login = login_chatgpt_device if headless else login_chatgpt
+  provider = login(timeout=timeout_s)
+  provider.get_token()
+  return True
 
 
-def build_chat_model(model: str | None = None) -> BaseChatModel:
+def build_chat_model(model: str | None = None):
   """Build Perferox's OAuth-backed LangChain chat model."""
   from langchain_openai.chat_models.codex import _ChatOpenAICodex
-  from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
-
-  provider = _FileChatGPTOAuthTokenProvider.from_default_store()
-  provider.get_token()
-  model_name = model or os.environ.get(MODEL_ENV_VAR, DEFAULT_CHAT_MODEL)
+  provider = _chatgpt_provider()
+  model_name = model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
   return _ChatOpenAICodex(
     model=model_name,
-    originator=ORIGINATOR,
+    originator="perferox",
     token_provider=provider,
   )

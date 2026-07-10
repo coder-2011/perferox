@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, login_chatgpt_oauth
+from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth
 
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
@@ -84,18 +84,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _login() -> int:
-  """Run ChatGPT OAuth once and report the persisted result."""
-  if chatgpt_auth_ready():
-    CONSOLE.print(Panel.fit("[green]authenticated[/] · ChatGPT OAuth is ready", title="[bold]Login[/]", border_style="green"))
-    return 0
-  CONSOLE.print("[bold yellow]Opening browser for ChatGPT login…[/]")
+  """Report the result of the auth-owned ChatGPT login workflow."""
   try:
-    login_chatgpt_oauth()
+    token_saved = ensure_chatgpt_auth()
   except Exception as exc:  # noqa: BLE001
     return _error(f"login failed: {type(exc).__name__}: {exc}")
-  if not chatgpt_auth_ready():
-    return _error("login completed without a refreshable token")
-  CONSOLE.print(Panel.fit("[green]authenticated[/] · token saved", title="[bold]Login[/]", border_style="green"))
+  message = "token saved" if token_saved else "ChatGPT OAuth is ready"
+  CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {message}", title="[bold]Login[/]", border_style="green"))
   return 0
 
 

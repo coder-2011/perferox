@@ -20,7 +20,7 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
 from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, login_chatgpt_oauth
+from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth
 from perferox.status import DashboardSnapshot, read_dashboard
 
 
@@ -216,7 +216,7 @@ class PerferoxTUI(App[None]):
   def _login_worker(self) -> None:
     """Complete OAuth and return the result to Textual's thread."""
     try:
-      login_chatgpt_oauth()
+      ensure_chatgpt_auth()
     except Exception as exc:
       self.call_from_thread(self._finish_login, False, f"{type(exc).__name__}: {exc}")
       return
@@ -224,7 +224,7 @@ class PerferoxTUI(App[None]):
 
   def _finish_login(self, logged_in: bool, error: str) -> None:
     """Apply the completed login result to the dashboard."""
-    self.logged_in = logged_in and chatgpt_auth_ready()
+    self.logged_in = logged_in
     if self.logged_in:
       self._sync_auth_gate()
       self.refresh_dashboard()
