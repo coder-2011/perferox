@@ -150,27 +150,17 @@ def _status(db_path: Path) -> int:
     sessions.add_row(Text("idle", style=DIM), "—", "—", "0", "0", "0", "—")
   CONSOLE.print(sessions)
 
-  runs = Table(title="Recent runs", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
-  runs.add_column("Run", no_wrap=True)
-  runs.add_column("State", no_wrap=True)
-  runs.add_column("Started", no_wrap=True)
-  runs.add_column("Intent / command", ratio=1, overflow="ellipsis")
+  runs = Table("Run", "State", "Started", "Intent / command", title="Recent runs", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
   for run in snapshot.recent_runs:
     state = str(run["status"])
-    label = run["label"] or "—"
-    runs.add_row(f"{run['agent_id']}/{run['run_id']}", Text(state, style=STATUS_STYLES[state]), str(run["started_at"]).replace("T", " ")[:19], Text(str(label)))
+    runs.add_row(f"{run['agent_id']}/{run['run_id']}", Text(state, style=STATUS_STYLES[state]), str(run["started_at"]).replace("T", " ")[:19], Text(str(run["label"] or "—")))
   if not snapshot.recent_runs:
     runs.add_row("—", Text("none", style=DIM), "—", "No benchmark runs recorded")
   CONSOLE.print(runs)
 
-  anomalies = Table(title="Recent anomalies", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
-  anomalies.add_column("ID", no_wrap=True)
-  anomalies.add_column("Run", no_wrap=True)
-  anomalies.add_column("Date", no_wrap=True)
-  anomalies.add_column("Summary", ratio=1, overflow="ellipsis")
+  anomalies = Table("ID", "Run", "Date", "Summary", title="Recent anomalies", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
   for anomaly in snapshot.anomalies:
-    date = str(anomaly["date"]).replace("T", " ")[:19]
-    anomalies.add_row(f"ANM-{anomaly['anomaly_id']:04d}", f"{anomaly['agent_id']}/{anomaly['run_id']}", date, Text(str(anomaly["summary"]), style="red"))
+    anomalies.add_row(f"ANM-{anomaly['anomaly_id']:04d}", f"{anomaly['agent_id']}/{anomaly['run_id']}", str(anomaly["date"]).replace("T", " ")[:19], Text(str(anomaly["summary"]), style="red"))
   if not snapshot.anomalies:
     anomalies.add_row("—", "—", "—", Text("No anomalies logged", style=DIM))
   CONSOLE.print(anomalies)

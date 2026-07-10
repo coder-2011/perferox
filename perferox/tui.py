@@ -163,7 +163,8 @@ class PerferoxTUI(App[None]):
     snapshot = read_dashboard(self.db_path)
     self.query_one("#counters", Static).update(_counter_text(snapshot))
     self.query_one("#sessions", Static).update(_session_text(snapshot.sessions))
-    self.query_one("#trace-text", Static).update(_trace_text(snapshot.trace_lines))
+    trace_text = "\n\n".join(escape(line) for line in snapshot.trace_lines) if snapshot.trace_lines else "no trace records yet"
+    self.query_one("#trace-text", Static).update(trace_text)
     self.query_one("#anomalies-text", Static).update(_anomaly_text(snapshot.anomalies))
     footer = {"running": "main graph running", "ending": "soft stop requested; waiting for current work to finish", "exited": "main graph exited"}.get(snapshot.main_status, "idle")
     self.query_one("#footer", Static).update(footer)
@@ -256,11 +257,6 @@ def _session_text(sessions: list[dict[str, object]]) -> str:
     counts = f"{session['run_count']} runs, {session['succeeded_runs']} ok, {session['failed_runs']} failed"
     lines.append(f"{session['status']} {session['role']}{agent}\n  {session['session_name']}\n  {counts}\n  {trace}")
   return "\n\n".join(lines)
-
-
-def _trace_text(lines: list[str]) -> str:
-  """Render trace lines or a clear empty state."""
-  return "\n\n".join(escape(line) for line in lines) if lines else "no trace records yet"
 
 
 def _anomaly_text(anomalies: list[dict[str, object]]) -> str:
