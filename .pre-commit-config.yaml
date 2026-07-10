@@ -5,4 +5,5 @@ repos:
         name: tests
         entry: uv run python -m unittest tests.py
         language: system
+        files: ^(perferox/|tests\.py$|pyproject\.toml$|uv\.lock$)
         pass_filenames: false

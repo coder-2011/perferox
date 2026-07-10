@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [master]
+    paths-ignore: ["**.md"]
   pull_request:
     branches: [master]
+    paths-ignore: ["**.md"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -31,8 +37,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - run: uv sync --locked
-      - run: uv run pre-commit run --all-files
+      - run: uv sync --locked --no-dev
+      - run: uv run --no-sync python -m unittest tests.py
 
   local-mac:
     name: Local Mac / Python 3.13
@@ -40,8 +46,10 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
+        with:
+          clean: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.13"
-      - run: uv sync --locked
-      - run: uv run pre-commit run --all-files
+      - run: uv sync --locked --no-dev
+      - run: uv run --no-sync python -m unittest tests.py
