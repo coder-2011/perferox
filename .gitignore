@@ -7,4 +7,5 @@
 *.egg-info/
 perferox-tui-demo.mp4
 PYPI.md
+/traces/
 /sglang/
