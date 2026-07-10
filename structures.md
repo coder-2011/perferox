@@ -56,11 +56,9 @@ The main process uses two roots:
 - **runtime root** — the Perferox checkout containing SQLite, traces, `uv`, and worker launch code;
 - **source root** — a persistent full SGLang clone at `<runtime root>/sglang` used by the main agent's code-reading tools.
 
-The SGLang checkout is cloned only when `sglang/.git` is absent. Existing edits, commits, and branches are preserved.
-
 ## Main coordinator
 
-The main graph has one model node and one local tool node. The outer runner keeps the longer-lived process alive between graph invocations.
+The main agent is responsible for logical reasoning work and finding perf vulnerabilities. This allows us to use cheaper models for subagents, too. 
 
 ```mermaid
 flowchart TD
@@ -75,10 +73,10 @@ flowchart TD
 
 Before each model call, the coordinator receives:
 
-- the user objective;
-- compact ExplorerState lines;
-- recent tmux session rows;
-- accumulated LangGraph messages.
+- the user objective
+- compact ExplorerState lines
+- recent tmux session rows
+- accumulated LangGraph messages
 
 Its tools are:
 
@@ -179,8 +177,6 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 
 `(agent_id, run_id)` is the run identity. `run_id` starts at zero for each agent. The command `exact_hash` is unique, preventing the same normalized benchmark command from being started twice.
 
-JSONL complements SQLite rather than replacing it. Each graph update is appended to a main or worker trace for replay and debugging; the TUI combines trace tails with SQLite events.
-
 ## Soft stop
 
 ```mermaid
@@ -200,7 +196,7 @@ The End action changes running `agent_sessions` rows to `ending`. After that:
 - an already-running remote benchmark is allowed to finish;
 - the main process exits after no worker sessions remain.
 
-The host does not rely on a model voluntarily honoring the stop request.
+The host does not rely on a model voluntarily honoring the stop request, but we do encourage the agent to stop after we hit the cap
 
 ## Module boundaries
 
@@ -217,18 +213,3 @@ The host does not rely on a model voluntarily honoring the stop request.
 | `remote.py` | Paramiko SSH session and in-process session registry |
 | `auth.py` | persisted ChatGPT OAuth and Codex chat model construction |
 | `prompts.py` | RunPod reference and phase-specific worker constraints |
-
-## Current boundaries
-
-These are current implementation limits, not hidden abstractions:
-
-- the main agent's local source checkout is always SGLang;
-- workers can set up an arbitrary repository commit, but the structured benchmark tool still runs `sglang.benchmark.serving`;
-- RunPod is the only implemented cloud lifecycle;
-- web search is available, but there is no structured GitHub issue/PR/code connector yet;
-- exact remote checkout verification is instructed and reported by the worker, not independently attested by the host;
-- the host closes SSH sessions, but pod IDs are not yet kept in a host-owned pod registry;
-- anomaly analysis is inline logging only; there is no separate periodic anomaly agent;
-- there is no implemented global runtime deadline.
-
-New providers and targets should extend the narrow provider and benchmark seams without weakening SQLite ownership of IDs, caps, stop state, or durable results.
