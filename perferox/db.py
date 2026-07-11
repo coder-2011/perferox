@@ -38,6 +38,15 @@ def init_db(conn: sqlite3.Connection) -> None:
   """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
+  # Existing pre-beta databases need the new text fields added in place.
+  for table, names in (
+    ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
+    ("agent_sessions", ("provider", "resource_id")),
+  ):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name in names:
+      if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 
 def embed_intent(intent_key: str) -> list[float]:
@@ -160,16 +169,53 @@ def notify_main(
   )
 
 
+def record_cloud_resource(conn: sqlite3.Connection, *, agent_id: int, provider: str, resource_id: str) -> None:
+  """Attach one paid resource to its owning worker session."""
+  with conn:
+    updated = conn.execute(
+      """UPDATE agent_sessions
+         SET provider = ?, resource_id = ?
+         WHERE role = 'subagent' AND agent_id = ? AND resource_id = ''""",
+      (provider, resource_id, agent_id),
+    ).rowcount
+  if updated != 1:
+    raise ValueError(f"agent {agent_id} has no available worker session")
+
+
+def pending_cloud_resource(conn: sqlite3.Connection, *, agent_id: int) -> sqlite3.Row | None:
+  """Return the worker-owned resource when it still needs termination."""
+  return conn.execute(
+    "SELECT * FROM agent_sessions WHERE role = 'subagent' AND agent_id = ? AND resource_id != ''",
+    (agent_id,),
+  ).fetchone()
+
+
+def clear_cloud_resource(conn: sqlite3.Connection, *, agent_id: int) -> None:
+  """Clear the worker-owned resource after successful teardown."""
+  with conn:
+    conn.execute(
+      "UPDATE agent_sessions SET resource_id = '' WHERE role = 'subagent' AND agent_id = ?",
+      (agent_id,),
+    )
+
+
 def start_benchmark_run(
   conn: sqlite3.Connection,
   *,
   agent_id: int,
   command: str,
+  repository: str = "",
+  commit: str = "",
+  provider: str = "",
+  gpu: str = "",
+  server_command: str = "",
+  model_state: str = "",
   trace_ref: str = "",
   attempt_cap: int | None = None,
 ) -> int:
   """Assign the next run id and insert the started benchmark row."""
-  exact_hash = hashlib.sha256(command.encode()).hexdigest()
+  identity = (repository, commit, provider, gpu, server_command, model_state, command)
+  exact_hash = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     # Serialize the stop/cap checks and run-id assignment with the insert.
@@ -185,12 +231,12 @@ def start_benchmark_run(
         raise ValueError(f"attempt cap reached ({attempts}/{attempt_cap}); wrap up")
     row = conn.execute(
       """
-      INSERT INTO runs(agent_id, run_id, started_at, trace_ref, command, exact_hash)
-      SELECT ?, COALESCE(MAX(run_id) + 1, 0), ?, ?, ?, ?
+      INSERT INTO runs(agent_id, run_id, repository, commit_hash, provider, gpu, server_command, model_state, started_at, trace_ref, command, exact_hash)
+      SELECT ?, COALESCE(MAX(run_id) + 1, 0), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       FROM runs WHERE agent_id = ?
       RETURNING *
       """,
-      (agent_id, started_at, trace_ref, command, exact_hash, agent_id),
+      (agent_id, repository, commit, provider, gpu, server_command, model_state, started_at, trace_ref, command, exact_hash, agent_id),
     ).fetchone()
     run_id = int(row["run_id"])
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_started", table_name="runs", row=row)

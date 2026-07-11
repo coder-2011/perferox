@@ -2,7 +2,9 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS runs (
   agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL CHECK(run_id >= 0),
-  gpu TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT,
+  repository TEXT NOT NULL DEFAULT '', commit_hash TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
+  gpu TEXT NOT NULL DEFAULT '', server_command TEXT NOT NULL DEFAULT '', model_state TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL, finished_at TEXT, trace_ref TEXT,
   command TEXT NOT NULL DEFAULT '', exact_hash TEXT NOT NULL UNIQUE, error TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(agent_id, run_id)
 );
@@ -31,7 +33,8 @@ CREATE TABLE IF NOT EXISTS explorer_state_lines (
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
   session_name TEXT PRIMARY KEY, role TEXT NOT NULL, agent_id INTEGER,
-  status TEXT NOT NULL, trace_ref TEXT NOT NULL DEFAULT ''
+  status TEXT NOT NULL, trace_ref TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT '', resource_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS main_notifications (

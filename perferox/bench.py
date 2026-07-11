@@ -58,6 +58,9 @@ class BenchServingArgs(BaseModel):
 
   model_config = ConfigDict(extra="forbid")
 
+  gpu: str = Field(..., min_length=1, description="Exact GPU model and count used by the server; stored as experiment identity metadata.")
+  server_command: str = Field(..., min_length=1, description="Exact server launch command and configuration; stored as experiment identity metadata.")
+  model_state: str = Field(..., min_length=1, description="Model weights, revision, and relevant runtime state; stored as experiment identity metadata.")
   backend: BenchBackend = Field("sglang", description="Serving backend/API shape to benchmark.")
   base_url: str | None = Field(None, description="Full server base URL; use instead of host/port when needed.")
   host: str | None = Field(None, description="Server host when base_url is not provided.")
@@ -174,7 +177,7 @@ class BenchServingArgs(BaseModel):
 
 def bench_serving_argv(args: BenchServingArgs) -> list[str]:
   """Build the SGLang serving benchmark argv from typed fields."""
-  data = args.model_dump(exclude={"timeout_s", "extra_request_body", "header"}, exclude_none=True)
+  data = args.model_dump(exclude={"gpu", "server_command", "model_state", "timeout_s", "extra_request_body", "header"}, exclude_none=True)
   data["extra_request_body"] = json.dumps(args.extra_request_body, separators=(",", ":")) if args.extra_request_body else None
   data["header"] = [f"{key}={value}" for key, value in (args.header or {}).items()]
   argv = ["python", "-m", "sglang.benchmark.serving"]

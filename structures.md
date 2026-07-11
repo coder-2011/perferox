@@ -106,7 +106,7 @@ Worker tools are deliberately phase-scoped:
 
 | Phase | Mutating capabilities |
 | --- | --- |
-| create instance | local `runpodctl` or `lambda-labs`, connect host SSH session |
+| create instance | host-tracked provider creation, read-only provider discovery, connect host SSH session |
 | setup / intervention | remote shell over the registered SSH session |
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
@@ -142,15 +142,15 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 
 | Table | Purpose |
 | --- | --- |
-| `runs` | every started benchmark, command hash, timing, trace, and failure state |
+| `runs` | every started benchmark, full target/environment identity, timing, trace, and failure state |
 | `experiments` | successful normalized metrics plus human-readable intent and embedding |
 | `anomalies` | human-readable surprising behavior tied to a run |
-| `agent_sessions` | main/subagent tmux identity and lifecycle status |
+| `agent_sessions` | main/subagent process lifecycle plus its single active provider resource |
 | `main_notifications` | durable wakeups for run, experiment, anomaly, and summary events |
 | `explorer_state_lines` | compact append-only exploration memory |
 | `doc_chunks` | locally ingested SGLang reference text and embeddings |
 
-`(agent_id, run_id)` is the run identity. `run_id` starts at zero for each agent. The command `exact_hash` is unique, preventing the same normalized benchmark command from being started twice.
+`(agent_id, run_id)` is the run identity. `run_id` starts at zero for each agent. The unique `exact_hash` covers repository, commit, provider, GPU, server command, model state, and normalized benchmark command.
 
 ## Soft stop
 
@@ -169,6 +169,7 @@ The End action changes running `agent_sessions` rows to `ending`. After that:
 - `start_benchmark_run` refuses new attempts
 - workers observe the stop flag and route to wrap-up
 - an already-running remote benchmark is allowed to finish
+- paid resources are terminated by the host on success, stop, or failure
 - the main process exits after no worker sessions remain
 
 The host does not rely on a model voluntarily honoring the stop request, but we do encourage the agent to stop after we hit the cap

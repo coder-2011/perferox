@@ -23,7 +23,6 @@ from perferox.remote import SessionRegistry
 from perferox.tools import (
   WEB_SEARCH_TOOL,
   connect_remote_session,
-  local_terminal,
   log_anomaly_tool,
   log_experiment_tool,
   remote_terminal,
@@ -105,7 +104,7 @@ def build_subagent_graph(
   create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
   attempt_cap: int = 1,
   trace_ref: str = "",
-  create_pod_tools: Sequence[BaseTool] = (local_terminal,),
+  create_pod_tools: Sequence[BaseTool] = (),
   setup_tools: Sequence[BaseTool] = (),
   benchmark_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
@@ -119,7 +118,16 @@ def build_subagent_graph(
   benchmark_tools = [
     *benchmark_tools,
     remote_tool,
-    sglang_bench_serving(session_registry, session_id, db_path, agent_id, trace_ref, attempt_cap),
+    sglang_bench_serving(
+      session_registry,
+      session_id,
+      db_path,
+      agent_id,
+      repository,
+      commit,
+      trace_ref,
+      attempt_cap,
+    ),
     log_experiment_tool(db_path, agent_id),
     log_anomaly_tool(db_path, agent_id),
   ]
@@ -169,9 +177,6 @@ def build_subagent_graph(
 
   def route_after_benchmark(state: SubagentState) -> Literal["benchmark_tools", "wrap_up"]:
     """Keep benchmarking until the started-attempt cap is reached."""
-    stopped, attempts = runtime_status()
-    if stopped or attempts >= attempt_cap:
-      return "wrap_up"
     last_message = state["messages"][-1]
     if getattr(last_message, "tool_calls", None):
       return "benchmark_tools"
