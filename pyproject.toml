@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "perferox"
 version = "0.1.0"
 description = "Agentic benchmark explorer for SGLang."
-readme = "PYPI.md"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Naman Chetwani" }]
 keywords = ["sglang", "benchmark", "fuzzing", "inference", "agents"]
