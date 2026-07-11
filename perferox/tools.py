@@ -5,7 +5,7 @@ import os
 import shlex
 import signal
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from heapq import nsmallest
 from pathlib import Path
@@ -96,11 +96,18 @@ def connect_remote_session(registry: SessionRegistry, session_id: str) -> BaseTo
   return connect
 
 
-def remote_terminal(registry: SessionRegistry, session_id: str) -> BaseTool:
+def remote_terminal(
+  registry: SessionRegistry,
+  session_id: str,
+  guard: Callable[[], str | None] | None = None,
+) -> BaseTool:
   """Create a shell tool bound to one host-assigned SSH session id."""
   @tool("remote_terminal", description="Run one shell command on the connected remote SSH machine.")
   def terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
     """Run one shell command through the bound SSH session."""
+    refusal = guard() if guard else None
+    if refusal:
+      return f"remote command refused: {refusal}"
     try:
       session = registry.get(session_id)
     except KeyError:
@@ -178,7 +185,7 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
     readable = "--help" in arguments or any(prefix[:len(allowed)] == allowed for allowed in read_prefixes)
     if not creating and not readable:
       return f"provider_cli refused unsupported or mutating {provider} command"
-    if provider == "lambda" and creating and "--count" in arguments:
+    if provider == "lambda" and creating and any(argument == "--count" or argument.startswith("--count=") for argument in arguments):
       return "provider_cli permits exactly one Lambda instance"
     if creating:
       with closing(db.connect(db_path)) as conn:

@@ -112,12 +112,30 @@ def build_subagent_graph(
   session_id = f"agent-{agent_id}"
   target_prompt = f"\n\nTarget repository:\n{repository}\n\nTarget commit:\n{commit}"
   graph = StateGraph(SubagentState)
-  remote_tool = remote_terminal(session_registry, session_id)
+  with closing(db.connect(db_path)) as conn:
+    db.init_db(conn)
+
+  def runtime_status() -> tuple[bool, int]:
+    """Read the host-owned stop flag and started-attempt count together."""
+    with closing(db.connect(db_path, readonly=True)) as conn:
+      stopped = db.stop_requested(conn, agent_id=agent_id)
+      attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+    return stopped, int(attempts)
+
+  def benchmark_command_guard() -> str | None:
+    """Refuse arbitrary remote work after stop or the final benchmark attempt."""
+    stopped, attempts = runtime_status()
+    if stopped:
+      return "stop requested; log pending results or wrap up"
+    if attempts >= attempt_cap:
+      return f"attempt cap reached ({attempts}/{attempt_cap}); log pending results or wrap up"
+    return None
+
   create_pod_tools = [*create_pod_tools, connect_remote_session(session_registry, session_id)]
-  setup_tools = [*setup_tools, remote_tool]
+  setup_tools = [*setup_tools, remote_terminal(session_registry, session_id)]
   benchmark_tools = [
     *benchmark_tools,
-    remote_tool,
+    remote_terminal(session_registry, session_id, benchmark_command_guard),
     sglang_bench_serving(
       session_registry,
       session_id,
@@ -131,15 +149,6 @@ def build_subagent_graph(
     log_experiment_tool(db_path, agent_id),
     log_anomaly_tool(db_path, agent_id),
   ]
-  with closing(db.connect(db_path)) as conn:
-    db.init_db(conn)
-
-  def runtime_status() -> tuple[bool, int]:
-    """Read the host-owned stop flag and started-attempt count together."""
-    with closing(db.connect(db_path, readonly=True)) as conn:
-      stopped = db.stop_requested(conn, agent_id=agent_id)
-      attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
-    return stopped, int(attempts)
 
   def route_after_create_pod(state: SubagentState) -> Literal["create_pod_tools", "basic_setup", "wrap_up"]:
     """Prevent another provisioning action after a soft stop."""

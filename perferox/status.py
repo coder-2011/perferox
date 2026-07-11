@@ -139,7 +139,12 @@ def _read_activity(conn, limit: int) -> list[str]:
     row["trace_ref"]
     for row in conn.execute("SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY role, agent_id")
   ))
-  return [*events, *read_trace_tail(trace_refs, limit)][-limit:]
+  traces = read_trace_tail(trace_refs, limit)
+  if not events:
+    return traces
+  event_slots = min(len(events), max(1, limit // 4))
+  trace_slots = limit - event_slots
+  return [*events[-event_slots:], *(traces[-trace_slots:] if trace_slots else [])]
 
 
 def read_trace_tail(paths: list[str], limit: int) -> list[str]:

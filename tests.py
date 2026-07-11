@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -35,9 +35,11 @@ class FakeRemoteSession:
 
   session_id: str
   result: RemoteResult
+  commands: list[str] = field(default_factory=list)
 
   def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
     """Return the configured remote result."""
+    self.commands.append(command)
     return self.result
 
 
@@ -267,6 +269,12 @@ class ToolAndExperimentTests(DatabaseTestCase):
         "type": "tool_call",
       }]),
       AIMessage(content="", tool_calls=[{
+        "name": "remote_terminal",
+        "args": {"command": "echo should-not-run"},
+        "id": "remote-call",
+        "type": "tool_call",
+      }]),
+      AIMessage(content="", tool_calls=[{
         "name": "log_experiment",
         "args": {"intent_key": "single capped run", "metrics": {"request_rps": 12.0}},
         "id": "log-call",
@@ -284,6 +292,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     experiments = self.conn.execute("SELECT COUNT(*) FROM experiments WHERE agent_id = 10").fetchone()[0]
     self.assertIsNotNone(run["finished_at"])
     self.assertEqual(experiments, 1)
+    self.assertEqual(len(registry.get("agent-10").commands), 1)
     self.assertEqual(result["summary"], "final summary")
 
   def test_cloud_resource_is_persisted_and_terminated(self) -> None:
@@ -292,6 +301,12 @@ class ToolAndExperimentTests(DatabaseTestCase):
     failed_cleanup = subprocess.CompletedProcess([], 1, stdout="", stderr="temporary provider error")
     terminated = subprocess.CompletedProcess([], 0, stdout="deleted pod-123\n", stderr="")
     db.record_agent_session(self.conn, session_name="perferox-agent-11", role="subagent", agent_id=11)
+    lambda_tool = provider_cli("lambda", self.db_path, 11)
+    with patch("perferox.tools.subprocess.run") as launch:
+      count_refused = lambda_tool.invoke({"arguments": ["up", "gpu_1x_a100", "--count=2"]})
+    self.assertIn("exactly one Lambda instance", count_refused)
+    launch.assert_not_called()
+
     tool = provider_cli("runpod", self.db_path, 11)
     refused = tool.invoke({"arguments": ["template", "delete", "shared-template"]})
     with patch("perferox.tools.subprocess.run", side_effect=[created, failed_cleanup]) as run:
@@ -326,7 +341,7 @@ class TUIWiringTests(DatabaseTestCase):
     db.start_benchmark_run(self.conn, agent_id=0, command="bench cache")
     db.log_anomaly(self.conn, agent_id=0, run_id=0, summary="cache pressure anomaly")
 
-    snapshot = read_dashboard(self.db_path)
+    snapshot = read_dashboard(self.db_path, trace_limit=10)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
     db.take_main_notifications(self.conn)
     with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=[subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\n", stderr=""), subprocess.CompletedProcess([], 1)]):
