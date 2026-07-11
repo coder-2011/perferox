@@ -30,7 +30,8 @@ LAMBDA_CREATE_POD_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 Current phase: create one temporary Lambda Cloud instance and connect over SSH.
 
 Use provider_cli with arguments excluding `lambda-labs`: `["catalog"]`,
-`["keys"]`, `["up", TYPE, "--region", REGION, "--key", KEY]`, and `["ls"]`.
+`["keys"]`, `["up", TYPE, "--region", REGION, "--key", SSH_KEY_NAME]`, and `["ls"]`.
+Pass the SSH key name, not its ID.
 Creation is limited to one host-tracked instance. Poll until its public IP is
 ready, then call connect_remote_session with that IP, user ubuntu, and port 22.
 

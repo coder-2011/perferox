@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from lambda_labs import request as lambda_request
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
@@ -128,6 +130,24 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertEqual(metrics["input_tps"], 1234.5)
     self.assertEqual(metrics["cache_hit_rate"], 0.75)
     self.assertEqual(metrics["error_rate"], 0.1)
+
+
+class LambdaLabsTests(unittest.TestCase):
+  """Protect the Lambda API request contract used by the bundled CLI."""
+
+  def test_request_uses_documented_headers_and_json(self) -> None:
+    """Send the API-key bearer header, JSON accept header, and compact body."""
+    with patch.dict(os.environ, {"LAMBDA_API_KEY": "test-key"}), patch("lambda_labs.urlopen") as urlopen:
+      response = urlopen.return_value.__enter__.return_value
+      response.read.return_value = b'{"data":{"instance_ids":["instance-1"]}}'
+      payload = lambda_request("POST", "instance-operations/launch", {"quantity": 1})
+
+    request = urlopen.call_args.args[0]
+    self.assertEqual(payload, {"instance_ids": ["instance-1"]})
+    self.assertEqual(request.get_full_url(), "https://cloud.lambda.ai/api/v1/instance-operations/launch")
+    self.assertEqual(request.get_header("Accept"), "application/json")
+    self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+    self.assertEqual(request.data, b'{"quantity":1}')
 
 
 class HostStateTests(DatabaseTestCase):

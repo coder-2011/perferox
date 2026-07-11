@@ -17,7 +17,7 @@ API_URL = "https://cloud.lambda.ai/api/v1"
 def request(method: str, path: str, body: dict | None = None):
   """Send one authenticated Lambda Cloud request."""
   data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
-  headers = {"Authorization": f"Bearer {os.environ['LAMBDA_API_KEY']}", "Content-Type": "application/json"}
+  headers = {"Accept": "application/json", "Authorization": f"Bearer {os.environ['LAMBDA_API_KEY']}", "Content-Type": "application/json"}
   try:
     with urlopen(Request(f"{API_URL}/{path}", data=data, headers=headers, method=method), timeout=30) as response:
       payload = json.load(response)
@@ -43,7 +43,7 @@ def parser() -> argparse.ArgumentParser:
   up = commands.add_parser("up", help="launch instances")
   up.add_argument("instance_type")
   up.add_argument("--region", required=True)
-  up.add_argument("--key", required=True)
+  up.add_argument("--key", required=True, help="registered SSH key name")
   up.add_argument("--count", type=int, default=1)
   rm = commands.add_parser("rm", help="terminate instances")
   rm.add_argument("instance_ids", nargs="+")
@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
       console.print(table("Instances", ("ID", "IP", "TYPE", "STATUS"), rows))
     elif args.command == "keys":
       keys = request("GET", "ssh-keys")
-      console.print(table("SSH keys", ("ID", "NAME"), ((key["id"], key["name"]) for key in keys)))
+      console.print(table("SSH keys", ("NAME", "ID"), ((key["name"], key["id"]) for key in keys)))
     elif args.command == "key-add":
       key_path = Path(args.key).expanduser()
       public_key = key_path.read_text().strip() if key_path.is_file() else args.key
