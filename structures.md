@@ -145,9 +145,8 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 | `runs` | every started benchmark, full target/environment identity, timing, trace, and failure state |
 | `experiments` | successful normalized metrics plus human-readable intent and embedding |
 | `anomalies` | human-readable surprising behavior tied to a run |
-| `agent_sessions` | main/subagent tmux identity and lifecycle status |
+| `agent_sessions` | main/subagent process lifecycle plus its single active provider resource |
 | `main_notifications` | durable wakeups for run, experiment, anomaly, and summary events |
-| `cloud_resources` | provider resource IDs and deterministic teardown outcomes |
 | `explorer_state_lines` | compact append-only exploration memory |
 | `doc_chunks` | locally ingested SGLang reference text and embeddings |
 

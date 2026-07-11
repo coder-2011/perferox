@@ -25,7 +25,7 @@ from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
 from perferox.subagent import build_subagent_graph
-from perferox.tools import cleanup_cloud_resources, provider_cli, sglang_bench_serving
+from perferox.tools import cleanup_cloud_resource, provider_cli, sglang_bench_serving
 from perferox.tui import request_end
 
 
@@ -291,25 +291,25 @@ class ToolAndExperimentTests(DatabaseTestCase):
     created = subprocess.CompletedProcess([], 0, stdout='{"id":"pod-123"}\n', stderr="")
     failed_cleanup = subprocess.CompletedProcess([], 1, stdout="", stderr="temporary provider error")
     terminated = subprocess.CompletedProcess([], 0, stdout="deleted pod-123\n", stderr="")
+    db.record_agent_session(self.conn, session_name="perferox-agent-11", role="subagent", agent_id=11)
     tool = provider_cli("runpod", self.db_path, 11)
     refused = tool.invoke({"arguments": ["template", "delete", "shared-template"]})
     with patch("perferox.tools.subprocess.run", side_effect=[created, failed_cleanup]) as run:
       output = tool.invoke({"arguments": ["pod", "create", "--image", "image", "--gpu-id", "H100"]})
-      cleanup = cleanup_cloud_resources(self.db_path, 11, "secret")
+      cleanup = cleanup_cloud_resource(self.db_path, 11, "secret")
 
-    resource = self.conn.execute("SELECT * FROM cloud_resources WHERE agent_id = 11").fetchone()
+    resource = self.conn.execute("SELECT * FROM agent_sessions WHERE agent_id = 11").fetchone()
     self.assertIn("resource_id=pod-123", output)
     self.assertIn("refused", refused)
-    self.assertIn("temporary provider error", cleanup[0])
-    self.assertIsNone(resource["terminated_at"])
+    self.assertIn("temporary provider error", cleanup)
+    self.assertEqual(resource["resource_id"], "pod-123")
     self.assertEqual(run.call_args_list[1].args[0], ["runpodctl", "pod", "delete", "pod-123"])
 
-    db.record_agent_session(self.conn, session_name="perferox-agent-11", role="subagent", agent_id=11)
     db.finish_agent_session(self.conn, session_name="perferox-agent-11", status="exited")
     with patch("perferox.tools.subprocess.run", return_value=terminated):
       _wait_for_main_event(self.db_path, poll_s=0, cloud_api_key="secret")
-    retried = self.conn.execute("SELECT terminated_at FROM cloud_resources WHERE resource_id = 'pod-123'").fetchone()
-    self.assertIsNotNone(retried["terminated_at"])
+    retried = self.conn.execute("SELECT resource_id FROM agent_sessions WHERE agent_id = 11").fetchone()
+    self.assertEqual(retried["resource_id"], "")
 
 
 class TUIWiringTests(DatabaseTestCase):

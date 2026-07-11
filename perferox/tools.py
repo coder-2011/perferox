@@ -117,7 +117,6 @@ def sglang_bench_serving(
   agent_id: int,
   repository: str = "",
   commit: str = "",
-  provider: str = "",
   trace_ref: str = "",
   attempt_cap: int | None = None,
 ) -> BaseTool:
@@ -136,13 +135,14 @@ def sglang_bench_serving(
     session = registry.get(session_id)
     try:
       with closing(db.connect(db_path)) as conn:
+        resource = db.pending_cloud_resource(conn, agent_id=agent_id)
         run_id = db.start_benchmark_run(
           conn,
           agent_id=agent_id,
           command=command,
           repository=repository,
           commit=commit,
-          provider=provider,
+          provider=resource["provider"] if resource else "",
           gpu=args.gpu,
           server_command=args.server_command,
           model_state=args.model_state,
@@ -184,7 +184,7 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
       with closing(db.connect(db_path)) as conn:
         if db.stop_requested(conn, agent_id=agent_id):
           return "stop requested; provider creation refused"
-        if db.pending_cloud_resources(conn, agent_id=agent_id):
+        if db.pending_cloud_resource(conn, agent_id=agent_id):
           return "provider_cli permits one active cloud resource per subagent"
     argv = [executable, *arguments]
     if provider == "runpod" and creating and not {"--output", "-o"} & set(arguments):
@@ -206,24 +206,22 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
   return run
 
 
-def cleanup_cloud_resources(db_path: str | Path, agent_id: int, api_key: str | None = None) -> list[str]:
-  """Terminate one worker's persisted resources and return cleanup failures."""
+def cleanup_cloud_resource(db_path: str | Path, agent_id: int, api_key: str | None = None) -> str:
+  """Terminate one worker's persisted resource and return any failure."""
   with closing(db.connect(db_path, readonly=True)) as conn:
-    resources = db.pending_cloud_resources(conn, agent_id=agent_id)
-  errors = []
-  for resource in resources:
-    provider = resource["provider"]
-    resource_id = resource["resource_id"]
-    env = os.environ.copy()
-    if api_key:
-      env["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
-    result = _terminate_resource(provider, resource_id, env)
-    error = "" if result.startswith("exit_code=0\n") else result
+    resource = db.pending_cloud_resource(conn, agent_id=agent_id)
+  if resource is None:
+    return ""
+  provider, resource_id = resource["provider"], resource["resource_id"]
+  env = os.environ.copy()
+  if api_key:
+    env["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
+  result = _terminate_resource(provider, resource_id, env)
+  error = "" if result.startswith("exit_code=0\n") else result
+  if not error:
     with closing(db.connect(db_path)) as conn:
-      db.finish_cloud_resource(conn, provider=provider, resource_id=resource_id, error=error)
-    if error:
-      errors.append(f"{provider} {resource_id}: {error}")
-  return errors
+      db.clear_cloud_resource(conn, agent_id=agent_id)
+  return f"{provider} {resource_id}: {error}" if error else ""
 
 
 def _run_argv(argv: list[str], env: Mapping[str, str] | None = None) -> str:

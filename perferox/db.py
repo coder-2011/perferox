@@ -38,11 +38,15 @@ def init_db(conn: sqlite3.Connection) -> None:
   """Create every table and index declared by the schema."""
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
-  columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
-  # Existing pre-beta databases need the identity fields added in place.
-  for name in ("repository", "commit_hash", "provider", "server_command", "model_state"):
-    if name not in columns:
-      conn.execute(f"ALTER TABLE runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+  # Existing pre-beta databases need the new text fields added in place.
+  for table, names in (
+    ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
+    ("agent_sessions", ("provider", "resource_id")),
+  ):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name in names:
+      if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 
 def embed_intent(intent_key: str) -> list[float]:
@@ -166,29 +170,32 @@ def notify_main(
 
 
 def record_cloud_resource(conn: sqlite3.Connection, *, agent_id: int, provider: str, resource_id: str) -> None:
-  """Persist one paid resource before the worker can continue."""
+  """Attach one paid resource to its owning worker session."""
   with conn:
-    conn.execute(
-      "INSERT INTO cloud_resources(provider, resource_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
-      (provider, resource_id, agent_id, datetime.now(UTC).isoformat(timespec="seconds")),
-    )
+    updated = conn.execute(
+      """UPDATE agent_sessions
+         SET provider = ?, resource_id = ?
+         WHERE role = 'subagent' AND agent_id = ? AND resource_id = ''""",
+      (provider, resource_id, agent_id),
+    ).rowcount
+  if updated != 1:
+    raise ValueError(f"agent {agent_id} has no available worker session")
 
 
-def pending_cloud_resources(conn: sqlite3.Connection, *, agent_id: int) -> list[sqlite3.Row]:
-  """Return paid resources that still require termination."""
+def pending_cloud_resource(conn: sqlite3.Connection, *, agent_id: int) -> sqlite3.Row | None:
+  """Return the worker-owned resource when it still needs termination."""
   return conn.execute(
-    "SELECT * FROM cloud_resources WHERE agent_id = ? AND terminated_at IS NULL ORDER BY created_at",
+    "SELECT * FROM agent_sessions WHERE role = 'subagent' AND agent_id = ? AND resource_id != ''",
     (agent_id,),
-  ).fetchall()
+  ).fetchone()
 
 
-def finish_cloud_resource(conn: sqlite3.Connection, *, provider: str, resource_id: str, error: str = "") -> None:
-  """Record a provider teardown result for one paid resource."""
-  terminated_at = None if error else datetime.now(UTC).isoformat(timespec="seconds")
+def clear_cloud_resource(conn: sqlite3.Connection, *, agent_id: int) -> None:
+  """Clear the worker-owned resource after successful teardown."""
   with conn:
     conn.execute(
-      "UPDATE cloud_resources SET terminated_at = ?, termination_error = ? WHERE provider = ? AND resource_id = ?",
-      (terminated_at, error[:2000], provider, resource_id),
+      "UPDATE agent_sessions SET resource_id = '' WHERE role = 'subagent' AND agent_id = ?",
+      (agent_id,),
     )
 
 
@@ -207,16 +214,8 @@ def start_benchmark_run(
   attempt_cap: int | None = None,
 ) -> int:
   """Assign the next run id and insert the started benchmark row."""
-  identity = {
-    "repository": repository,
-    "commit": commit,
-    "provider": provider,
-    "gpu": gpu,
-    "server_command": server_command,
-    "model_state": model_state,
-    "command": command,
-  }
-  exact_hash = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+  identity = (repository, commit, provider, gpu, server_command, model_state, command)
+  exact_hash = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
   started_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     # Serialize the stop/cap checks and run-id assignment with the insert.

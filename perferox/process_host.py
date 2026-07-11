@@ -23,7 +23,7 @@ from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_
 from perferox.remote import SessionRegistry
 from perferox.status import refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
-from perferox.tools import cleanup_cloud_resources, provider_cli
+from perferox.tools import cleanup_cloud_resource, provider_cli
 
 MAIN_SESSION = "perferox-main"
 CONSOLE = Console()
@@ -149,7 +149,6 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
     graph = build_subagent_graph(
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
-      provider,
       create_pod_prompt=create_prompt,
       attempt_cap=attempt_cap,
       trace_ref=str(trace_path),
@@ -161,7 +160,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     return 0
   finally:
     registry.close(f"agent-{agent_id}")
-    cleanup_cloud_resources(db_path, agent_id)
+    cleanup_cloud_resource(db_path, agent_id)
     with closing(db.connect(db_path)) as conn:
       if db.finish_agent_session(conn, session_name=session_name, status="exited"):
         db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
@@ -188,16 +187,16 @@ def _wait_for_main_event(db_path: Path, poll_s: float, cloud_api_key: str | None
       active_rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
       cleanup_agents = conn.execute(
-        """
-        SELECT DISTINCT c.agent_id FROM cloud_resources c
-        JOIN agent_sessions s ON s.agent_id = c.agent_id
-        WHERE c.terminated_at IS NULL AND s.role = 'subagent' AND s.status NOT IN ('running', 'ending')
-        """
+        """SELECT agent_id FROM agent_sessions
+           WHERE role = 'subagent' AND status NOT IN ('running', 'ending')
+             AND resource_id != ''"""
       ).fetchall()
     cleanup_errors = []
     # Provider I/O must not retain the coordinator's SQLite connection.
     for row in cleanup_agents:
-      cleanup_errors.extend(cleanup_cloud_resources(db_path, row["agent_id"], cloud_api_key))
+      error = cleanup_cloud_resource(db_path, row["agent_id"], cloud_api_key)
+      if error:
+        cleanup_errors.append(error)
     if ending and not active_rows:
       if cleanup_errors:
         time.sleep(poll_s)
