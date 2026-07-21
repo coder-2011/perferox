@@ -9,7 +9,7 @@ Perferox is intentionally small. I think of agentic engineering as carefully dec
 ```mermaid
 flowchart LR
   user["User"] --> surface["TUI / CLI"] --> main["Main agent"]
-  main --> workers["Benchmark subagents"] --> instance["RunPod / Lambda"]
+  main --> workers["Benchmark subagents"] --> instance["RunPod / Lambda / Modal"]
   main <--> db[("SQLite state")]
   workers <--> db
 ```
@@ -21,7 +21,7 @@ The important split is:
 | hypotheses and exploration direction | agent and run IDs |
 | repository setup strategy | attempt caps and stop state |
 | benchmark parameters | SQLite writes and transactions |
-| whether behavior looks interesting | tmux sessions, trace paths, and SSH objects |
+| whether behavior looks interesting | tmux sessions, trace paths, and remote session handles |
 | concise summaries | tool schemas and command execution |
 
 Agents receive goals and immutable constraints, then choose the simplest useful path inside those bounds.
@@ -35,7 +35,7 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
-The TUI and CLI both launch `perferox.process_host`. The API-key prefix selects RunPod or Lambda, and the host passes the key to detached tmux processes through a one-use file. Workers expose only the selected provider's environment variable.
+The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one credential handoff to detached tmux processes through a one-use file, and workers expose only the selected provider's credentials.
 
 The main process uses two roots:
 
@@ -82,7 +82,7 @@ Each subagent receives one exact repository, commit, goal, and hard attempt cap.
 
 ```mermaid
 flowchart LR
-  start["START"] --> create["Create instance + SSH"] --> setup["Set up target"]
+  start["START"] --> create["Create instance + session"] --> setup["Set up target"]
   setup -->|"ready"| bench["Benchmark loop"]
   setup -->|"retry needed"| intervention["Setup intervention"]
   intervention --> setup
@@ -93,7 +93,7 @@ flowchart LR
 
 The normal setup path is:
 
-1. choose a RunPod or Lambda environment
+1. choose a RunPod, Lambda, or Modal environment
 2. optionally use a container when it clearly reduces setup work
 3. clone the delegated repository into `/workspace/target`
 4. check out the exact commit in detached HEAD state
@@ -106,12 +106,12 @@ Worker tools are deliberately phase-scoped:
 
 | Phase | Mutating capabilities |
 | --- | --- |
-| create instance | host-tracked provider creation, read-only provider discovery, connect host SSH session |
-| setup / intervention | remote shell over the registered SSH session |
+| create instance | provider discovery when available, one host-tracked resource, one registered remote session |
+| setup / intervention | remote shell over SSH or Modal Sandbox exec |
 | benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
 | wrap-up | write one summary notification to SQLite |
 
-The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH clients stay in a host `SessionRegistry`, never in graph state or traces.
+The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH and Modal Sandbox handles stay in a host `SessionRegistry`, never in graph state or traces.
 
 ## One benchmark attempt
 
@@ -124,7 +124,7 @@ flowchart LR
   tx --> guard{"stop or cap reached?"}
   guard -->|"yes"| refuse["Refuse new run"]
   guard -->|"no"| row["Insert started run + assign run_id"]
-  row --> remote["Execute over SSH"]
+  row --> remote["Execute remotely"]
   remote -->|"failed"| failed["Mark run failed"]
   remote -->|"succeeded"| parse["Parse benchmark metrics"]
   parse --> experiment["Log experiment + intent embedding"]
@@ -186,7 +186,7 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `tools.py` | local/remote execution and narrow host-owned LangChain tools |
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
-| `remote.py` | Paramiko SSH session and in-process session registry |
-| `auth.py` | persisted ChatGPT OAuth, cloud-key validation and one-use handoff |
+| `remote.py` | Paramiko SSH and Modal Sandbox execution sessions plus their in-process registry |
+| `auth.py` | persisted ChatGPT OAuth, cloud credential validation and one-use handoff |
 | `prompts.py` | provider-specific instance creation and worker constraints |
 | `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |

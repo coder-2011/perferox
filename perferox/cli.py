@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth
+from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
 
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
   subparsers = parser.add_subparsers(dest="command")
   run_parser = subparsers.add_parser("run", help="start the main graph without opening the TUI")
   run_parser.add_argument("objective", nargs="+", help="objective for the main agent")
-  run_parser.add_argument("--provider", choices=("runpod", "lambda"), help="cloud provider; inferred from a recognized key prefix")
+  run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
   subparsers.add_parser("login", help="authenticate with ChatGPT OAuth")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
@@ -101,9 +101,17 @@ def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) ->
   from perferox.process_host import main as run_agent
 
   objective = " ".join(args.objective)
-  selected = args.provider or Prompt.ask("Cloud provider", choices=("runpod", "lambda"), console=CONSOLE)
-  env_name = "LAMBDA_API_KEY" if selected == "lambda" else "RUNPOD_API_KEY"
-  api_key = os.environ.get(env_name) or Prompt.ask(f"{selected.title()} API key", password=True, console=CONSOLE)
+  selected = args.provider or Prompt.ask("Cloud provider", choices=("runpod", "lambda", "modal"), console=CONSOLE)
+  if selected == "modal":
+    try:
+      api_key = modal_cloud_key()
+    except ValueError as exc:
+      return _error(str(exc))
+  else:
+    env_name = "LAMBDA_API_KEY" if selected == "lambda" else "RUNPOD_API_KEY"
+    api_key = os.environ.get(env_name)
+    if not api_key:
+      api_key = Prompt.ask(f"{selected.title()} API key", password=True, console=CONSOLE)
   try:
     provider = cloud_provider(api_key)
   except ValueError as exc:
@@ -212,9 +220,19 @@ def _doctor(cwd: Path, db_path: Path) -> int:
       configured.append(expected if cloud_provider(api_key) == expected else f"invalid {env_name}")
     except ValueError:
       configured.append(f"invalid {env_name}")
+  modal_config = Path("~/.modal.toml").expanduser()
+  if os.environ.get("MODAL_TOKEN_ID") or os.environ.get("MODAL_TOKEN_SECRET"):
+    try:
+      modal_cloud_key()
+      configured.append("modal")
+    except ValueError:
+      configured.append("invalid Modal tokens")
+  elif modal_config.is_file():
+    configured.append("modal")
   invalid_cloud = any(item.startswith("invalid") for item in configured)
   cloud_state = "fail" if invalid_cloud else "ok" if configured else "warn"
-  checks.append(("cloud key", cloud_state, ", ".join(configured) if configured else "prompted when a run starts"))
+  cloud_detail = ", ".join(configured) if configured else "RunPod/Lambda prompt on start; Modal uses `modal setup`"
+  checks.append(("cloud auth", cloud_state, cloud_detail))
   checkout_ready = (cwd / "sglang" / ".git").is_dir()
   checks.append(("SGLang checkout", "ok" if checkout_ready else "warn", "ready" if checkout_ready else "cloned on first run"))
 

@@ -20,7 +20,7 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
 from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth
+from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
 from perferox.status import DashboardSnapshot, read_dashboard
 
 
@@ -115,8 +115,8 @@ class PerferoxTUI(App[None]):
         )
         yield Vertical(
           Horizontal(
-            Select((("RunPod", "runpod"), ("Lambda", "lambda")), prompt="Provider", id="cloud-provider"),
-            Input(placeholder="API key", password=True, id="cloud-key"),
+            Select((("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal")), prompt="Provider", id="cloud-provider"),
+            Input(placeholder="API key (blank for Modal)", password=True, id="cloud-key"),
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
             Button("END", id="end"),
@@ -176,7 +176,12 @@ class PerferoxTUI(App[None]):
     if not self.logged_in:
       return
     api_key = self.query_one("#cloud-key", Input).value.strip()
+    selected = self.query_one("#cloud-provider", Select).value
     try:
+      if selected == "modal":
+        if api_key:
+          raise ValueError("Leave the API key blank for Modal; use `modal setup` or token environment variables")
+        api_key = modal_cloud_key()
       provider = cloud_provider(api_key)
     except ValueError as exc:
       self.query_one("#footer", Static).update(escape(str(exc)))
@@ -185,7 +190,6 @@ class PerferoxTUI(App[None]):
     if not objective:
       self.query_one("#footer", Static).update("enter an objective before starting")
       return
-    selected = self.query_one("#cloud-provider", Select).value
     correction = f"using {provider} based on key; " if selected is not Select.BLANK and selected != provider else ""
     result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key)
     self.query_one("#cloud-key", Input).value = ""
