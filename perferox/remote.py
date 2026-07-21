@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import shlex
 import time
 from dataclasses import dataclass, field
+from math import ceil
+from typing import Any
 
 import paramiko
 
@@ -95,20 +98,54 @@ class RemoteSession:
             client.close()
 
 
+@dataclass(eq=False, slots=True)
+class ModalSession:
+    """Run commands through one Modal Sandbox handle."""
+
+    session_id: str
+    _sandbox: Any | None = field(repr=False)
+
+    def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
+        """Execute one command through Modal's native Sandbox process API."""
+        sandbox = self._sandbox
+        if sandbox is None:
+            raise RuntimeError(f"remote session is not connected: {self.session_id}")
+        argv = shlex.split(command)
+        if timeout_s is None:
+            process = sandbox.exec(*argv)
+        else:
+            process = sandbox.exec(*argv, timeout=max(1, ceil(timeout_s)))
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        exit_status = process.wait()
+        return RemoteResult(exit_status, stdout, stderr)
+
+    def close(self) -> None:
+        """Detach the client while host-owned cleanup terminates the Sandbox."""
+        sandbox = self._sandbox
+        self._sandbox = None
+        if sandbox is not None:
+            # Host-owned cleanup reattaches by id, so client detachment is best effort.
+            try:
+                sandbox.detach()
+            except Exception:  # noqa: BLE001,S110
+                pass
+
+
 class SessionRegistry:
-    """Keep live SSH clients behind string ids for graph/tool lookup."""
+    """Keep live remote execution sessions behind string ids for tool lookup."""
 
     def __init__(self) -> None:
         """Create an empty host-owned session map."""
-        self._sessions: dict[str, RemoteSession] = {}
+        self._sessions: dict[str, RemoteSession | ModalSession] = {}
 
-    def add(self, session: RemoteSession) -> None:
+    def add(self, session: RemoteSession | ModalSession) -> None:
         """Register a session without replacing an existing id."""
         if session.session_id in self._sessions:
             raise ValueError(f"remote session already exists: {session.session_id}")
         self._sessions[session.session_id] = session
 
-    def get(self, session_id: str) -> RemoteSession:
+    def get(self, session_id: str) -> RemoteSession | ModalSession:
         """Return the session registered under an id."""
         return self._sessions[session_id]
 

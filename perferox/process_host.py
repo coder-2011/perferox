@@ -17,17 +17,26 @@ from rich.console import Console
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import build_chat_model, cloud_provider, read_cloud_key, write_cloud_key
+from perferox.auth import build_chat_model, cloud_environment, cloud_provider, read_cloud_key, write_cloud_key
 from perferox.main_agent import build_main_agent_graph
-from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT
+from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT, MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
 from perferox.status import refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
-from perferox.tools import cleanup_cloud_resource, provider_cli
+from perferox.tools import cleanup_cloud_resource, create_modal_sandbox, provider_cli
 
 MAIN_SESSION = "perferox-main"
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
+CLOUD_CREDENTIAL_NAMES = ("LAMBDA_API_KEY", "RUNPOD_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
+
+
+def _select_cloud_environment(api_key: str) -> None:
+  """Expose only the selected provider credentials in this agent process."""
+  selected_environment = cloud_environment(api_key)
+  for name in CLOUD_CREDENTIAL_NAMES:
+    os.environ.pop(name, None)
+  os.environ.update(selected_environment)
 
 
 def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> int:
@@ -96,6 +105,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   if args.command == "main":
     api_key = read_cloud_key(args.cloud_key_file)
     provider = cloud_provider(api_key)
+    _select_cloud_environment(api_key)
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
@@ -135,10 +145,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   registry = SessionRegistry()
   api_key = read_cloud_key(args.cloud_key_file)
   provider = cloud_provider(api_key)
-  # Expose only the selected credential to the bounded provider CLI.
-  for name in ("LAMBDA_API_KEY", "RUNPOD_API_KEY"):
-    os.environ.pop(name, None)
-  os.environ["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
+  _select_cloud_environment(api_key)
   try:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
@@ -146,24 +153,32 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       if conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()["status"] == "ending":
         return 0
     attempt_cap = int(args.attempt_cap)
-    create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
+    if provider == "modal":
+      create_prompt = MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
+      create_tools = (create_modal_sandbox(registry, f"agent-{agent_id}", db_path, agent_id),)
+    else:
+      create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
+      create_tools = (provider_cli(provider, db_path, agent_id),)
     graph = build_subagent_graph(
       build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
       create_pod_prompt=create_prompt,
+      connect_with_ssh=provider != "modal",
       attempt_cap=attempt_cap,
       trace_ref=str(trace_path),
-      create_pod_tools=(provider_cli(provider, db_path, agent_id),),
+      create_pod_tools=create_tools,
     )
     state = {"agent_id": agent_id, "objective": Path(args.goal_file).read_text(encoding="utf-8"), "messages": []}
     for _ in stream_with_trace(graph, state, trace_path):
       pass
     return 0
   finally:
-    registry.close(f"agent-{agent_id}")
-    cleanup_cloud_resource(db_path, agent_id)
-    with closing(db.connect(db_path)) as conn:
-      if db.finish_agent_session(conn, session_name=session_name, status="exited"):
-        db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
+    try:
+      registry.close(f"agent-{agent_id}")
+    finally:
+      cleanup_cloud_resource(db_path, agent_id)
+      with closing(db.connect(db_path)) as conn:
+        if db.finish_agent_session(conn, session_name=session_name, status="exited"):
+          db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
 
 
 def _collect_update(state: dict, event: object) -> None:

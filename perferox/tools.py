@@ -11,15 +11,19 @@ from heapq import nsmallest
 from pathlib import Path
 from typing import Any
 
+import modal
 from langchain_core.tools import BaseTool, tool
 
 from perferox import db
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
-from perferox.remote import RemoteSession, SessionRegistry
+from perferox.remote import ModalSession, RemoteSession, SessionRegistry
 
 DEFAULT_TIMEOUT_S = 30.0
 MAX_OUTPUT_CHARS = 10000
 MAX_SEARCH_RESULTS = 50
+MODAL_CPU_CORES = 8.0
+MODAL_MEMORY_MIB = 64 * 1024
+MODAL_SANDBOX_TIMEOUT_S = 24 * 60 * 60
 SKIP_SEARCH_DIRS = {".git", ".ruff_cache", ".venv", "__pycache__"}
 WEB_SEARCH_TOOL = {"type": "web_search", "external_web_access": True, "search_context_size": "high"}
 _PROVIDER_COMMANDS = {
@@ -101,10 +105,10 @@ def remote_terminal(
   session_id: str,
   guard: Callable[[], str | None] | None = None,
 ) -> BaseTool:
-  """Create a shell tool bound to one host-assigned SSH session id."""
-  @tool("remote_terminal", description="Run one shell command on the connected remote SSH machine.")
+  """Create a shell tool bound to one host-assigned remote session id."""
+  @tool("remote_terminal", description="Run one shell command on the connected remote machine.")
   def terminal(command: str, timeout_s: float | None = DEFAULT_TIMEOUT_S) -> str:
-    """Run one shell command through the bound SSH session."""
+    """Run one shell command through the bound remote session."""
     refusal = guard() if guard else None
     if refusal:
       return f"remote command refused: {refusal}"
@@ -130,7 +134,7 @@ def sglang_bench_serving(
   """Create the structured SGLang benchmark tool for one subagent."""
   @tool(
     "sglang_bench_serving", args_schema=BenchServingArgs,
-    description="Run one structured SGLang serving benchmark on the connected remote SSH machine and return its host-assigned run_id.",
+    description="Run one structured SGLang serving benchmark on the connected remote machine and return its host-assigned run_id.",
   )
   def run(**kwargs: Any) -> str:
     """Run one benchmark command after the host assigns its run id."""
@@ -213,6 +217,81 @@ def provider_cli(provider: str, db_path: str | Path, agent_id: int) -> BaseTool:
   return run
 
 
+def create_modal_sandbox(
+  registry: SessionRegistry,
+  session_id: str,
+  db_path: str | Path,
+  agent_id: int,
+) -> BaseTool:
+  """Create one tracked Modal GPU Sandbox and register its exec session."""
+  @tool(
+    "create_modal_sandbox",
+    description="Create one host-tracked Modal GPU Sandbox from a public container image and connect its native command session.",
+  )
+  def create(
+    image: str,
+    gpu: str,
+    cpu: float = MODAL_CPU_CORES,
+    memory_mib: int = MODAL_MEMORY_MIB,
+  ) -> str:
+    """Create one bounded Sandbox after checking stop and resource ownership."""
+    image = image.strip()
+    gpu = gpu.strip()
+    if not image or not gpu:
+      return "image and gpu must be non-empty"
+    if cpu <= 0 or memory_mib < 128:
+      return "cpu must be positive and memory_mib must be at least 128"
+    with closing(db.connect(db_path)) as conn:
+      if db.stop_requested(conn, agent_id=agent_id):
+        return "stop requested; Modal Sandbox creation refused"
+      if db.pending_cloud_resource(conn, agent_id=agent_id):
+        return "create_modal_sandbox permits one active cloud resource per subagent"
+
+    sandbox = None
+    registered = False
+    try:
+      app = modal.App.lookup("perferox", create_if_missing=True)
+      image_definition = modal.Image.from_registry(image)
+      # Clear registry entrypoints so the host-owned sleep command always runs.
+      image_definition = image_definition.entrypoint([])
+      sandbox = modal.Sandbox.create(
+        "sleep", "infinity",
+        app=app,
+        image=image_definition,
+        gpu=gpu,
+        cpu=cpu,
+        memory=memory_mib,
+        timeout=MODAL_SANDBOX_TIMEOUT_S,
+      )
+      registry.add(ModalSession(session_id, sandbox))
+      registered = True
+      with closing(db.connect(db_path)) as conn:
+        db.record_cloud_resource(conn, agent_id=agent_id, provider="modal", resource_id=sandbox.object_id)
+    except Exception as exc:
+      cleanup_error = ""
+      if sandbox is not None:
+        try:
+          sandbox.terminate(wait=True)
+        except Exception as cleanup_exc:
+          cleanup_error = f"; compensating cleanup failed: {type(cleanup_exc).__name__}: {cleanup_exc}"
+        try:
+          if registered:
+            registry.close(session_id)
+          else:
+            sandbox.detach()
+        except Exception as detach_exc:
+          cleanup_error += f"; detach failed: {type(detach_exc).__name__}: {detach_exc}"
+      return f"Modal Sandbox creation failed: {type(exc).__name__}: {exc}{cleanup_error}"
+
+    return (
+      f"resource_id={sandbox.object_id}\nimage={image}\ngpu={gpu}\n"
+      f"cpu={cpu:g} physical cores\nmemory_mib={memory_mib}\n"
+      f"connected remote session {session_id} through Modal"
+    )
+
+  return create
+
+
 def cleanup_cloud_resource(db_path: str | Path, agent_id: int, api_key: str | None = None) -> str:
   """Terminate one worker's persisted resource and return any failure."""
   with closing(db.connect(db_path, readonly=True)) as conn:
@@ -221,7 +300,7 @@ def cleanup_cloud_resource(db_path: str | Path, agent_id: int, api_key: str | No
     return ""
   provider, resource_id = resource["provider"], resource["resource_id"]
   env = os.environ.copy()
-  if api_key:
+  if api_key and provider in {"lambda", "runpod"}:
     env["LAMBDA_API_KEY" if provider == "lambda" else "RUNPOD_API_KEY"] = api_key
   result = _terminate_resource(provider, resource_id, env)
   error = "" if result.startswith("exit_code=0\n") else result
@@ -254,6 +333,21 @@ def _created_resource_id(provider: str, output: str) -> str | None:
 
 def _terminate_resource(provider: str, resource_id: str, env: Mapping[str, str]) -> str:
   """Permanently delete one recorded provider resource."""
+  if provider == "modal":
+    sandbox = None
+    try:
+      sandbox = modal.Sandbox.from_id(resource_id)
+      sandbox.terminate(wait=True)
+    except Exception as exc:
+      return _format_result(None, "", f"{type(exc).__name__}: {exc}")
+    finally:
+      if sandbox is not None:
+        # Termination is the durable cleanup boundary; detach only releases the local client.
+        try:
+          sandbox.detach()
+        except Exception:  # noqa: S110
+          pass
+    return _format_result(0, f"terminated {resource_id}", "")
   argv = ["lambda-labs", "rm", resource_id] if provider == "lambda" else ["runpodctl", "pod", "delete", resource_id]
   return _run_argv(argv, env)
 
@@ -318,8 +412,8 @@ def run_local_command(command: str, timeout_s: float | None, cwd: str | Path | N
     return _format_result(None, "", f"{type(exc).__name__}: {exc}")
 
 
-def _run_remote(session: RemoteSession, command: str, timeout_s: float | None) -> str:
-  """Run a command through SSH."""
+def _run_remote(session: RemoteSession | ModalSession, command: str, timeout_s: float | None) -> str:
+  """Run a command through the selected remote execution session."""
   try:
     result = session.run(f"bash -lc {shlex.quote(command)}", timeout_s=timeout_s)
   except Exception as exc:

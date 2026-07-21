@@ -13,7 +13,7 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from lambda_labs import request as lambda_request
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -22,12 +22,13 @@ from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from perferox import db
+from perferox.auth import cloud_environment, modal_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
 from perferox.subagent import build_subagent_graph
-from perferox.tools import cleanup_cloud_resource, provider_cli, sglang_bench_serving
+from perferox.tools import MODAL_CPU_CORES, MODAL_MEMORY_MIB, cleanup_cloud_resource, create_modal_sandbox, provider_cli, sglang_bench_serving
 from perferox.tui import request_end
 
 
@@ -345,6 +346,62 @@ class ToolAndExperimentTests(DatabaseTestCase):
       _wait_for_main_event(self.db_path, poll_s=0, cloud_api_key="secret")
     retried = self.conn.execute("SELECT resource_id FROM agent_sessions WHERE agent_id = 11").fetchone()
     self.assertEqual(retried["resource_id"], "")
+
+  def test_modal_sandbox_uses_native_exec_and_host_cleanup(self) -> None:
+    """Persist, execute in, and terminate one Modal Sandbox without SSH."""
+    with patch.dict(os.environ, {"MODAL_TOKEN_ID": "ak-test", "MODAL_TOKEN_SECRET": "as-test"}, clear=True):
+      cloud_key = modal_cloud_key()
+    self.assertEqual(cloud_environment(cloud_key), {"MODAL_TOKEN_ID": "ak-test", "MODAL_TOKEN_SECRET": "as-test"})
+
+    process = MagicMock()
+    process.stdout.read.return_value = "gpu ready\n"
+    process.stderr.read.return_value = ""
+    process.wait.return_value = 0
+    sandbox = MagicMock(object_id="sb-123")
+    sandbox.exec.return_value = process
+    recovered_sandbox = MagicMock()
+    recovered_sandbox.detach.side_effect = RuntimeError("local detach failed")
+    app = object()
+    base_image = MagicMock()
+    image = object()
+    base_image.entrypoint.return_value = image
+    registry = SessionRegistry()
+    db.record_agent_session(self.conn, session_name="perferox-agent-12", role="subagent", agent_id=12)
+    tool = create_modal_sandbox(registry, "agent-12", self.db_path, 12)
+
+    with (
+      patch("perferox.tools.modal.App.lookup", return_value=app) as lookup_app,
+      patch("perferox.tools.modal.Image.from_registry", return_value=base_image) as load_image,
+      patch("perferox.tools.modal.Sandbox.create", return_value=sandbox) as create_sandbox,
+      patch("perferox.tools.modal.Sandbox.from_id", return_value=recovered_sandbox) as load_sandbox,
+    ):
+      output = tool.invoke({"image": "lmsysorg/sglang:latest", "gpu": "H100"})
+      result = registry.get("agent-12").run("bash -lc 'nvidia-smi'", timeout_s=7)
+      registry.close("agent-12")
+      cleanup = cleanup_cloud_resource(self.db_path, 12)
+
+    resource = self.conn.execute("SELECT provider, resource_id FROM agent_sessions WHERE agent_id = 12").fetchone()
+    self.assertIn("resource_id=sb-123", output)
+    self.assertEqual(result, RemoteResult(0, "gpu ready\n", ""))
+    self.assertEqual(cleanup, "")
+    self.assertEqual(dict(resource), {"provider": "modal", "resource_id": ""})
+    lookup_app.assert_called_once_with("perferox", create_if_missing=True)
+    load_image.assert_called_once_with("lmsysorg/sglang:latest")
+    base_image.entrypoint.assert_called_once_with([])
+    create_sandbox.assert_called_once_with(
+      "sleep", "infinity",
+      app=app,
+      image=image,
+      gpu="H100",
+      cpu=MODAL_CPU_CORES,
+      memory=MODAL_MEMORY_MIB,
+      timeout=24 * 60 * 60,
+    )
+    sandbox.exec.assert_called_once_with("bash", "-lc", "nvidia-smi", timeout=7)
+    load_sandbox.assert_called_once_with("sb-123")
+    sandbox.detach.assert_called_once_with()
+    recovered_sandbox.terminate.assert_called_once_with(wait=True)
+    recovered_sandbox.detach.assert_called_once_with()
 
 
 class TUIWiringTests(DatabaseTestCase):

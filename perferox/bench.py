@@ -148,7 +148,7 @@ class BenchServingArgs(BaseModel):
   fake_prefill: bool = Field(False, description="Use fake prefill mode for decode-only benchmarking.")
   tag: str | None = Field(None, description="Tag written to benchmark output.")
   header: dict[str, str] | None = Field(None, description="Custom HTTP headers as key/value pairs.")
-  timeout_s: float | None = Field(BENCH_TIMEOUT_S, gt=0, description="Host-side SSH command timeout; not a bench_serving flag.")
+  timeout_s: float | None = Field(BENCH_TIMEOUT_S, gt=0, description="Host-side remote command timeout; not a bench_serving flag.")
 
   @model_validator(mode="after")
   def check_serving_constraints(self) -> Self:

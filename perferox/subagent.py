@@ -102,6 +102,7 @@ def build_subagent_graph(
   commit: str,
   *,
   create_pod_prompt: str = CREATE_POD_SYSTEM_PROMPT,
+  connect_with_ssh: bool = True,
   attempt_cap: int = 1,
   trace_ref: str = "",
   create_pod_tools: Sequence[BaseTool] = (),
@@ -131,7 +132,9 @@ def build_subagent_graph(
       return f"attempt cap reached ({attempts}/{attempt_cap}); log pending results or wrap up"
     return None
 
-  create_pod_tools = [*create_pod_tools, connect_remote_session(session_registry, session_id)]
+  create_pod_tools = list(create_pod_tools)
+  if connect_with_ssh:
+    create_pod_tools.append(connect_remote_session(session_registry, session_id))
   setup_tools = [*setup_tools, remote_terminal(session_registry, session_id)]
   benchmark_tools = [
     *benchmark_tools,
