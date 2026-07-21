@@ -9,10 +9,41 @@ from pathlib import Path
 
 
 def cloud_provider(api_key: str) -> str:
-  """Infer the provider from its API-key prefix."""
+  """Identify the provider from a key prefix or explicit Modal selection."""
+  if api_key.partition("\n")[0] == "modal": return "modal"
   if api_key.startswith("secret_"): return "lambda"
   if api_key.startswith("rpa_"): return "runpod"
-  raise ValueError("API key must start with secret_ for Lambda or rpa_ for RunPod")
+  raise ValueError("API key must start with secret_ for Lambda or rpa_ for RunPod; Modal uses `modal setup`")
+
+
+def modal_cloud_key() -> str:
+  """Build the one-use Modal handoff from paired environment tokens or a local profile."""
+  token_id = os.environ.get("MODAL_TOKEN_ID", "")
+  token_secret = os.environ.get("MODAL_TOKEN_SECRET", "")
+  if not token_id and not token_secret:
+    if not Path("~/.modal.toml").expanduser().is_file():
+      raise ValueError("Modal auth is missing; run `modal setup` or set both Modal token variables")
+    return "modal"
+  if not token_id or not token_secret:
+    raise ValueError("Modal requires both MODAL_TOKEN_ID and MODAL_TOKEN_SECRET")
+  if not token_id.startswith("ak-") or not token_secret.startswith("as-"):
+    raise ValueError("Modal API tokens must start with ak- and as-")
+  return f"modal\n{token_id}\n{token_secret}"
+
+
+def cloud_environment(api_key: str) -> dict[str, str]:
+  """Return only the selected provider credentials for a worker process."""
+  provider = cloud_provider(api_key)
+  if provider == "lambda":
+    return {"LAMBDA_API_KEY": api_key}
+  if provider == "runpod":
+    return {"RUNPOD_API_KEY": api_key}
+  parts = api_key.splitlines()
+  if parts == ["modal"]:
+    return {}
+  if len(parts) != 3 or not parts[1].startswith("ak-") or not parts[2].startswith("as-"):
+    raise ValueError("invalid Modal credential handoff")
+  return {"MODAL_TOKEN_ID": parts[1], "MODAL_TOKEN_SECRET": parts[2]}
 
 
 def write_cloud_key(api_key: str) -> Path:

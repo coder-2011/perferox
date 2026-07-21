@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "lambda-labs>=1.0.1",
+  "modal>=1.4.0",
   "langchain",
   "langgraph",
   "langchain-openai",
