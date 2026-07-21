@@ -23,6 +23,7 @@ MAX_OUTPUT_CHARS = 10000
 MAX_SEARCH_RESULTS = 50
 MODAL_CPU_CORES = 8.0
 MODAL_MEMORY_MIB = 64 * 1024
+MODAL_READY_TIMEOUT_S = 5 * 60
 MODAL_SANDBOX_TIMEOUT_S = 24 * 60 * 60
 SKIP_SEARCH_DIRS = {".git", ".ruff_cache", ".venv", "__pycache__"}
 WEB_SEARCH_TOOL = {"type": "web_search", "external_web_access": True, "search_context_size": "high"}
@@ -254,6 +255,8 @@ def create_modal_sandbox(
       image_definition = modal.Image.from_registry(image)
       # Clear registry entrypoints so the host-owned sleep command always runs.
       image_definition = image_definition.entrypoint([])
+      # Modal starts asynchronously, so prove the shell is usable before reporting a connected session.
+      readiness_probe = modal.Probe.with_exec("bash", "-lc", "command -v sleep >/dev/null")
       sandbox = modal.Sandbox.create(
         "sleep", "infinity",
         app=app,
@@ -262,11 +265,16 @@ def create_modal_sandbox(
         cpu=cpu,
         memory=memory_mib,
         timeout=MODAL_SANDBOX_TIMEOUT_S,
+        readiness_probe=readiness_probe,
       )
+      resource_id = sandbox.object_id
+      if not resource_id:
+        raise RuntimeError("Modal returned an empty Sandbox id")
+      sandbox.wait_until_ready(timeout=MODAL_READY_TIMEOUT_S)
       registry.add(ModalSession(session_id, sandbox))
       registered = True
       with closing(db.connect(db_path)) as conn:
-        db.record_cloud_resource(conn, agent_id=agent_id, provider="modal", resource_id=sandbox.object_id)
+        db.record_cloud_resource(conn, agent_id=agent_id, provider="modal", resource_id=resource_id)
     except Exception as exc:
       cleanup_error = ""
       if sandbox is not None:
@@ -284,7 +292,7 @@ def create_modal_sandbox(
       return f"Modal Sandbox creation failed: {type(exc).__name__}: {exc}{cleanup_error}"
 
     return (
-      f"resource_id={sandbox.object_id}\nimage={image}\ngpu={gpu}\n"
+      f"resource_id={resource_id}\nimage={image}\ngpu={gpu}\n"
       f"cpu={cpu:g} physical cores\nmemory_mib={memory_mib}\n"
       f"connected remote session {session_id} through Modal"
     )

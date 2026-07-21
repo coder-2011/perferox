@@ -28,7 +28,15 @@ from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
 from perferox.subagent import build_subagent_graph
-from perferox.tools import MODAL_CPU_CORES, MODAL_MEMORY_MIB, cleanup_cloud_resource, create_modal_sandbox, provider_cli, sglang_bench_serving
+from perferox.tools import (
+  MODAL_CPU_CORES,
+  MODAL_MEMORY_MIB,
+  MODAL_READY_TIMEOUT_S,
+  cleanup_cloud_resource,
+  create_modal_sandbox,
+  provider_cli,
+  sglang_bench_serving,
+)
 from perferox.tui import request_end
 
 
@@ -364,6 +372,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     app = object()
     base_image = MagicMock()
     image = object()
+    readiness_probe = object()
     base_image.entrypoint.return_value = image
     registry = SessionRegistry()
     db.record_agent_session(self.conn, session_name="perferox-agent-12", role="subagent", agent_id=12)
@@ -372,6 +381,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     with (
       patch("perferox.tools.modal.App.lookup", return_value=app) as lookup_app,
       patch("perferox.tools.modal.Image.from_registry", return_value=base_image) as load_image,
+      patch("perferox.tools.modal.Probe.with_exec", return_value=readiness_probe) as make_probe,
       patch("perferox.tools.modal.Sandbox.create", return_value=sandbox) as create_sandbox,
       patch("perferox.tools.modal.Sandbox.from_id", return_value=recovered_sandbox) as load_sandbox,
     ):
@@ -388,6 +398,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     lookup_app.assert_called_once_with("perferox", create_if_missing=True)
     load_image.assert_called_once_with("lmsysorg/sglang:latest")
     base_image.entrypoint.assert_called_once_with([])
+    make_probe.assert_called_once_with("bash", "-lc", "command -v sleep >/dev/null")
     create_sandbox.assert_called_once_with(
       "sleep", "infinity",
       app=app,
@@ -396,12 +407,40 @@ class ToolAndExperimentTests(DatabaseTestCase):
       cpu=MODAL_CPU_CORES,
       memory=MODAL_MEMORY_MIB,
       timeout=24 * 60 * 60,
+      readiness_probe=readiness_probe,
     )
+    sandbox.wait_until_ready.assert_called_once_with(timeout=MODAL_READY_TIMEOUT_S)
     sandbox.exec.assert_called_once_with("bash", "-lc", "nvidia-smi", timeout=7)
     load_sandbox.assert_called_once_with("sb-123")
     sandbox.detach.assert_called_once_with()
     recovered_sandbox.terminate.assert_called_once_with(wait=True)
     recovered_sandbox.detach.assert_called_once_with()
+
+  def test_modal_readiness_failure_terminates_sandbox(self) -> None:
+    """Terminate a Sandbox that fails readiness before it becomes host-owned."""
+    sandbox = MagicMock(object_id="sb-unready")
+    sandbox.wait_until_ready.side_effect = TimeoutError("not ready")
+    base_image = MagicMock()
+    base_image.entrypoint.return_value = object()
+    registry = SessionRegistry()
+    db.record_agent_session(self.conn, session_name="perferox-agent-13", role="subagent", agent_id=13)
+    tool = create_modal_sandbox(registry, "agent-13", self.db_path, 13)
+
+    with (
+      patch("perferox.tools.modal.App.lookup", return_value=object()),
+      patch("perferox.tools.modal.Image.from_registry", return_value=base_image),
+      patch("perferox.tools.modal.Probe.with_exec", return_value=object()),
+      patch("perferox.tools.modal.Sandbox.create", return_value=sandbox),
+    ):
+      output = tool.invoke({"image": "lmsysorg/sglang:latest", "gpu": "H100"})
+
+    resource_id = self.conn.execute("SELECT resource_id FROM agent_sessions WHERE agent_id = 13").fetchone()[0]
+    self.assertIn("Modal Sandbox creation failed: TimeoutError: not ready", output)
+    self.assertEqual(resource_id, "")
+    with self.assertRaises(KeyError):
+      registry.get("agent-13")
+    sandbox.terminate.assert_called_once_with(wait=True)
+    sandbox.detach.assert_called_once_with()
 
 
 class TUIWiringTests(DatabaseTestCase):
