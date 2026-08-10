@@ -20,6 +20,30 @@ Perferox is an agentic loop that tests the absolute edges of a system, by using 
 
 Not everyone opens a github issue when something goes wrong...
 
+## Getting started
+
+```bash
+uv sync
+uv run perferox onboard
+uv run perferox run "look for a regression in the radix cache"
+```
+
+`perferox onboard` asks two questions: which model does the thinking, and which cloud rents the GPU. It saves the answer to `~/.perferox/config.json`, so the TUI, the CLI, and the detached tmux workers all agree on it. Run it again any time to change your mind, or use `perferox providers` to see what is configured.
+
+## Model providers
+
+Perferox drives one chat model. You can sign in with an account, bring an API key, or point it at a server on your own machine.
+
+| How you authenticate | Providers |
+| --- | --- |
+| Account sign-in, no API key | ChatGPT, xAI (Grok) |
+| API key | OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras |
+| Local | Ollama, llama.cpp |
+
+Both sign-ins are OAuth with PKCE and refresh in the background, so a run that lasts hours does not die on an expired token. `perferox login chatgpt` and `perferox login grok` open a browser; over SSH they fall back to a flow you can finish on another machine. API keys are read from their usual environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and so on), or pasted during onboarding and stored in `~/.perferox/credentials.json` with mode 0600.
+
+Everything except ChatGPT speaks the OpenAI chat-completions dialect, so a provider is one row in `perferox/providers.py`. Add a row and it shows up in onboarding, in `perferox providers`, and in the TUI without touching anything else.
+
 ## How it works
 
 A main agent spawns benchmark subagents in persistent tmux sessions. Each subagent creates an isolated GPU environment through RunPod, Lambda, or Modal, investigates one focused hypothesis from the main agent, records its experiments in SQLite, and reports anomalies.

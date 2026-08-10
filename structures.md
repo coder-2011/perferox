@@ -28,9 +28,12 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 
 ## Entry points and processes
 
-`perferox` exposes four user paths:
+`perferox` exposes these user paths:
 
 - no command opens the Textual dashboard
+- `perferox onboard` picks and authenticates a model provider and a GPU cloud
+- `perferox login [provider]` authenticates one model provider
+- `perferox providers` lists every supported model provider and its state
 - `perferox run <objective>` launches the main agent
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
@@ -136,6 +139,20 @@ flowchart LR
 
 Started failures count against the cap. Invalid arguments do not, because no run row is created. SQLite serializes run-number assignment and enforces the cap in the same transaction.
 
+## Model providers
+
+One chat model drives the coordinator and its workers. `perferox/providers.py` holds every backend as a single row: how it authenticates, its OpenAI-compatible endpoint, and the model tags pickers offer. Three auth kinds cover all of them.
+
+| Auth kind | Credential | Providers |
+| --- | --- | --- |
+| `oauth` | account sign-in with PKCE, refreshed in the background | ChatGPT, Grok |
+| `key` | env var, else `~/.perferox/credentials.json` (0600) | OpenAI, Anthropic, xAI, OpenRouter, Cloudflare, Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras |
+| `local` | none | Ollama, llama.cpp |
+
+The selected provider and model live in `~/.perferox/config.json`, which `PERFEROX_PROVIDER` and `PERFEROX_CHAT_MODEL` override. Detached tmux workers read the same profile, so the coordinator and its subagents cannot drift onto different models. Only the cloud credential is handed to a worker through the one-use file; model credentials are never copied into a process environment or a trace.
+
+Grok is the one provider whose token expires mid-run. `XaiTokenProvider` refreshes it under a lock 120 seconds before the JWT `exp`, and an `httpx` auth hook stamps the header at send time rather than at model construction, so an eight-hour run never carries a stale bearer. A refresh rejected by the token endpoint clears the stored session instead of retrying a grant that is gone.
+
 ## Durable state
 
 SQLite is the source of truth; prompts and message history are not bookkeeping systems.
@@ -187,6 +204,9 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
 | `remote.py` | Paramiko SSH and Modal Sandbox execution sessions plus their in-process registry |
-| `auth.py` | persisted ChatGPT OAuth, cloud credential validation and one-use handoff |
+| `auth.py` | model-provider auth, chat model construction, cloud credential validation and one-use handoff |
+| `providers.py` | the provider table, the saved profile, and stored model credentials |
+| `onboarding.py` | first-run provider/model/cloud setup |
+| `xai_oauth.py` | xAI account sign-in, token storage, and background refresh |
 | `prompts.py` | provider-specific instance creation and worker constraints |
 | `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |

@@ -22,7 +22,7 @@ The system should run bounded benchmark experiments, preserve useful traces, det
 - Agent/tool wrappers: LangChain.
 - Agent state and routing: LangGraph.
 - Local storage: SQLite.
-- OpenAI auth: `langchain-openai` ChatGPT OAuth through `login_chatgpt`.
+- Model auth: one row per provider in `providers.py`. ChatGPT OAuth through `langchain-openai`, xAI OAuth in `xai_oauth.py`, everything else an OpenAI-compatible base URL plus a key.
 - Initial target: SGLang benchmarks using `--output-details --cache-report`.
 
 If Python packaging is needed, prefer `uv` unless the repo later chooses something else.
@@ -155,6 +155,8 @@ Idle -> Running -> Stopping -> Done
 - Use `login_chatgpt` for local ChatGPT OAuth when a token is missing.
 - Reuse the persisted token after login.
 - Use the device-flow fallback on SSH/headless machines.
+- Add a provider by adding a row to `providers.py`, not by branching in the CLI or TUI.
+- Keep model credentials in `~/.perferox` at mode 0600. Never put them in `config.json`, a process environment handoff, or a trace.
 - Never commit tokens, API keys, OAuth stores, `.env` files, benchmark credentials, or cloud credentials.
 
 ## Coding Rules

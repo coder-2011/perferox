@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -12,16 +14,19 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 from lambda_labs import request as lambda_request
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from pydantic import ValidationError
 
-from perferox import db
+from perferox import auth as perferox_auth
+from perferox import db, providers, xai_oauth
 from perferox.auth import cloud_environment, modal_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
@@ -481,6 +486,158 @@ class TUIWiringTests(DatabaseTestCase):
     self.assertIn("cache pressure 29", tail_lines[-1])
     self.assertEqual(stopped, 2)
     self.assertIsNone(update)
+
+
+class ProviderRegistryTests(unittest.TestCase):
+  """Cover the provider table, the stored profile, and credential resolution."""
+
+  def setUp(self) -> None:
+    """Point the profile and credential files at a throwaway directory."""
+    self.tempdir = tempfile.TemporaryDirectory()
+    root = Path(self.tempdir.name)
+    self.addCleanup(self.tempdir.cleanup)
+    patches = {
+      "CONFIG_DIR": root,
+      "CONFIG_PATH": root / "config.json",
+      "CREDENTIALS_PATH": root / "credentials.json",
+    }
+    for name, value in patches.items():
+      patcher = patch.object(providers, name, value)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+    for name in ("PERFEROX_PROVIDER", "PERFEROX_CHAT_MODEL", "PERFEROX_CLOUD", "DEEPSEEK_API_KEY", "CLOUDFLARE_ACCOUNT_ID"):
+      patcher = patch.dict(os.environ, {}, clear=False)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+      os.environ.pop(name, None)
+
+  def test_provider_rows_are_well_formed(self) -> None:
+    """Every row must be uniquely named, addressable, and offer a default model."""
+    seen: set[str] = set()
+    for provider in providers.PROVIDERS:
+      self.assertNotIn(provider.name, seen, f"duplicate provider {provider.name}")
+      seen.add(provider.name)
+      self.assertTrue(provider.models, f"{provider.name} offers no models")
+      self.assertEqual(provider.default_model, provider.models[0])
+      self.assertIn(provider.auth, (providers.OAUTH, providers.KEY, providers.LOCAL))
+      if provider.auth == providers.KEY:
+        self.assertTrue(provider.base_url.startswith("https://"), f"{provider.name} is not HTTPS")
+        self.assertFalse(provider.base_url.endswith("/"), f"{provider.name} has a trailing slash")
+        self.assertTrue(all(character.isupper() or character == "_" for character in provider.key_env), f"{provider.name} key_env is not UPPER_SNAKE")
+      if provider.auth == providers.LOCAL:
+        self.assertTrue(provider.base_url.startswith("http://127.0.0.1"), f"{provider.name} is not a loopback server")
+    self.assertEqual(len(seen), len(providers.PROVIDER_NAMES))
+
+  def test_settings_round_trip_and_environment_overrides(self) -> None:
+    """A saved profile survives a reload; env vars win; a switch resets the model."""
+    self.assertIsNone(providers.load_settings())
+    providers.save_settings(providers.Settings(provider="deepseek", model="deepseek-v4-flash", cloud="modal"))
+    self.assertEqual(providers.load_settings(), providers.Settings(provider="deepseek", model="deepseek-v4-flash", cloud="modal"))
+    self.assertEqual(providers.CONFIG_PATH.stat().st_mode & 0o777, 0o600)
+
+    with patch.dict(os.environ, {"PERFEROX_CHAT_MODEL": "deepseek-v4-pro"}):
+      self.assertEqual(providers.active_settings().model, "deepseek-v4-pro")
+    with patch.dict(os.environ, {"PERFEROX_PROVIDER": "groq"}):
+      # Switching providers must not carry a model tag the new provider cannot serve.
+      self.assertEqual(providers.active_settings(), providers.Settings(provider="groq", model="openai/gpt-oss-120b", cloud="modal"))
+
+  def test_credentials_prefer_the_environment_and_stay_private(self) -> None:
+    """Stored keys are owner-only, and an exported key wins over a stored one."""
+    deepseek = providers.find("deepseek")
+    providers.save_credential("deepseek", "stored-key")
+    self.assertEqual(providers.CREDENTIALS_PATH.stat().st_mode & 0o777, 0o600)
+    self.assertEqual(providers.api_key(deepseek), "stored-key")
+    with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "env-key"}):
+      self.assertEqual(providers.api_key(deepseek), "env-key")
+
+  def test_account_scoped_base_url_needs_an_account_id(self) -> None:
+    """Cloudflare's endpoint is unusable until an account id is configured."""
+    cloudflare = providers.find("cloudflare")
+    with self.assertRaises(ValueError):
+      providers.base_url(cloudflare)
+    providers.save_credential("cloudflare_account", "acct-123")
+    self.assertEqual(providers.base_url(cloudflare), "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1")
+
+  def test_auth_readiness_matches_the_credential_actually_present(self) -> None:
+    """Local needs nothing, a key provider needs its key, and the hint names it."""
+    self.assertTrue(perferox_auth.auth_ready(providers.find("llamacpp")))
+    groq = providers.find("groq")
+    self.assertFalse(perferox_auth.auth_ready(groq))
+    self.assertIn("GROQ_API_KEY", perferox_auth.missing_credential(groq))
+    providers.save_credential("groq", "gsk-test")
+    self.assertTrue(perferox_auth.auth_ready(groq))
+    self.assertIn("perferox login grok", perferox_auth.missing_credential(providers.find("grok")))
+
+
+class XaiOAuthTests(unittest.TestCase):
+  """Cover the parts of the xAI sign-in that fail silently if they regress."""
+
+  def setUp(self) -> None:
+    """Keep the token store inside a throwaway directory."""
+    self.tempdir = tempfile.TemporaryDirectory()
+    self.addCleanup(self.tempdir.cleanup)
+    self.token_path = Path(self.tempdir.name) / "xai_oauth.json"
+    patcher = patch.object(xai_oauth, "TOKEN_PATH", self.token_path)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  @staticmethod
+  def _jwt(expiry: int) -> str:
+    """Build a token whose payload carries only the given `exp` claim."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+  def test_pkce_challenge_is_the_s256_of_the_verifier(self) -> None:
+    """A mismatched challenge would only fail at the token exchange, far from here."""
+    verifier, challenge = xai_oauth._pkce_pair()
+    expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    self.assertEqual(challenge, expected)
+    self.assertLessEqual(len(verifier), 128)
+    self.assertNotIn("=", verifier)
+
+  def test_credentials_only_go_to_https_x_ai_endpoints(self) -> None:
+    """The token endpoint is cached on disk, so it is re-pinned before every use."""
+    xai_oauth._validate_xai_https("https://auth.x.ai/oauth2/token")
+    for hostile in ("http://auth.x.ai/oauth2/token", "https://auth.x.ai.evil.test/token", "https://example.com/token"):
+      with self.assertRaises(ValueError, msg=hostile):
+        xai_oauth._validate_xai_https(hostile)
+
+  def test_expiry_leeway_refreshes_before_the_token_actually_dies(self) -> None:
+    """A token inside the leeway is stale; an unreadable one is treated as live."""
+    now = 1_000_000
+    self.assertTrue(xai_oauth.expires_soon(self._jwt(now + xai_oauth.EXPIRY_LEEWAY_S - 1), now))
+    self.assertFalse(xai_oauth.expires_soon(self._jwt(now + xai_oauth.EXPIRY_LEEWAY_S + 60), now))
+    self.assertFalse(xai_oauth.expires_soon("not-a-jwt", now))
+
+  def test_a_stale_token_is_refreshed_and_a_dead_grant_is_forgotten(self) -> None:
+    """One refresh replaces both tokens; a rejected refresh clears the session."""
+    now = time()
+    xai_oauth.save_tokens(xai_oauth.StoredTokens(self._jwt(int(now) - 10), "refresh-1", "https://auth.x.ai/oauth2/token"))
+    self.assertEqual(self.token_path.stat().st_mode & 0o777, 0o600)
+
+    fresh = self._jwt(int(now) + 3600)
+    with patch.object(xai_oauth, "_exchange", return_value={"access_token": fresh, "refresh_token": "refresh-2"}) as exchange:
+      self.assertEqual(xai_oauth.XaiTokenProvider().get_token(), fresh)
+    self.assertEqual(exchange.call_args.args[1]["grant_type"], "refresh_token")
+    self.assertEqual(xai_oauth.load_tokens().refresh_token, "refresh-2")
+
+    with patch.object(xai_oauth, "_exchange", side_effect=RuntimeError("HTTP 400")), self.assertRaises(RuntimeError):
+      xai_oauth.XaiTokenProvider()._refresh(xai_oauth.StoredTokens("stale", "refresh-2", "https://auth.x.ai/oauth2/token"))
+    self.assertIsNone(xai_oauth.load_tokens())
+    self.assertFalse(xai_oauth.auth_ready())
+
+  def test_the_bearer_header_is_stamped_at_send_time(self) -> None:
+    """The key baked in when the chat model was built must never reach the API."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+      seen.append(request.headers.get("authorization"))
+      return httpx.Response(200, json={})
+
+    auth_flow = xai_oauth.BearerAuth(MagicMock(get_token=MagicMock(return_value="fresh")))
+    with httpx.Client(auth=auth_flow, transport=httpx.MockTransport(handler)) as client:
+      client.post("https://api.x.ai/v1/chat/completions", headers={"Authorization": "Bearer stale"}, json={})
+    self.assertEqual(seen, ["Bearer fresh"])
 
 
 if __name__ == "__main__":

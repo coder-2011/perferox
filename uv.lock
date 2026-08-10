@@ -1978,6 +1978,7 @@ name = "perferox"
 version = "0.1.1"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "lambda-labs" },
     { name = "langchain" },
     { name = "langchain-openai" },
@@ -1999,6 +2000,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx" },
     { name = "lambda-labs", editable = "packages/lambda-labs" },
     { name = "langchain" },
     { name = "langchain-openai" },

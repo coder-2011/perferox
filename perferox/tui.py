@@ -19,9 +19,10 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
-from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
+from perferox import auth, db, providers
 from perferox.status import DashboardSnapshot, read_dashboard
+
+CLOUD_CHOICES = (("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal"))
 
 
 def request_end(db_path: str | Path) -> int:
@@ -67,7 +68,8 @@ class PerferoxTUI(App[None]):
   Screen { background: #1d2021; color: #d5c4a1; }
   #root { height: 100%; width: 100%; background: #1d2021; }
   #login-screen { height: 1fr; width: 100%; align: center middle; }
-  #login-box { width: 44; height: 8; align: center middle; }
+  #login-box { width: 52; height: 10; align: center middle; }
+  #login-provider { height: 3; content-align: center middle; text-align: center; color: #fabd2f; }
   #body { height: 1fr; }
   #left { width: 31; border-right: solid #504945; }
   #main { width: 1fr; min-width: 64; }
@@ -98,13 +100,21 @@ class PerferoxTUI(App[None]):
     self.cwd = Path(cwd).resolve()
     self.db_path = Path(db_path).resolve()
     self.trace_dir = Path(trace_dir).resolve()
-    self.logged_in = chatgpt_auth_ready() if logged_in is None else logged_in
+    self.settings = providers.active_settings()
+    self.provider = providers.find(self.settings.provider)
+    self.logged_in = auth.auth_ready(self.provider) if logged_in is None else logged_in
     self.login_thread: threading.Thread | None = None
 
   def compose(self) -> ComposeResult:
     """Build the live dashboard layout."""
     with Vertical(id="root"):
-      yield Vertical(Vertical(Button("LOGIN", id="login"), Static("", id="login-status"), id="login-box"), id="login-screen")
+      login_box = Vertical(
+        Static(f"{self.provider.label}\n{self.provider.detail}", id="login-provider"),
+        Button("LOGIN", id="login"),
+        Static("", id="login-status"),
+        id="login-box",
+      )
+      yield Vertical(login_box, id="login-screen")
       with Horizontal(id="body"):
         yield Vertical(
           Static("STATUS", classes="section-title"),
@@ -115,7 +125,7 @@ class PerferoxTUI(App[None]):
         )
         yield Vertical(
           Horizontal(
-            Select((("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal")), prompt="Provider", id="cloud-provider"),
+            Select(CLOUD_CHOICES, prompt="Provider", value=self.settings.cloud or Select.BLANK, id="cloud-provider"),
             Input(placeholder="API key (blank for Modal)", password=True, id="cloud-key"),
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
@@ -181,8 +191,8 @@ class PerferoxTUI(App[None]):
       if selected == "modal":
         if api_key:
           raise ValueError("Leave the API key blank for Modal; use `modal setup` or token environment variables")
-        api_key = modal_cloud_key()
-      provider = cloud_provider(api_key)
+        api_key = auth.modal_cloud_key()
+      provider = auth.cloud_provider(api_key)
     except ValueError as exc:
       self.query_one("#footer", Static).update(escape(str(exc)))
       return
@@ -204,7 +214,7 @@ class PerferoxTUI(App[None]):
     self.refresh_dashboard()
 
   def _sync_auth_gate(self) -> None:
-    """Hide the working UI until ChatGPT OAuth is available."""
+    """Hide the working UI until the configured model provider is authenticated."""
     self.query_one("#login-screen", Vertical).display = not self.logged_in
     self.query_one("#body", Horizontal).display = self.logged_in
     self.query_one("#footer", Static).display = self.logged_in
@@ -214,14 +224,14 @@ class PerferoxTUI(App[None]):
     if self.login_thread and self.login_thread.is_alive():
       return
     self.query_one("#login", Button).disabled = True
-    self.query_one("#login-status", Static).update("opening browser")
+    self.query_one("#login-status", Static).update("authenticating")
     self.login_thread = threading.Thread(target=self._login_worker, daemon=True)
     self.login_thread.start()
 
   def _login_worker(self) -> None:
-    """Complete OAuth and return the result to Textual's thread."""
+    """Complete the provider sign-in and return the result to Textual's thread."""
     try:
-      ensure_chatgpt_auth()
+      auth.ensure_auth(self.provider)
     except Exception as exc:
       self.call_from_thread(self._finish_login, False, f"{type(exc).__name__}: {exc}")
       return

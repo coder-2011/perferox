@@ -1,4 +1,12 @@
-"""ChatGPT OAuth auth and model construction for Perferox."""
+"""Model-provider auth and chat-model construction for Perferox.
+
+Two unrelated credentials meet here. The *model* credential selects and proves
+a chat backend (a ChatGPT or xAI account sign-in, an API key, or a local server
+that needs neither). The *cloud* credential rents the GPU a benchmark runs on.
+They are kept apart on purpose: workers receive only the cloud key for the
+provider they were launched with, and read the model credential from the
+Perferox profile.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +14,12 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+
+from perferox import providers
+from perferox.providers import KEY, LOCAL, OAUTH, Provider
+
+# Cloud GPU providers a benchmark worker can rent an instance from.
+CLOUD_PROVIDERS = ("runpod", "lambda", "modal")
 
 
 def cloud_provider(api_key: str) -> str:
@@ -62,6 +76,11 @@ def read_cloud_key(path: str | Path) -> str:
     key_path.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# ChatGPT account sign-in
+# ---------------------------------------------------------------------------
+
+
 def _chatgpt_provider():
   """Open the persisted provider and require a usable ChatGPT token."""
   from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
@@ -94,13 +113,98 @@ def ensure_chatgpt_auth(timeout_s: float = 300.0) -> bool:
   return True
 
 
-def build_chat_model(model: str | None = None):
-  """Build Perferox's OAuth-backed LangChain chat model."""
+# ---------------------------------------------------------------------------
+# Provider-agnostic model auth
+# ---------------------------------------------------------------------------
+
+
+def auth_ready(provider: Provider) -> bool:
+  """Report whether this provider could be used right now without any prompting."""
+  if provider.auth == LOCAL:
+    return True
+  if provider.auth == KEY:
+    if provider.account_env and not providers.account_id(provider):
+      return False
+    return bool(providers.api_key(provider))
+  if provider.name == "chatgpt":
+    return chatgpt_auth_ready()
+  from perferox import xai_oauth
+
+  return xai_oauth.auth_ready()
+
+
+def ensure_auth(provider: Provider, timeout_s: float = 300.0) -> bool:
+  """Bring a provider to a usable state, returning whether a sign-in happened."""
+  if auth_ready(provider):
+    return False
+  if provider.auth != OAUTH:
+    raise ValueError(missing_credential(provider))
+  if provider.name == "chatgpt":
+    return ensure_chatgpt_auth(timeout_s)
+  from perferox import xai_oauth
+
+  xai_oauth.login(timeout_s)
+  return True
+
+
+def missing_credential(provider: Provider) -> str:
+  """Explain, in one line, what this provider still needs."""
+  if provider.auth == OAUTH:
+    return f"{provider.label} is not signed in; run `perferox login {provider.name}`"
+  if provider.account_env and not providers.account_id(provider):
+    return f"{provider.label} needs an account id; set {provider.account_env} or run `perferox onboard`"
+  return f"{provider.label} needs an API key; set {provider.key_env} or run `perferox onboard`"
+
+
+# ---------------------------------------------------------------------------
+# Chat model construction
+# ---------------------------------------------------------------------------
+
+
+def _chatgpt_model(model: str):
+  """Build the ChatGPT-subscription chat model over the Codex Responses API."""
   from langchain_openai.chat_models.codex import _ChatOpenAICodex
-  provider = _chatgpt_provider()
-  model_name = model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
-  return _ChatOpenAICodex(
-    model=model_name,
-    originator="perferox",
-    token_provider=provider,
+
+  return _ChatOpenAICodex(model=model, originator="perferox", token_provider=_chatgpt_provider())
+
+
+def _grok_model(provider: Provider, model: str):
+  """Build a Grok chat model whose bearer token is refreshed per request."""
+  import httpx
+  from langchain_openai import ChatOpenAI
+
+  from perferox.xai_oauth import BearerAuth, XaiTokenProvider
+
+  tokens = XaiTokenProvider()
+  auth = BearerAuth(tokens)
+  return ChatOpenAI(
+    model=model,
+    base_url=provider.base_url,
+    api_key=tokens.get_token(),
+    http_client=httpx.Client(auth=auth, timeout=600.0),
+    http_async_client=httpx.AsyncClient(auth=auth, timeout=600.0),
   )
+
+
+def _compatible_model(provider: Provider, model: str):
+  """Build a chat model for any provider that speaks OpenAI chat completions."""
+  from langchain_openai import ChatOpenAI
+
+  key = providers.api_key(provider)
+  if provider.auth == KEY and not key:
+    raise ValueError(missing_credential(provider))
+  headers = {"HTTP-Referer": "https://github.com/coder-2011/perferox", "X-Title": "Perferox"} if provider.name == "openrouter" else None
+  # Local servers ignore the key but the client still requires a non-empty one.
+  return ChatOpenAI(model=model, base_url=providers.base_url(provider), api_key=key or "local", default_headers=headers)
+
+
+def build_chat_model(model: str | None = None, provider_name: str | None = None):
+  """Build the configured chat model, or an explicitly requested one."""
+  settings = providers.active_settings()
+  provider = providers.find(provider_name or settings.provider)
+  model_name = model or (settings.model if provider.name == settings.provider else provider.default_model)
+  if provider.name == "chatgpt":
+    return _chatgpt_model(model_name)
+  if provider.name == "grok":
+    return _grok_model(provider, model_name)
+  return _compatible_model(provider, model_name)

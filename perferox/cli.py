@@ -17,8 +17,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
-from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
+from perferox import auth, db, providers
 
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
@@ -37,9 +36,12 @@ def main(argv: list[str] | None = None) -> int:
   subparsers = parser.add_subparsers(dest="command")
   run_parser = subparsers.add_parser("run", help="start the main graph without opening the TUI")
   run_parser.add_argument("objective", nargs="+", help="objective for the main agent")
-  run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
+  run_parser.add_argument("--provider", choices=auth.CLOUD_PROVIDERS, help="cloud provider; select Modal explicitly because it has no single-key prefix")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
-  subparsers.add_parser("login", help="authenticate with ChatGPT OAuth")
+  subparsers.add_parser("onboard", help="pick and authenticate a model provider and a GPU cloud")
+  login_parser = subparsers.add_parser("login", help="authenticate a model provider")
+  login_parser.add_argument("provider", nargs="?", choices=providers.PROVIDER_NAMES, help="provider to authenticate (default: the configured one)")
+  subparsers.add_parser("providers", help="list every supported model provider and its state")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
   logs_parser.add_argument("-n", "--limit", type=int, default=30, help="maximum activity lines (default: 30)")
   subparsers.add_parser("doctor", help="check local requirements without cloud calls")
@@ -59,8 +61,12 @@ def main(argv: list[str] | None = None) -> int:
 
     PerferoxTUI(cwd=cwd, db_path=db_path, trace_dir=trace_dir).run()
     return 0
+  if args.command == "onboard":
+    return _onboard()
   if args.command == "login":
-    return _login()
+    return _login(args.provider)
+  if args.command == "providers":
+    return _providers()
   if args.command == "status":
     return _status(db_path)
   if args.command == "logs":
@@ -83,28 +89,68 @@ def main(argv: list[str] | None = None) -> int:
   return 0
 
 
-def _login() -> int:
-  """Report the result of the auth-owned ChatGPT login workflow."""
+def _onboard() -> int:
+  """Run the interactive setup and report whether a profile was saved."""
+  from perferox import onboarding
+
   try:
-    token_saved = ensure_chatgpt_auth()
+    settings = onboarding.run(CONSOLE)
+  except (KeyboardInterrupt, EOFError):
+    CONSOLE.print()
+    return _error("setup cancelled")
+  return 0 if settings else 1
+
+
+def _login(name: str | None) -> int:
+  """Authenticate one model provider, defaulting to the configured one."""
+  provider = providers.find(name or providers.active_settings().provider)
+  try:
+    signed_in = auth.ensure_auth(provider)
   except Exception as exc:  # noqa: BLE001
     return _error(f"login failed: {type(exc).__name__}: {exc}")
-  message = "token saved" if token_saved else "ChatGPT OAuth is ready"
+  message = "credentials saved" if signed_in else f"{provider.label} is ready"
   CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {message}", title="[bold]Login[/]", border_style="green"))
   return 0
 
 
+def _providers() -> int:
+  """List every supported model provider, marking the active one."""
+  active = providers.active_settings()
+  table = Table("Provider", "Auth", "State", "Detail", title="Model providers", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
+  for provider in providers.PROVIDERS:
+    ready = auth.auth_ready(provider)
+    marker = f"[bold {BRAND}]{provider.name}[/] ←" if provider.name == active.provider else provider.name
+    table.add_row(marker, provider.auth, Text("ready" if ready else "not configured", style="green" if ready else DIM), Text(provider.detail, style=DIM))
+  CONSOLE.print(table)
+  CONSOLE.print(Text(f"active  {active.provider}:{active.model}", style=DIM))
+  return 0
+
+
+def _ensure_profile() -> bool:
+  """Offer setup on a machine that has never been onboarded."""
+  if providers.load_settings() is not None:
+    return True
+  CONSOLE.print(Text("No Perferox profile yet.", style=DIM))
+  from perferox import onboarding
+
+  return onboarding.run(CONSOLE) is not None
+
+
 def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) -> int:
   """Validate credentials and launch the tmux-wrapped main agent."""
-  if not chatgpt_auth_ready():
-    return _error("ChatGPT OAuth is missing; run `perferox login` first")
+  if not _ensure_profile():
+    return _error("setup did not finish; run `perferox onboard`")
+  settings = providers.active_settings()
+  model_provider = providers.find(settings.provider)
+  if not auth.auth_ready(model_provider):
+    return _error(auth.missing_credential(model_provider))
   from perferox.process_host import main as run_agent
 
   objective = " ".join(args.objective)
-  selected = args.provider or Prompt.ask("Cloud provider", choices=("runpod", "lambda", "modal"), console=CONSOLE)
+  selected = args.provider or settings.cloud or Prompt.ask("Cloud provider", choices=auth.CLOUD_PROVIDERS, console=CONSOLE)
   if selected == "modal":
     try:
-      api_key = modal_cloud_key()
+      api_key = auth.modal_cloud_key()
     except ValueError as exc:
       return _error(str(exc))
   else:
@@ -113,7 +159,7 @@ def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) ->
     if not api_key:
       api_key = Prompt.ask(f"{selected.title()} API key", password=True, console=CONSOLE)
   try:
-    provider = cloud_provider(api_key)
+    provider = auth.cloud_provider(api_key)
   except ValueError as exc:
     return _error(str(exc))
   if provider != selected:
@@ -197,12 +243,16 @@ def _doctor(cwd: Path, db_path: Path) -> int:
   """Check local launch requirements without model or cloud API calls."""
   uv = shutil.which("uv")
   tmux = shutil.which("tmux")
-  authenticated = chatgpt_auth_ready()
+  settings = providers.active_settings()
+  model_provider = providers.find(settings.provider)
+  authenticated = auth.auth_ready(model_provider)
+  profile_saved = providers.load_settings() is not None
   checks = [
     ("workspace", "ok" if cwd.is_dir() else "fail", str(cwd)),
     ("uv", "ok" if uv else "fail", uv or "not found"),
     ("tmux", "ok" if tmux else "fail", tmux or "not found"),
-    ("ChatGPT OAuth", "ok" if authenticated else "fail", "authenticated" if authenticated else "run `perferox login`"),
+    ("profile", "ok" if profile_saved else "warn", str(providers.CONFIG_PATH) if profile_saved else "not set up; run `perferox onboard`"),
+    ("model", "ok" if authenticated else "fail", f"{settings.provider}:{settings.model}" if authenticated else auth.missing_credential(model_provider)),
   ]
   try:
     with closing(db.connect(db_path)) as conn:
@@ -217,13 +267,13 @@ def _doctor(cwd: Path, db_path: Path) -> int:
     if not api_key:
       continue
     try:
-      configured.append(expected if cloud_provider(api_key) == expected else f"invalid {env_name}")
+      configured.append(expected if auth.cloud_provider(api_key) == expected else f"invalid {env_name}")
     except ValueError:
       configured.append(f"invalid {env_name}")
   modal_config = Path("~/.modal.toml").expanduser()
   if os.environ.get("MODAL_TOKEN_ID") or os.environ.get("MODAL_TOKEN_SECRET"):
     try:
-      modal_cloud_key()
+      auth.modal_cloud_key()
       configured.append("modal")
     except ValueError:
       configured.append("invalid Modal tokens")
