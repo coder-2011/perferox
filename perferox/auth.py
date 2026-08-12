@@ -127,18 +127,11 @@ def active_model() -> ActiveModel | None:
 
 
 def _save_active_model(active: ActiveModel) -> None:
-  """Atomically save a validated model selection."""
+  """Save a validated model selection."""
   profile_path = _profile_path()
   profile_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-  temporary_path: Path | None = None
-  try:
-    with tempfile.NamedTemporaryFile("w", dir=profile_path.parent, encoding="utf-8", delete=False) as file:
-      json.dump({"model": active.model}, file, separators=(",", ":"))
-      temporary_path = Path(file.name)
-    temporary_path.replace(profile_path)
-  finally:
-    if temporary_path is not None:
-      temporary_path.unlink(missing_ok=True)
+  profile = json.dumps({"model": active.model})
+  profile_path.write_text(profile, encoding="utf-8")
 
 
 def login_model(provider_name: str, model: str | None = None) -> ActiveModel:
