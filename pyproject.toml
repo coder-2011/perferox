@@ -24,7 +24,7 @@ dependencies = [
   "modal>=1.4.0",
   "langchain",
   "langgraph",
-  "langchain-openai",
+  "langchain-litellm",
   "rich",
   "textual",
   "paramiko",

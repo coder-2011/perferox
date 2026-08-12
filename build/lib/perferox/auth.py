@@ -1,11 +1,78 @@
-"""ChatGPT OAuth auth and model construction for Perferox."""
+"""LLM OAuth profiles, model construction, and cloud credentials."""
 
 from __future__ import annotations
 
+import json
 import os
-import sys
 import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from langchain_litellm import ChatLiteLLM
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthProvider:
+  """Describe one CLI-supported LiteLLM OAuth provider."""
+
+  label: str
+  model_prefix: str
+  default_model: str
+  token_dir_env: str
+  default_token_dir: str
+  token_file_env: str
+  default_token_file: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveModel:
+  """Pair the selected model with its derived OAuth provider."""
+
+  provider: str
+  model: str
+
+
+OAUTH_PROVIDERS = {
+  "chatgpt": OAuthProvider(
+    label="ChatGPT subscription",
+    model_prefix="chatgpt/",
+    default_model="chatgpt/gpt-5.4",
+    token_dir_env="CHATGPT_TOKEN_DIR",
+    default_token_dir="~/.config/litellm/chatgpt",
+    token_file_env="CHATGPT_AUTH_FILE",
+    default_token_file="auth.json",
+  ),
+  "github-copilot": OAuthProvider(
+    label="GitHub Copilot",
+    model_prefix="github_copilot/",
+    default_model="github_copilot/gpt-4",
+    token_dir_env="GITHUB_COPILOT_TOKEN_DIR",
+    default_token_dir="~/.config/litellm/github_copilot",
+    token_file_env="GITHUB_COPILOT_ACCESS_TOKEN_FILE",
+    default_token_file="access-token",
+  ),
+}
+
+AUTH_PROBE_TOOL = {
+  "type": "function",
+  "function": {
+    "name": "perferox_auth_probe",
+    "description": "Confirm that the selected model can call Perferox tools.",
+    "parameters": {"type": "object", "properties": {}},
+  },
+}
+
+
+class AuthenticatedChatLiteLLM(ChatLiteLLM):
+  """Refuse model calls that would need an interactive OAuth refresh."""
+
+  def invoke(self, input: Any, config: Any = None, *, stop: list[str] | None = None, **kwargs: Any) -> Any:
+    """Recheck local auth before every synchronous LangGraph model call."""
+    if active_model() is None:
+      raise RuntimeError("LLM OAuth expired; run `perferox login` again")
+    return super().invoke(input, config, stop=stop, **kwargs)
 
 
 def cloud_provider(api_key: str) -> str:
@@ -62,45 +129,89 @@ def read_cloud_key(path: str | Path) -> str:
     key_path.unlink(missing_ok=True)
 
 
-def _chatgpt_provider():
-  """Open the persisted provider and require a usable ChatGPT token."""
-  from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
-
-  provider = _FileChatGPTOAuthTokenProvider.from_default_store()
-  provider.get_token()
-  return provider
+def _profile_path() -> Path:
+  """Return the XDG-style path for Perferox's non-secret LLM profile."""
+  config_root = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+  return config_root / "perferox" / "llm.json"
 
 
-def chatgpt_auth_ready() -> bool:
-  """Return whether a refreshable ChatGPT OAuth token is available."""
+def _token_path(provider: OAuthProvider) -> Path:
+  """Return the LiteLLM-owned credential path for one provider."""
+  token_dir = Path(os.environ.get(provider.token_dir_env, provider.default_token_dir)).expanduser()
+  token_file = os.environ.get(provider.token_file_env, provider.default_token_file)
+  return token_dir / token_file
+
+
+def active_model() -> ActiveModel | None:
+  """Load the selected model only when its local OAuth is usable."""
   try:
-    _chatgpt_provider()
-  except Exception:  # noqa: BLE001
+    data = json.loads(_profile_path().read_text(encoding="utf-8"))
+    model = data["model"]
+  except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+    return None
+  if not isinstance(model, str):
+    return None
+  for provider_name, provider in OAUTH_PROVIDERS.items():
+    if model.startswith(provider.model_prefix) and _credentials_ready(provider_name):
+      return ActiveModel(provider=provider_name, model=model)
+  return None
+
+
+def _credentials_ready(provider_name: str) -> bool:
+  """Check one provider's LiteLLM-owned token without starting OAuth."""
+  token_path = _token_path(OAUTH_PROVIDERS[provider_name])
+  try:
+    if provider_name == "chatgpt":
+      auth_data = json.loads(token_path.read_text(encoding="utf-8"))
+      expires_at = auth_data.get("expires_at")
+      credentials_present = bool(auth_data.get("access_token") and auth_data.get("refresh_token"))
+      return credentials_present and isinstance(expires_at, (int, float)) and expires_at > time.time() + 60
+    return bool(token_path.read_text(encoding="utf-8").strip())
+  except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
     return False
-  return True
 
 
-def ensure_chatgpt_auth(timeout_s: float = 300.0) -> bool:
-  """Ensure persisted ChatGPT OAuth, returning whether login was needed."""
-  if chatgpt_auth_ready():
-    return False
-  from langchain_openai.chatgpt_oauth import login_chatgpt, login_chatgpt_device
+def _save_active_model(active: ActiveModel) -> None:
+  """Atomically save a validated model selection."""
+  profile_path = _profile_path()
+  profile_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  temporary_path: Path | None = None
+  try:
+    with tempfile.NamedTemporaryFile("w", dir=profile_path.parent, encoding="utf-8", delete=False) as file:
+      json.dump({"model": active.model}, file, separators=(",", ":"))
+      temporary_path = Path(file.name)
+    temporary_path.replace(profile_path)
+  finally:
+    if temporary_path is not None:
+      temporary_path.unlink(missing_ok=True)
 
-  # SSH and non-interactive sessions cannot reliably receive a loopback callback.
-  headless = os.environ.get("SSH_CONNECTION") or not sys.stdout.isatty()
-  login = login_chatgpt_device if headless else login_chatgpt
-  provider = login(timeout=timeout_s)
-  provider.get_token()
-  return True
+
+def login_model(provider_name: str, model: str | None = None) -> ActiveModel:
+  """Run CLI-owned OAuth and save the model only after a real tool call."""
+  try:
+    provider = OAUTH_PROVIDERS[provider_name]
+  except KeyError as exc:
+    raise ValueError(f"unsupported OAuth provider: {provider_name}") from exc
+  model_name = model or provider.default_model
+  if not model_name.startswith(provider.model_prefix):
+    raise ValueError(f"{provider.label} models must start with {provider.model_prefix}")
+
+  chat_model = ChatLiteLLM(model=model_name, max_retries=0)
+  probe_model = chat_model.bind_tools([AUTH_PROBE_TOOL], tool_choice="required")
+  response = probe_model.invoke("Call perferox_auth_probe once with no arguments.")
+  if not any(call.get("name") == "perferox_auth_probe" for call in response.tool_calls):
+    raise RuntimeError(f"{model_name} authenticated but did not complete the tool-call probe")
+  if not _credentials_ready(provider_name):
+    raise RuntimeError(f"{provider.label} did not persist usable OAuth credentials")
+  active = ActiveModel(provider=provider_name, model=model_name)
+  _save_active_model(active)
+  return active
 
 
-def build_chat_model(model: str | None = None):
-  """Build Perferox's OAuth-backed LangChain chat model."""
-  from langchain_openai.chat_models.codex import _ChatOpenAICodex
-  provider = _chatgpt_provider()
-  model_name = model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
-  return _ChatOpenAICodex(
-    model=model_name,
-    originator="perferox",
-    token_provider=provider,
-  )
+def build_chat_model():
+  """Build the active OAuth-backed LangChain model without starting login."""
+  active = active_model()
+  if active is None:
+    raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
+
+  return AuthenticatedChatLiteLLM(model=active.model, max_retries=0)

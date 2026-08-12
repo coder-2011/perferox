@@ -22,7 +22,7 @@ The system should run bounded benchmark experiments, preserve useful traces, det
 - Agent/tool wrappers: LangChain.
 - Agent state and routing: LangGraph.
 - Local storage: SQLite.
-- OpenAI auth: `langchain-openai` ChatGPT OAuth through `login_chatgpt`.
+- LLM provider: `langchain-litellm` with CLI-owned OAuth selection.
 - Initial target: SGLang benchmarks using `--output-details --cache-report`.
 
 If Python packaging is needed, prefer `uv` unless the repo later chooses something else.
@@ -152,9 +152,10 @@ Idle -> Running -> Stopping -> Done
 
 ## Auth and Secrets
 
-- Use `login_chatgpt` for local ChatGPT OAuth when a token is missing.
-- Reuse the persisted token after login.
-- Use the device-flow fallback on SSH/headless machines.
+- `perferox login` is the only interactive LLM OAuth surface.
+- Support ChatGPT subscription and GitHub Copilot OAuth through LiteLLM.
+- LiteLLM owns persisted OAuth tokens; Perferox stores only the active model and derives its provider.
+- The TUI and agent processes must never initiate an interactive OAuth flow.
 - Never commit tokens, API keys, OAuth stores, `.env` files, benchmark credentials, or cloud credentials.
 
 ## Coding Rules
