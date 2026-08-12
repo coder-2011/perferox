@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from langchain_litellm import ChatLiteLLM
 
@@ -20,10 +18,6 @@ class OAuthProvider:
   label: str
   model_prefix: str
   default_model: str
-  token_dir_env: str
-  default_token_dir: str
-  token_file_env: str
-  default_token_file: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,19 +33,11 @@ OAUTH_PROVIDERS = {
     label="ChatGPT subscription",
     model_prefix="chatgpt/",
     default_model="chatgpt/gpt-5.4",
-    token_dir_env="CHATGPT_TOKEN_DIR",
-    default_token_dir="~/.config/litellm/chatgpt",
-    token_file_env="CHATGPT_AUTH_FILE",
-    default_token_file="auth.json",
   ),
   "github-copilot": OAuthProvider(
     label="GitHub Copilot",
     model_prefix="github_copilot/",
     default_model="github_copilot/gpt-4",
-    token_dir_env="GITHUB_COPILOT_TOKEN_DIR",
-    default_token_dir="~/.config/litellm/github_copilot",
-    token_file_env="GITHUB_COPILOT_ACCESS_TOKEN_FILE",
-    default_token_file="access-token",
   ),
 }
 
@@ -63,16 +49,6 @@ AUTH_PROBE_TOOL = {
     "parameters": {"type": "object", "properties": {}},
   },
 }
-
-
-class AuthenticatedChatLiteLLM(ChatLiteLLM):
-  """Refuse model calls that would need an interactive OAuth refresh."""
-
-  def invoke(self, input: Any, config: Any = None, *, stop: list[str] | None = None, **kwargs: Any) -> Any:
-    """Recheck local auth before every synchronous LangGraph model call."""
-    if active_model() is None:
-      raise RuntimeError("LLM OAuth expired; run `perferox login` again")
-    return super().invoke(input, config, stop=stop, **kwargs)
 
 
 def cloud_provider(api_key: str) -> str:
@@ -135,15 +111,8 @@ def _profile_path() -> Path:
   return config_root / "perferox" / "llm.json"
 
 
-def _token_path(provider: OAuthProvider) -> Path:
-  """Return the LiteLLM-owned credential path for one provider."""
-  token_dir = Path(os.environ.get(provider.token_dir_env, provider.default_token_dir)).expanduser()
-  token_file = os.environ.get(provider.token_file_env, provider.default_token_file)
-  return token_dir / token_file
-
-
 def active_model() -> ActiveModel | None:
-  """Load the selected model only when its local OAuth is usable."""
+  """Load the model selected by a completed CLI login."""
   try:
     data = json.loads(_profile_path().read_text(encoding="utf-8"))
     model = data["model"]
@@ -152,23 +121,9 @@ def active_model() -> ActiveModel | None:
   if not isinstance(model, str):
     return None
   for provider_name, provider in OAUTH_PROVIDERS.items():
-    if model.startswith(provider.model_prefix) and _credentials_ready(provider_name):
+    if model.startswith(provider.model_prefix):
       return ActiveModel(provider=provider_name, model=model)
   return None
-
-
-def _credentials_ready(provider_name: str) -> bool:
-  """Check one provider's LiteLLM-owned token without starting OAuth."""
-  token_path = _token_path(OAUTH_PROVIDERS[provider_name])
-  try:
-    if provider_name == "chatgpt":
-      auth_data = json.loads(token_path.read_text(encoding="utf-8"))
-      expires_at = auth_data.get("expires_at")
-      credentials_present = bool(auth_data.get("access_token") and auth_data.get("refresh_token"))
-      return credentials_present and isinstance(expires_at, (int, float)) and expires_at > time.time() + 60
-    return bool(token_path.read_text(encoding="utf-8").strip())
-  except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
-    return False
 
 
 def _save_active_model(active: ActiveModel) -> None:
@@ -201,8 +156,6 @@ def login_model(provider_name: str, model: str | None = None) -> ActiveModel:
   response = probe_model.invoke("Call perferox_auth_probe once with no arguments.")
   if not any(call.get("name") == "perferox_auth_probe" for call in response.tool_calls):
     raise RuntimeError(f"{model_name} authenticated but did not complete the tool-call probe")
-  if not _credentials_ready(provider_name):
-    raise RuntimeError(f"{provider.label} did not persist usable OAuth credentials")
   active = ActiveModel(provider=provider_name, model=model_name)
   _save_active_model(active)
   return active
@@ -214,4 +167,4 @@ def build_chat_model():
   if active is None:
     raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
 
-  return AuthenticatedChatLiteLLM(model=active.model, max_retries=0)
+  return ChatLiteLLM(model=active.model, max_retries=0)

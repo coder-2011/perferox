@@ -38,7 +38,7 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 
 The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one credential handoff to detached tmux processes through a one-use file, and workers expose only the selected provider's credentials.
 
-LLM login is separate from cloud auth. `perferox login` validates a LiteLLM-backed model with a real tool call, then atomically stores only that model under the user's config directory. The model prefix selects the provider; LiteLLM owns its OAuth tokens. The CLI blocks the TUI, direct runs, and tmux launch when the model or its credentials are missing; no interactive OAuth code runs from the TUI or agent processes.
+LLM login is separate from cloud auth. `perferox login` validates a LiteLLM-backed model with a real tool call, then atomically stores only that model under the user's config directory. The model prefix selects the provider. LiteLLM owns the complete OAuth lifecycle, and Perferox never reads provider token files. The CLI blocks the TUI, direct runs, and tmux launch until login has selected a model.
 
 The main process uses two roots:
 

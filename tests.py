@@ -22,7 +22,7 @@ from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from perferox import db
-from perferox.auth import active_model, build_chat_model, cloud_environment, login_model, modal_cloud_key
+from perferox.auth import active_model, cloud_environment, login_model, modal_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
@@ -66,19 +66,10 @@ class OAuthProfileTests(unittest.TestCase):
   """Protect the CLI-validated active model and local launch gate."""
 
   def setUp(self) -> None:
-    """Isolate Perferox and LiteLLM profile files in one temp directory."""
+    """Isolate Perferox's selected-model profile."""
     self.tempdir = tempfile.TemporaryDirectory()
     root = Path(self.tempdir.name)
-    self.chatgpt_dir = root / "chatgpt"
-    self.copilot_dir = root / "copilot"
-    self.environment = patch.dict(
-      os.environ,
-      {
-        "XDG_CONFIG_HOME": str(root),
-        "CHATGPT_TOKEN_DIR": str(self.chatgpt_dir),
-        "GITHUB_COPILOT_TOKEN_DIR": str(self.copilot_dir),
-      },
-    )
+    self.environment = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(root)})
     self.environment.start()
 
   def tearDown(self) -> None:
@@ -88,8 +79,6 @@ class OAuthProfileTests(unittest.TestCase):
 
   def test_login_replaces_profile_only_after_tool_probe(self) -> None:
     """Preserve the working selection when a replacement model fails validation."""
-    self.chatgpt_dir.mkdir()
-    (self.chatgpt_dir / "auth.json").write_text('{"access_token":"access","refresh_token":"refresh","expires_at":4102444800}', encoding="utf-8")
     probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
     chat_model = ToolBindingFakeModel(responses=[probe])
     with patch("perferox.auth.ChatLiteLLM", return_value=chat_model):
@@ -105,27 +94,15 @@ class OAuthProfileTests(unittest.TestCase):
       login_model("github-copilot")
     self.assertEqual(active_model(), logged_in)
 
-  def test_auth_gate_rejects_bad_profile_or_credentials(self) -> None:
-    """Require a known model route and structurally usable local OAuth files."""
+  def test_auth_gate_rejects_an_unknown_model_route(self) -> None:
+    """Reject a profile that cannot select a supported LiteLLM provider."""
     profile_path = Path(os.environ["XDG_CONFIG_HOME"]) / "perferox" / "llm.json"
     profile_path.parent.mkdir()
     profile_path.write_text('{"model":"unknown/gpt"}', encoding="utf-8")
     self.assertIsNone(active_model())
 
     profile_path.write_text('{"model":"chatgpt/gpt-5.4"}', encoding="utf-8")
-    self.chatgpt_dir.mkdir()
-    (self.chatgpt_dir / "auth.json").write_text('{"access_token":"access","refresh_token":"refresh","expires_at":1}', encoding="utf-8")
-    self.assertIsNone(active_model())
-    (self.chatgpt_dir / "auth.json").write_text('{"access_token":"access","refresh_token":"refresh","expires_at":4102444800}', encoding="utf-8")
     self.assertEqual(active_model().provider, "chatgpt")
-
-    profile_path.write_text('{"model":"github_copilot/gpt-4"}', encoding="utf-8")
-    self.copilot_dir.mkdir()
-    (self.copilot_dir / "access-token").write_text("github-access", encoding="utf-8")
-    self.assertEqual(active_model().provider, "github-copilot")
-    model = build_chat_model()
-    with patch("perferox.auth.active_model", return_value=None), self.assertRaisesRegex(RuntimeError, "run `perferox login` again"):
-      model.invoke("must not reach LiteLLM")
 
 
 class DatabaseTestCase(unittest.TestCase):
