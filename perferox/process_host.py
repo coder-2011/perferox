@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage
 from rich.console import Console
 from rich.text import Text
 
-from perferox import DEFAULT_MAX_AGENTS, db
+from perferox import db
 from perferox.auth import build_chat_model, cloud_environment, cloud_provider, read_cloud_key, write_cloud_key
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT, MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
@@ -49,15 +49,13 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     subparser.add_argument("--trace-dir", default="traces")
     subparser.add_argument("--objective", required=True)
     subparser.add_argument("--cwd", default=".")
-    subparser.add_argument("--max-agents", type=int, default=DEFAULT_MAX_AGENTS)
+    subparser.add_argument("--max-agents", type=int, default=3)
   subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
   for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "attempt-cap", "cloud-key-file"):
     subagent.add_argument(f"--{name}", required=True)
   args = parser.parse_args(argv)
-  if args.command in ("launch-main", "main") and args.max_agents < 1:
-    parser.error("--max-agents must be at least 1")
 
   if args.command in ("launch-main", "main"):
     cwd = Path(args.cwd).resolve()

@@ -24,7 +24,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
-from perferox import DEFAULT_MAX_AGENTS, db
+from perferox import db
 from perferox.auth import write_cloud_key
 from perferox.status import refresh_sessions
 from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
@@ -75,12 +75,10 @@ def build_main_agent_graph(
   cwd: str | Path = ".",
   runtime_cwd: str | Path | None = None,
   trace_dir: str | Path = "traces",
-  max_agents: int = DEFAULT_MAX_AGENTS,
+  max_agents: int = 3,
   extra_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
   """Compile the main coordinator graph with ExplorerState hydration."""
-  if max_agents < 1:
-    raise ValueError("max_agents must be at least 1")
   root = Path(cwd).resolve()
   # Keep Perferox process launches separate from the SGLang source workspace.
   runtime_root = Path(runtime_cwd).resolve() if runtime_cwd is not None else root
