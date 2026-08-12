@@ -19,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
-from perferox import db
+from perferox import DEFAULT_MAX_AGENTS, db
 from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
 from perferox.status import DashboardSnapshot, read_dashboard
 
@@ -39,6 +39,7 @@ def launch_main(
   trace_dir: str | Path,
   objective: str,
   cloud_api_key: str,
+  max_agents: int = DEFAULT_MAX_AGENTS,
 ) -> subprocess.CompletedProcess[str]:
   """Start the tmux-wrapped main graph through the existing runner CLI."""
   command = [
@@ -56,6 +57,8 @@ def launch_main(
     objective,
     "--cwd",
     str(Path(cwd).resolve()),
+    "--max-agents",
+    str(max_agents),
   ]
   return subprocess.run(command, cwd=Path(cwd), input=cloud_api_key, text=True, capture_output=True, check=False)
 
@@ -77,6 +80,7 @@ class PerferoxTUI(App[None]):
   #objective-row { height: 5; padding: 1; background: #282828; border-bottom: solid #504945; }
   #cloud-provider { width: 16; margin-right: 1; }
   #cloud-key { width: 24; margin-right: 1; }
+  #max-agents { width: 16; margin-right: 1; }
   #objective { width: 1fr; height: 3; margin-right: 1; background: #1d2021; color: #ebdbb2; border: solid #504945; }
   Button { height: 3; min-width: 10; margin-right: 1; background: #32302f; color: #fabd2f; border: solid #b57614; text-style: bold; }
   Button#end { color: #fb4934; border: solid #fb4934; }
@@ -117,6 +121,7 @@ class PerferoxTUI(App[None]):
           Horizontal(
             Select((("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal")), prompt="Provider", id="cloud-provider"),
             Input(placeholder="API key (blank for Modal)", password=True, id="cloud-key"),
+            Input(placeholder=f"Max agents ({DEFAULT_MAX_AGENTS})", id="max-agents"),
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
             Button("END", id="end"),
@@ -175,6 +180,15 @@ class PerferoxTUI(App[None]):
     """Launch the tmux-backed main graph for the entered objective."""
     if not self.logged_in:
       return
+    max_agents_text = self.query_one("#max-agents", Input).value.strip()
+    try:
+      max_agents = int(max_agents_text or DEFAULT_MAX_AGENTS)
+    except ValueError:
+      self.query_one("#footer", Static).update("max agents must be a positive integer")
+      return
+    if max_agents < 1:
+      self.query_one("#footer", Static).update("max agents must be a positive integer")
+      return
     api_key = self.query_one("#cloud-key", Input).value.strip()
     selected = self.query_one("#cloud-provider", Select).value
     try:
@@ -191,7 +205,7 @@ class PerferoxTUI(App[None]):
       self.query_one("#footer", Static).update("enter an objective before starting")
       return
     correction = f"using {provider} based on key; " if selected is not Select.BLANK and selected != provider else ""
-    result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key)
+    result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key, max_agents)
     self.query_one("#cloud-key", Input).value = ""
     output = (result.stdout or result.stderr).strip()
     self.query_one("#footer", Static).update(correction + (output or f"launch exited {result.returncode}"))

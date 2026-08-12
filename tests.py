@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from perferox import db
 from perferox.auth import cloud_environment, modal_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
+from perferox.cli import main as cli_main
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
 from perferox.status import read_dashboard, read_trace_tail, refresh_sessions
@@ -37,7 +38,7 @@ from perferox.tools import (
   provider_cli,
   sglang_bench_serving,
 )
-from perferox.tui import request_end
+from perferox.tui import launch_main, request_end
 
 
 @dataclass(slots=True)
@@ -445,6 +446,34 @@ class ToolAndExperimentTests(DatabaseTestCase):
 
 class TUIWiringTests(DatabaseTestCase):
   """Protect the TUI bridge without model, browser, SSH, or cloud work."""
+
+  def test_cli_and_tui_forward_custom_agent_caps(self) -> None:
+    """Carry a non-default cap from both user surfaces into the host runner."""
+    with (
+      patch.dict(os.environ, {"RUNPOD_API_KEY": "rpa_test"}, clear=True),
+      patch("perferox.cli.chatgpt_auth_ready", return_value=True),
+      patch("perferox.process_host.main", return_value=0) as run_agent,
+    ):
+      exit_code = cli_main(["run", "--provider", "runpod", "--max-agents", "7", "probe SGLang"])
+    cli_command = run_agent.call_args.args[0]
+
+    completed = subprocess.CompletedProcess([], 0, stdout="started", stderr="")
+    with patch("perferox.tui.subprocess.run", return_value=completed) as run:
+      result = launch_main(self.tempdir.name, self.db_path, Path(self.tempdir.name) / "traces", "probe SGLang", "rpa_test", 5)
+    tui_command = run.call_args.args[0]
+
+    self.assertEqual(exit_code, 0)
+    self.assertEqual(cli_command[cli_command.index("--max-agents") + 1], "7")
+    self.assertEqual(result.returncode, 0)
+    self.assertEqual(tui_command[tui_command.index("--max-agents") + 1], "5")
+
+  def test_cli_rejects_nonpositive_agent_cap_before_auth(self) -> None:
+    """Reject an unusable cap before credentials or processes are touched."""
+    with patch("perferox.cli.chatgpt_auth_ready") as auth_ready:
+      exit_code = cli_main(["run", "--provider", "runpod", "--max-agents", "0", "probe SGLang"])
+
+    self.assertEqual(exit_code, 1)
+    auth_ready.assert_not_called()
 
   def test_dashboard_trace_tail_and_soft_stop_flow(self) -> None:
     """Read live state, preserve notifications, then request soft stop."""
