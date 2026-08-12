@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
   run_parser = subparsers.add_parser("run", help="start the main graph without opening the TUI")
   run_parser.add_argument("objective", nargs="+", help="objective for the main agent")
   run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
+  run_parser.add_argument("--max-agents", type=int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
   subparsers.add_parser("login", help="authenticate with ChatGPT OAuth")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
@@ -96,6 +97,7 @@ def _login() -> int:
 
 def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) -> int:
   """Validate credentials and launch the tmux-wrapped main agent."""
+  assert args.max_agents >= 1
   if not chatgpt_auth_ready():
     return _error("ChatGPT OAuth is missing; run `perferox login` first")
   from perferox.process_host import main as run_agent
@@ -121,7 +123,7 @@ def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) ->
   return run_agent(
     [
       "launch-main", "--db-path", str(db_path), "--trace-dir", str(trace_dir),
-      "--objective", objective, "--cwd", str(cwd),
+      "--objective", objective, "--cwd", str(cwd), "--max-agents", str(args.max_agents),
     ],
     cloud_api_key=api_key,
   )

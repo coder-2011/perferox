@@ -74,7 +74,7 @@ Its tools are:
 - `delegate_benchmark_subagent`
 - native server-side web search
 
-Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. At most three subagents may be active.
+Delegation takes exactly four model-supplied values: `repository`, `commit`, `goal`, and `attempt_cap`. The host validates them, transactionally reserves the next `agent_id` and active slot in SQLite, creates trace/goal files, and starts `perferox-agent-<id>` in tmux. The CLI or TUI sets the per-run active subagent cap, which defaults to three.
 
 ## Benchmark worker
 

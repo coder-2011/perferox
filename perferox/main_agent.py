@@ -29,7 +29,6 @@ from perferox.auth import write_cloud_key
 from perferox.status import refresh_sessions
 from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
 
-MAX_ACTIVE_SUBAGENTS = 3
 MAX_EXPLORER_LINE_CHARS = 120
 MAX_FILE_LINES = 240
 SQL_ROW_LIMIT = 100
@@ -76,6 +75,7 @@ def build_main_agent_graph(
   cwd: str | Path = ".",
   runtime_cwd: str | Path | None = None,
   trace_dir: str | Path = "traces",
+  max_agents: int = 3,
   extra_tools: Sequence[BaseTool] = (),
 ) -> CompiledStateGraph:
   """Compile the main coordinator graph with ExplorerState hydration."""
@@ -211,7 +211,7 @@ def build_main_agent_graph(
     with closing(db.connect(database)) as conn:
       refresh_sessions(conn)
       try:
-        agent_id = db.reserve_subagent(conn, active_cap=MAX_ACTIVE_SUBAGENTS, minimum_id=trace_next)
+        agent_id = db.reserve_subagent(conn, active_cap=max_agents, minimum_id=trace_next)
       except ValueError as exc:
         return str(exc)
     trace_path = traces / f"agent-{agent_id}.jsonl"
@@ -280,7 +280,7 @@ def build_main_agent_graph(
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
-    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
+    system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\nMax active subagents: {max_agents}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "") or "(none)"), *state.get("messages", [])]
     return {"messages": [bound_model.invoke(messages)]}
 

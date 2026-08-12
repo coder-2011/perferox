@@ -49,6 +49,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     subparser.add_argument("--trace-dir", default="traces")
     subparser.add_argument("--objective", required=True)
     subparser.add_argument("--cwd", default=".")
+    subparser.add_argument("--max-agents", type=int, default=3)
   subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
@@ -82,6 +83,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       sys.executable, "-m", "perferox.process_host", "main",
       "--db-path", str(db_path), "--trace-dir", str(trace_dir),
       "--objective", args.objective, "--cwd", str(cwd),
+      "--max-agents", str(args.max_agents),
       "--cloud-key-file", str(key_path),
     ])
     try:
@@ -124,7 +126,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       graph = build_main_agent_graph(
         build_chat_model(), db_path,
         cloud_provider=provider, cloud_api_key=api_key,
-        cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir,
+        cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir, max_agents=args.max_agents,
       )
       state = {"objective": args.objective, "messages": []}
       while True:
