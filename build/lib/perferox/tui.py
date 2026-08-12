@@ -77,6 +77,7 @@ class PerferoxTUI(App[None]):
   #right { width: 34; border-left: solid #504945; }
   .section-title { height: 2; padding: 0 1; color: #fabd2f; text-style: bold; border-bottom: solid #32302f; }
   .scroll-pane { height: 1fr; padding: 1; scrollbar-color: #504945; scrollbar-background: #1d2021; scrollbar-corner-color: #1d2021; }
+  #provider-row { height: 3; padding: 0 1; background: #282828; }
   #objective-row { height: 5; padding: 1; background: #282828; border-bottom: solid #504945; }
   #cloud-provider { width: 16; margin-right: 1; }
   #cloud-key { width: 24; margin-right: 1; }
@@ -122,6 +123,9 @@ class PerferoxTUI(App[None]):
             Select((("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal")), prompt="Provider", id="cloud-provider"),
             Input(placeholder="API key (blank for Modal)", password=True, id="cloud-key"),
             Input(placeholder="Max agents (3)", restrict=r"(?:[1-9]\d*)?", id="max-agents"),
+            id="provider-row",
+          ),
+          Horizontal(
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
             Button("END", id="end"),
