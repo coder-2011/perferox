@@ -121,7 +121,7 @@ class PerferoxTUI(App[None]):
           Horizontal(
             Select((("RunPod", "runpod"), ("Lambda", "lambda"), ("Modal", "modal")), prompt="Provider", id="cloud-provider"),
             Input(placeholder="API key (blank for Modal)", password=True, id="cloud-key"),
-            Input(placeholder="Max agents (3)", id="max-agents"),
+            Input(placeholder="Max agents (3)", restrict=r"(?:[1-9]\d*)?", id="max-agents"),
             Input(placeholder="Objective", id="objective"),
             Button("START", id="start"),
             Button("END", id="end"),
