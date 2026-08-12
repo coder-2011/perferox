@@ -22,7 +22,7 @@ from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from perferox import db
-from perferox.auth import active_model, cloud_environment, login_model, modal_cloud_key
+from perferox.auth import active_model, cloud_environment, login_provider, modal_cloud_key
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
@@ -63,46 +63,27 @@ class ToolBindingFakeModel(FakeMessagesListChatModel):
 
 
 class OAuthProfileTests(unittest.TestCase):
-  """Protect the CLI-validated active model and local launch gate."""
-
-  def setUp(self) -> None:
-    """Isolate Perferox's selected-model profile."""
-    self.tempdir = tempfile.TemporaryDirectory()
-    root = Path(self.tempdir.name)
-    self.environment = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(root)})
-    self.environment.start()
-
-  def tearDown(self) -> None:
-    """Restore the environment and delete isolated profile files."""
-    self.environment.stop()
-    self.tempdir.cleanup()
+  """Protect the CLI-validated model selection."""
 
   def test_login_replaces_profile_only_after_tool_probe(self) -> None:
-    """Preserve the working selection when a replacement model fails validation."""
-    probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
-    chat_model = ToolBindingFakeModel(responses=[probe])
-    with patch("perferox.auth.ChatLiteLLM", return_value=chat_model):
-      logged_in = login_model("chatgpt")
+    """Reject unsupported profiles and preserve a selection when a new probe fails."""
+    with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
+      profile_path = Path(root) / "perferox" / "provider"
+      profile_path.parent.mkdir()
+      profile_path.write_text("unknown", encoding="utf-8")
+      self.assertIsNone(active_model())
 
-    self.assertEqual(logged_in.model, "chatgpt/gpt-5.4")
-    self.assertEqual(active_model(), logged_in)
-    profile_path = Path(os.environ["XDG_CONFIG_HOME"]) / "perferox" / "llm.json"
-    self.assertEqual(json.loads(profile_path.read_text(encoding="utf-8")), {"model": logged_in.model})
+      probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
+      chat_model = ToolBindingFakeModel(responses=[probe])
+      with patch("perferox.auth.ChatLiteLLM", return_value=chat_model):
+        logged_in = login_provider("chatgpt")
+      self.assertEqual(active_model(), logged_in)
+      self.assertEqual(profile_path.read_text(encoding="utf-8"), "chatgpt")
 
-    failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
-    with patch("perferox.auth.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
-      login_model("github-copilot")
-    self.assertEqual(active_model(), logged_in)
-
-  def test_auth_gate_rejects_an_unknown_model_route(self) -> None:
-    """Reject a profile that cannot select a supported LiteLLM provider."""
-    profile_path = Path(os.environ["XDG_CONFIG_HOME"]) / "perferox" / "llm.json"
-    profile_path.parent.mkdir()
-    profile_path.write_text('{"model":"unknown/gpt"}', encoding="utf-8")
-    self.assertIsNone(active_model())
-
-    profile_path.write_text('{"model":"chatgpt/gpt-5.4"}', encoding="utf-8")
-    self.assertEqual(active_model().provider, "chatgpt")
+      failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
+      with patch("perferox.auth.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
+        login_provider("github-copilot")
+      self.assertEqual(active_model(), logged_in)
 
 
 class DatabaseTestCase(unittest.TestCase):

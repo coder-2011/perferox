@@ -31,14 +31,14 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 `perferox` exposes five user paths:
 
 - no command opens the Textual dashboard after local LLM auth passes
-- `perferox login [chatgpt|github-copilot]` runs CLI-only OAuth and selects the active model
+- `perferox login [chatgpt|github-copilot]` runs CLI-only OAuth and selects the provider
 - `perferox run <objective>` launches the main agent
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
 The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one credential handoff to detached tmux processes through a one-use file, and workers expose only the selected provider's credentials.
 
-LLM login is separate from cloud auth. `perferox login` validates a LiteLLM-backed model with a real tool call, then atomically stores only that model under the user's config directory. The model prefix selects the provider. LiteLLM owns the complete OAuth lifecycle, and Perferox never reads provider token files. The CLI blocks the TUI, direct runs, and tmux launch until login has selected a model.
+LLM login is separate from cloud auth. `perferox login` makes a real LiteLLM tool call, then stores only the selected provider. LiteLLM owns OAuth tokens. The CLI blocks the TUI, direct runs, and tmux launch until login has selected a provider.
 
 The main process uses two roots:
 
@@ -190,6 +190,6 @@ The host does not rely on a model voluntarily honoring the stop request, but we 
 | `bench.py` | typed SGLang serving arguments, command generation, and metric parsing |
 | `db.py` / `init-db.sql` | transactions, IDs, caps, persistence, embeddings, and notifications |
 | `remote.py` | Paramiko SSH and Modal Sandbox execution sessions plus their in-process registry |
-| `auth.py` | active LiteLLM model profile, OAuth readiness, cloud credential validation, and one-use handoff |
+| `auth.py` | LiteLLM model selection, cloud credential validation, and one-use handoff |
 | `prompts.py` | provider-specific instance creation and worker constraints |
 | `packages/lambda-labs/lambda_labs.py` | small Lambda Cloud CLI used by workers |

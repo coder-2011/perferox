@@ -152,9 +152,8 @@ Idle -> Running -> Stopping -> Done
 
 ## Auth and Secrets
 
-- `perferox login` is the only interactive LLM OAuth surface.
-- Support ChatGPT subscription and GitHub Copilot OAuth through LiteLLM.
-- LiteLLM owns the complete OAuth lifecycle; Perferox stores only the active model and never reads provider token files.
+- `perferox login` is the only interactive LLM OAuth surface and supports ChatGPT subscription and GitHub Copilot through LiteLLM.
+- LiteLLM owns the complete OAuth lifecycle; Perferox stores only the selected provider and never reads provider token files.
 - The TUI opens only after `perferox login` completes successfully.
 - Never commit tokens, API keys, OAuth stores, `.env` files, benchmark credentials, or cloud credentials.
 

@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import OAUTH_PROVIDERS, active_model, cloud_provider, login_model, modal_cloud_key
+from perferox.auth import OAUTH_MODELS, active_model, cloud_provider, login_provider, modal_cloud_key
 
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
@@ -41,8 +41,7 @@ def main(argv: list[str] | None = None) -> int:
   run_parser.add_argument("--max-agents", type=int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
   login_parser = subparsers.add_parser("login", help="authenticate an LLM provider through OAuth")
-  login_parser.add_argument("provider", nargs="?", choices=tuple(OAUTH_PROVIDERS), help="OAuth provider; prompts when omitted")
-  login_parser.add_argument("--model", help="provider-prefixed model; uses the provider default when omitted")
+  login_parser.add_argument("provider", nargs="?", choices=tuple(OAUTH_MODELS), help="OAuth provider; prompts when omitted")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
   logs_parser.add_argument("-n", "--limit", type=int, default=30, help="maximum activity lines (default: 30)")
   subparsers.add_parser("doctor", help="check local requirements without cloud calls")
@@ -57,9 +56,9 @@ def main(argv: list[str] | None = None) -> int:
   db_path = (cwd / args.db_path).resolve()
   trace_dir = (cwd / args.trace_dir).resolve()
 
+  if args.command in (None, "run") and active_model() is None:
+    return _error("LLM OAuth is missing; run `perferox login` first")
   if args.command is None:
-    if active_model() is None:
-      return _error("LLM OAuth is missing; run `perferox login` first")
     from perferox.tui import PerferoxTUI
 
     PerferoxTUI(cwd=cwd, db_path=db_path, trace_dir=trace_dir).run()
@@ -90,21 +89,18 @@ def main(argv: list[str] | None = None) -> int:
 
 def _login(args: argparse.Namespace) -> int:
   """Choose an OAuth provider and validate it through the production model path."""
-  provider = args.provider or Prompt.ask("LLM provider", choices=tuple(OAUTH_PROVIDERS), console=CONSOLE)
+  provider = args.provider or Prompt.ask("LLM provider", choices=tuple(OAUTH_MODELS), console=CONSOLE)
   try:
-    active = login_model(provider, args.model)
+    model = login_provider(provider)
   except Exception as exc:  # noqa: BLE001
     return _error(f"login failed: {type(exc).__name__}: {exc}")
-  label = OAUTH_PROVIDERS[active.provider].label
-  CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {label} · {active.model}", title="[bold]Login[/]", border_style="green"))
+  CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {provider} · {model}", title="[bold]Login[/]", border_style="green"))
   return 0
 
 
 def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) -> int:
   """Validate credentials and launch the tmux-wrapped main agent."""
   assert args.max_agents >= 1
-  if active_model() is None:
-    return _error("LLM OAuth is missing; run `perferox login` first")
   from perferox.process_host import main as run_agent
 
   objective = " ".join(args.objective)
@@ -204,14 +200,12 @@ def _doctor(cwd: Path, db_path: Path) -> int:
   """Check local launch requirements without model or cloud API calls."""
   uv = shutil.which("uv")
   tmux = shutil.which("tmux")
-  active = active_model()
-  authenticated = active is not None
-  auth_detail = f"{OAUTH_PROVIDERS[active.provider].label} · {active.model}" if active else "run `perferox login`"
+  model = active_model()
   checks = [
     ("workspace", "ok" if cwd.is_dir() else "fail", str(cwd)),
     ("uv", "ok" if uv else "fail", uv or "not found"),
     ("tmux", "ok" if tmux else "fail", tmux or "not found"),
-    ("LLM OAuth", "ok" if authenticated else "fail", auth_detail),
+    ("LLM OAuth", "ok" if model else "fail", model or "run `perferox login`"),
   ]
   try:
     with closing(db.connect(db_path)) as conn:
