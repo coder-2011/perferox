@@ -6,8 +6,6 @@ import os
 import tempfile
 from pathlib import Path
 
-from langchain_litellm import ChatLiteLLM
-
 OAUTH_MODELS = {
   "chatgpt": "chatgpt/gpt-5.4",
   "github-copilot": "github_copilot/gpt-4",
@@ -92,6 +90,8 @@ def login_provider(provider: str) -> str:
   model = OAUTH_MODELS.get(provider)
   if model is None:
     raise ValueError(f"unsupported OAuth provider: {provider}")
+  from langchain_litellm import ChatLiteLLM
+
   chat_model = ChatLiteLLM(model=model, max_retries=0)
   probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
   response = probe_model.invoke(f"Call {perferox_auth_probe.__name__} once with no arguments.")
@@ -99,7 +99,6 @@ def login_provider(provider: str) -> str:
     raise RuntimeError(f"{model} authenticated but did not complete the tool-call probe")
   provider_path = _provider_path()
   provider_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-  # Same-directory replacement keeps the active profile intact after write failures.
   temporary_path = provider_path.with_suffix(".tmp")
   temporary_path.write_text(provider, encoding="utf-8")
   temporary_path.replace(provider_path)
@@ -111,5 +110,6 @@ def build_chat_model():
   model = active_model()
   if model is None:
     raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
+  from langchain_litellm import ChatLiteLLM
 
   return ChatLiteLLM(model=model, max_retries=1)

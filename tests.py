@@ -75,18 +75,18 @@ class OAuthProfileTests(unittest.TestCase):
 
       probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
       chat_model = ToolBindingFakeModel(responses=[probe])
-      with patch("perferox.auth.ChatLiteLLM", return_value=chat_model):
+      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model):
         logged_in = login_provider("chatgpt")
       self.assertEqual(active_model(), logged_in)
       self.assertEqual(profile_path.read_text(encoding="utf-8"), "chatgpt")
 
       failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
-      with patch("perferox.auth.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
+      with patch("langchain_litellm.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
         login_provider("github-copilot")
       self.assertEqual(active_model(), logged_in)
 
       chat_model = ToolBindingFakeModel(responses=[probe])
-      with patch("perferox.auth.ChatLiteLLM", return_value=chat_model), patch.object(Path, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
+      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model), patch.object(Path, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
         login_provider("github-copilot")
       self.assertEqual(active_model(), logged_in)
 
