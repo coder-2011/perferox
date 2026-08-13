@@ -20,7 +20,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "lambda-labs>=1.0.1",
+  "lambda-labs==1.0.1",
   "modal>=1.4.0",
   "langchain",
   "langgraph",

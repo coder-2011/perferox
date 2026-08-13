@@ -40,6 +40,23 @@ jobs:
       - run: uv sync --locked --no-dev
       - run: uv run --no-sync python -m unittest tests.py
 
+  artifact:
+    name: Installed artifact / Python 3.13
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv build --sdist --no-sources
+      - run: uv build --wheel --no-sources dist/perferox-*.tar.gz
+      - run: uv venv .artifact-venv
+      - run: uv pip install --python .artifact-venv/bin/python dist/perferox-*.whl
+      - run: .artifact-venv/bin/perferox --version
+      - run: .artifact-venv/bin/python -c "import perferox.tui; from importlib.resources import files; assert files('perferox').joinpath('sglang_docs/perferox-docs.sqlite').is_file()"
+      - run: .artifact-venv/bin/lambda-labs --help
+
   local-mac:
     name: Local Mac / Python 3.13
     if: github.event_name == 'push'
