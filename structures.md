@@ -31,14 +31,14 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 `perferox` exposes five user paths:
 
 - no command opens the Textual dashboard after local LLM auth passes
-- `perferox login [chatgpt|github-copilot]` runs CLI-only OAuth and selects the provider
+- `perferox login <provider/model> [--reasoning-effort EFFORT]` validates and selects any LiteLLM model
 - `perferox run <objective>` launches the main agent
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
-The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one credential handoff to detached tmux processes through a one-use file, and workers expose only the selected provider's credentials.
+The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one cloud credential handoff to detached tmux processes through a one-use file, and workers expose only the selected cloud provider's credentials. Perferox uses its own tmux server so detached model processes inherit the authentication environment from launch rather than an unrelated older tmux server.
 
-LLM login is separate from cloud auth. `perferox login` makes a real LiteLLM tool call, then stores only the selected provider. LiteLLM owns OAuth tokens. The CLI blocks the TUI, direct runs, and tmux launch until login has selected a provider.
+LLM login is separate from cloud auth. `perferox login` makes a real LiteLLM tool call, then stores only the non-secret model name and optional reasoning effort. LiteLLM and provider tooling own OAuth tokens, API keys, and cloud credentials. The CLI blocks the TUI, direct runs, and tmux launch until a model profile exists. Launch snapshots that profile into one-use handoffs so the coordinator and every subagent keep the exact model selected at start.
 
 The main process uses two roots:
 
@@ -153,7 +153,7 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 | `runs` | every started benchmark, full target/environment identity, timing, trace, and failure state |
 | `experiments` | host-parsed metrics plus a later human-readable intent and embedding |
 | `anomalies` | human-readable surprising behavior tied to a run |
-| `agent_sessions` | main/subagent process lifecycle plus its single active provider resource |
+| `agent_sessions` | main/subagent process lifecycle, exact LLM profile, and single active cloud resource |
 | `main_notifications` | durable wakeups for run, experiment, anomaly, and summary events |
 | `explorer_state_lines` | compact append-only exploration memory |
 | `doc_chunks` | locally ingested SGLang reference text and embeddings |

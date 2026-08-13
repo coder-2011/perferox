@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _EMBEDDER = None
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 METRIC_COLUMNS = ["request_rps", "input_tps", "output_tps", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "error_rate", "cache_hit_rate", "peak_gpu_mem_gb", "startup_s", "warmup_s", "accept_length", "correctness_score"]
 _METRIC_COLUMN_SET = set(METRIC_COLUMNS)
@@ -56,7 +56,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Existing pre-beta databases need the new text fields added in place.
     for table, names in (
       ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
-      ("agent_sessions", ("provider", "resource_id", "error")),
+      ("agent_sessions", ("provider", "resource_id", "error", "llm_model", "reasoning_effort")),
     ):
       columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
       for name in names:
@@ -123,21 +123,32 @@ def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, lin
   return int(row[0])
 
 
-def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: str, agent_id: int | None = None, trace_ref: str = "") -> None:
+def record_agent_session(
+  conn: sqlite3.Connection,
+  *,
+  session_name: str,
+  role: str,
+  agent_id: int | None = None,
+  trace_ref: str = "",
+  llm_model: str = "",
+  reasoning_effort: str = "",
+) -> None:
   """Record one tmux-wrapped process without clearing an accepted stop."""
   with conn:
     conn.execute(
       """
-      INSERT INTO agent_sessions(session_name, role, agent_id, status, trace_ref)
-      VALUES (?, ?, ?, 'running', ?)
+      INSERT INTO agent_sessions(session_name, role, agent_id, status, trace_ref, llm_model, reasoning_effort)
+      VALUES (?, ?, ?, 'running', ?, ?, ?)
       ON CONFLICT(session_name) DO UPDATE SET
         role = excluded.role,
         agent_id = excluded.agent_id,
         status = CASE WHEN agent_sessions.status = 'ending' OR (agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed')) THEN agent_sessions.status ELSE 'running' END,
         trace_ref = excluded.trace_ref,
+        llm_model = excluded.llm_model,
+        reasoning_effort = excluded.reasoning_effort,
         error = CASE WHEN agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed') THEN agent_sessions.error ELSE '' END
       """,
-      (session_name, role, agent_id, trace_ref),
+      (session_name, role, agent_id, trace_ref, llm_model, reasoning_effort),
     )
 
 

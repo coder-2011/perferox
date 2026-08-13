@@ -254,9 +254,12 @@ def _session_text(sessions: list[dict[str, object]]) -> str:
   for session in sessions:
     agent = "" if session["agent_id"] is None else f" agent-{session['agent_id']}"
     trace = Path(str(session["trace_ref"])).name if session.get("trace_ref") else "no-trace"
+    model = str(session["llm_model"] or "no-model")
+    if session["reasoning_effort"]:
+      model += f" · {session['reasoning_effort']}"
     counts = f"{session['run_count']} runs, {session['succeeded_runs']} ok, {session['failed_runs']} failed"
     error = f"\n  {escape(str(session['error']))}" if session.get("error") else ""
-    lines.append(f"{session['status']} {session['role']}{agent}\n  {session['session_name']}\n  {counts}\n  {trace}{error}")
+    lines.append(f"{session['status']} {session['role']}{agent}\n  {session['session_name']}\n  {escape(model)}\n  {counts}\n  {trace}{error}")
   return "\n\n".join(lines)
 
 

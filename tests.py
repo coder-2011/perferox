@@ -26,7 +26,15 @@ from modal.stream_type import StreamType
 from pydantic import ValidationError
 
 from perferox import db
-from perferox.auth import active_model, cloud_environment, login_provider, modal_cloud_key
+from perferox.auth import (
+  active_model_profile,
+  build_chat_model,
+  cloud_environment,
+  login_model,
+  modal_cloud_key,
+  read_model_profile,
+  write_model_profile,
+)
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
 from perferox.remote import RemoteResult, SessionRegistry
@@ -67,33 +75,40 @@ class ToolBindingFakeModel(FakeMessagesListChatModel):
     return self
 
 
-class OAuthProfileTests(unittest.TestCase):
+class ModelProfileTests(unittest.TestCase):
   """Protect the CLI-validated model selection."""
 
   def test_login_replaces_profile_only_after_validation(self) -> None:
-    """Preserve the active selection until the probe and file replacement succeed."""
+    """Validate arbitrary models, preserve failures, and hand off exact profiles."""
     with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
-      profile_path = Path(root) / "perferox" / "provider"
-      profile_path.parent.mkdir()
-      profile_path.write_text("unknown", encoding="utf-8")
-      self.assertIsNone(active_model())
+      config_dir = Path(root) / "perferox"
+      config_dir.mkdir()
+      (config_dir / "provider").write_text("chatgpt", encoding="utf-8")
+      self.assertEqual(active_model_profile().model, "chatgpt/gpt-5.4")
 
       probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
       chat_model = ToolBindingFakeModel(responses=[probe])
-      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model):
-        logged_in = login_provider("chatgpt")
-      self.assertEqual(active_model(), logged_in)
-      self.assertEqual(profile_path.read_text(encoding="utf-8"), "chatgpt")
+      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model) as constructor:
+        logged_in = login_model("anthropic/claude-sonnet", "high")
+      self.assertEqual(active_model_profile(), logged_in)
+      constructor.assert_called_once_with(model="anthropic/claude-sonnet", model_kwargs={"reasoning_effort": "high"}, max_retries=0)
+      self.assertEqual(json.loads((config_dir / "model.json").read_text(encoding="utf-8")), {"model": "anthropic/claude-sonnet", "reasoning_effort": "high"})
+      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model) as constructor:
+        build_chat_model(logged_in)
+      constructor.assert_called_once_with(model="anthropic/claude-sonnet", model_kwargs={"reasoning_effort": "high"}, max_retries=1)
+      handoff = write_model_profile(logged_in)
+      self.assertEqual(read_model_profile(handoff), logged_in)
+      self.assertFalse(handoff.exists())
 
       failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
       with patch("langchain_litellm.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
-        login_provider("github-copilot")
-      self.assertEqual(active_model(), logged_in)
+        login_model("openrouter/auto")
+      self.assertEqual(active_model_profile(), logged_in)
 
       chat_model = ToolBindingFakeModel(responses=[probe])
       with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model), patch.object(Path, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
-        login_provider("github-copilot")
-      self.assertEqual(active_model(), logged_in)
+        login_model("github_copilot/gpt-4")
+      self.assertEqual(active_model_profile(), logged_in)
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -242,7 +257,7 @@ class HostStateTests(DatabaseTestCase):
       second.result()
 
     with closing(db.connect(legacy_path)) as conn:
-      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
       self.assertIn("repository", {row["name"] for row in conn.execute("PRAGMA table_info(runs)")})
 
   def test_run_ids_hash_caps_and_stop_are_host_owned(self) -> None:
@@ -566,7 +581,7 @@ class TUIWiringTests(DatabaseTestCase):
     trace_path = Path(self.tempdir.name) / "main.jsonl"
     lines = [json.dumps({"payload": {"main": {"messages": [{"content": f"cache pressure {index}"}]}}}, separators=(",", ":")) for index in range(30)]
     trace_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+    db.record_agent_session(self.conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path), llm_model="anthropic/claude-sonnet", reasoning_effort="high")
     db.record_agent_session(self.conn, session_name="perferox-agent-0", role="subagent", agent_id=0, trace_ref=str(trace_path))
     db.append_explorer_state(self.conn, agent_id=None, line="explorer saw cache pressure")
     db.start_benchmark_run(self.conn, agent_id=0, command="bench cache")
@@ -594,6 +609,7 @@ class TUIWiringTests(DatabaseTestCase):
     tail_lines = read_trace_tail([str(trace_path)], 5)
     subagent = next(session for session in snapshot.sessions if session["session_name"] == "perferox-agent-0")
     self.assertEqual(snapshot.main_status, "running")
+    self.assertEqual(next(session for session in snapshot.sessions if session["role"] == "main")["llm_model"], "anthropic/claude-sonnet")
     self.assertEqual(snapshot.runs, 1)
     self.assertEqual(snapshot.running_runs, 1)
     self.assertEqual(snapshot.anomaly_count, 1)

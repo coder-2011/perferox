@@ -2,14 +2,39 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
-OAUTH_MODELS = {
+LEGACY_MODELS = {
   "chatgpt": "chatgpt/gpt-5.4",
   "github-copilot": "github_copilot/gpt-4",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+  """Store one non-secret LiteLLM model selection."""
+
+  model: str
+  reasoning_effort: str | None = None
+
+  def __post_init__(self) -> None:
+    """Normalize and validate values before they reach LiteLLM."""
+    model = self.model.strip()
+    effort = self.reasoning_effort.strip() if self.reasoning_effort else None
+    if not model or any(character in model for character in "\r\n"):
+      raise ValueError("model must be one non-empty LiteLLM model name")
+    if effort and any(character in effort for character in "\r\n"):
+      raise ValueError("reasoning effort must be one non-empty value")
+    object.__setattr__(self, "model", model)
+    object.__setattr__(self, "reasoning_effort", effort)
+
+  def label(self) -> str:
+    """Render the model and optional reasoning effort compactly."""
+    return f"{self.model} · {self.reasoning_effort}" if self.reasoning_effort else self.model
 
 
 def perferox_auth_probe() -> None:
@@ -70,46 +95,83 @@ def read_cloud_key(path: str | Path) -> str:
     key_path.unlink(missing_ok=True)
 
 
-def _provider_path() -> Path:
-  """Return the XDG-style path for Perferox's selected provider."""
+def _profile_path() -> Path:
+  """Return the XDG-style path for Perferox's selected model profile."""
   config_root = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
-  return config_root / "perferox" / "provider"
+  return config_root / "perferox" / "model.json"
+
+
+def active_model_profile() -> ModelProfile | None:
+  """Load the selected model profile, including legacy provider selections."""
+  profile_path = _profile_path()
+  try:
+    profile_text = profile_path.read_text(encoding="utf-8")
+  except OSError:
+    profile_text = ""
+  except UnicodeError:
+    return None
+  if profile_text:
+    try:
+      data = json.loads(profile_text)
+      return ModelProfile(model=data["model"], reasoning_effort=data.get("reasoning_effort"))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+      return None
+  try:
+    provider = profile_path.with_name("provider").read_text(encoding="utf-8").strip()
+  except (OSError, UnicodeError):
+    return None
+  model = LEGACY_MODELS.get(provider)
+  return ModelProfile(model) if model else None
 
 
 def active_model() -> str | None:
-  """Load the default model for the selected OAuth provider."""
-  try:
-    provider = _provider_path().read_text(encoding="utf-8").strip()
-  except (OSError, UnicodeError):
-    return None
-  return OAUTH_MODELS.get(provider)
+  """Return the selected LiteLLM model name when configured."""
+  profile = active_model_profile()
+  return profile.model if profile else None
 
 
-def login_provider(provider: str) -> str:
-  """Run CLI-owned OAuth and save the provider after a real tool call."""
-  model = OAUTH_MODELS.get(provider)
-  if model is None:
-    raise ValueError(f"unsupported OAuth provider: {provider}")
+def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile:
+  """Validate and atomically save any LiteLLM-backed model profile."""
   from langchain_litellm import ChatLiteLLM
 
-  chat_model = ChatLiteLLM(model=model, max_retries=0)
+  profile = ModelProfile(model, reasoning_effort)
+  model_kwargs = {"reasoning_effort": profile.reasoning_effort} if profile.reasoning_effort else {}
+  chat_model = ChatLiteLLM(model=profile.model, model_kwargs=model_kwargs, max_retries=0)
   probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
   response = probe_model.invoke(f"Call {perferox_auth_probe.__name__} once with no arguments.")
   if not response.tool_calls:
-    raise RuntimeError(f"{model} authenticated but did not complete the tool-call probe")
-  provider_path = _provider_path()
-  provider_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-  temporary_path = provider_path.with_suffix(".tmp")
-  temporary_path.write_text(provider, encoding="utf-8")
-  temporary_path.replace(provider_path)
-  return model
+    raise RuntimeError(f"{profile.model} authenticated but did not complete the tool-call probe")
+  profile_path = _profile_path()
+  profile_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  temporary_path = profile_path.with_suffix(".tmp")
+  temporary_path.write_text(json.dumps({"model": profile.model, "reasoning_effort": profile.reasoning_effort}, separators=(",", ":")), encoding="utf-8")
+  temporary_path.replace(profile_path)
+  return profile
 
 
-def build_chat_model():
-  """Build the active OAuth-backed LangChain model without starting login."""
-  model = active_model()
-  if model is None:
-    raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
+def build_chat_model(profile: ModelProfile | None = None):
+  """Build the selected LiteLLM model without starting authentication."""
+  profile = profile or active_model_profile()
+  if profile is None:
+    raise RuntimeError("LLM model is not configured; run `perferox login MODEL` first")
   from langchain_litellm import ChatLiteLLM
 
-  return ChatLiteLLM(model=model, max_retries=1)
+  model_kwargs = {"reasoning_effort": profile.reasoning_effort} if profile.reasoning_effort else {}
+  return ChatLiteLLM(model=profile.model, model_kwargs=model_kwargs, max_retries=1)
+
+
+def write_model_profile(profile: ModelProfile) -> Path:
+  """Write one mode-0600 model profile handoff for a detached process."""
+  with tempfile.NamedTemporaryFile("w", prefix="perferox-model-", delete=False) as file:
+    json.dump({"model": profile.model, "reasoning_effort": profile.reasoning_effort}, file, separators=(",", ":"))
+    return Path(file.name)
+
+
+def read_model_profile(path: str | Path) -> ModelProfile:
+  """Read and delete a one-use model profile handoff."""
+  profile_path = Path(path)
+  try:
+    data = json.loads(profile_path.read_text(encoding="utf-8"))
+    return ModelProfile(model=data["model"], reasoning_effort=data.get("reasoning_effort"))
+  finally:
+    profile_path.unlink(missing_ok=True)

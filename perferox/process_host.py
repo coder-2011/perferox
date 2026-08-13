@@ -17,11 +17,20 @@ from rich.console import Console
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import active_model, build_chat_model, cloud_environment, cloud_provider, read_cloud_key, write_cloud_key
+from perferox.auth import (
+  active_model_profile,
+  build_chat_model,
+  cloud_environment,
+  cloud_provider,
+  read_cloud_key,
+  read_model_profile,
+  write_cloud_key,
+  write_model_profile,
+)
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT, MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
-from perferox.status import refresh_sessions
+from perferox.status import TMUX_SOCKET, refresh_sessions
 from perferox.subagent import build_subagent_graph, stream_with_trace
 from perferox.tools import cleanup_cloud_resource, create_modal_sandbox, provider_cli
 
@@ -59,9 +68,10 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     subparser.add_argument("--cwd", default=".")
     subparser.add_argument("--max-agents", type=_positive_int, default=3)
   subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
+  subparsers.choices["main"].add_argument("--model-profile-file", required=True)
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
-  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "cloud-key-file"):
+  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "cloud-key-file", "model-profile-file"):
     subagent.add_argument(f"--{name}", required=True)
   subagent.add_argument("--attempt-cap", type=_positive_int, required=True)
   args = parser.parse_args(argv)
@@ -72,52 +82,62 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_dir = (cwd / args.trace_dir).resolve()
 
   if args.command == "launch-main":
-    if active_model() is None:
-      ERROR_CONSOLE.print("[bold red]error:[/] LLM OAuth is missing; run `perferox login` first")
+    profile = active_model_profile()
+    if profile is None:
+      ERROR_CONSOLE.print("[bold red]error:[/] LLM model is not configured; run `perferox login MODEL` first")
       return 1
     tmux = shutil.which("tmux")
     if tmux is None:
       ERROR_CONSOLE.print("[bold red]error:[/] tmux is not installed or not on PATH")
       return 1
     trace_dir.mkdir(parents=True, exist_ok=True)
-    if subprocess.run([tmux, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
-      CONSOLE.print(f"[yellow]{MAIN_SESSION} already running[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
+    if subprocess.run([tmux, "-L", TMUX_SOCKET, "has-session", "-t", MAIN_SESSION], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+      CONSOLE.print(f"[yellow]{MAIN_SESSION} already running[/] · attach with [bold]tmux -L {TMUX_SOCKET} attach -t {MAIN_SESSION}[/]")
       return 1
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
     key_path = write_cloud_key(api_key)
+    try:
+      profile_path = write_model_profile(profile)
+    except OSError:
+      key_path.unlink(missing_ok=True)
+      raise
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       # Register before tmux starts so an immediate End request cannot be lost.
       db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
-      db.record_agent_session(conn, session_name=MAIN_SESSION, role="main")
+      db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", llm_model=profile.model, reasoning_effort=profile.reasoning_effort or "")
     command = shlex.join([
       sys.executable, "-m", "perferox.process_host", "main",
       "--db-path", str(db_path), "--trace-dir", str(trace_dir),
       "--objective", args.objective, "--cwd", str(cwd),
       "--max-agents", str(args.max_agents),
       "--cloud-key-file", str(key_path),
+      "--model-profile-file", str(profile_path),
     ])
     try:
-      result = subprocess.run([tmux, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
+      result = subprocess.run([tmux, "-L", TMUX_SOCKET, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
     except OSError:
       # Delete a secret handoff that tmux never delivered.
       key_path.unlink(missing_ok=True)
+      profile_path.unlink(missing_ok=True)
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       raise
     if result.returncode != 0:
       key_path.unlink(missing_ok=True)
+      profile_path.unlink(missing_ok=True)
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
     if result.returncode == 0:
-      CONSOLE.print(f"[green]started {MAIN_SESSION}[/] · attach with [bold]tmux attach -t {MAIN_SESSION}[/]")
+      CONSOLE.print(f"[green]started {MAIN_SESSION}[/] · {profile.label()} · attach with [bold]tmux -L {TMUX_SOCKET} attach -t {MAIN_SESSION}[/]")
     else:
       ERROR_CONSOLE.print(Text((result.stderr or result.stdout).strip(), style="red"))
     return result.returncode
 
   if args.command == "main":
     api_key = read_cloud_key(args.cloud_key_file)
+    profile = read_model_profile(args.model_profile_file)
     provider = cloud_provider(api_key)
     _select_cloud_environment(api_key)
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +148,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     try:
       with closing(db.connect(db_path)) as conn, conn:
         db.init_db(conn)
-        db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path))
+        db.record_agent_session(conn, session_name=MAIN_SESSION, role="main", trace_ref=str(trace_path), llm_model=profile.model, reasoning_effort=profile.reasoning_effort or "")
         # A prior coordinator may have died after reserving but before launching tmux.
         conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status IN ('running', 'ending') AND trace_ref = ''")
         session = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
@@ -138,8 +158,9 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       if not (workspace / ".git").is_dir():
         subprocess.run(["git", "clone", "https://github.com/sgl-project/sglang.git", str(workspace)], check=True)
       graph = build_main_agent_graph(
-        build_chat_model(), db_path,
+        build_chat_model(profile), db_path,
         cloud_provider=provider, cloud_api_key=api_key,
+        model_profile=profile,
         cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir, max_agents=args.max_agents,
       )
       state = {"objective": args.objective, "messages": []}
@@ -170,6 +191,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   session_name = f"perferox-agent-{agent_id}"
   registry = SessionRegistry()
   api_key = read_cloud_key(args.cloud_key_file)
+  profile = read_model_profile(args.model_profile_file)
   provider = cloud_provider(api_key)
   _select_cloud_environment(api_key)
   session_status = "exited"
@@ -177,7 +199,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   try:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
-      db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
+      db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path), llm_model=profile.model, reasoning_effort=profile.reasoning_effort or "")
       if conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()["status"] == "ending":
         return 0
     attempt_cap = args.attempt_cap
@@ -188,7 +210,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       create_prompt = LAMBDA_CREATE_POD_SYSTEM_PROMPT if provider == "lambda" else CREATE_POD_SYSTEM_PROMPT
       create_tools = (provider_cli(provider, db_path, agent_id),)
     graph = build_subagent_graph(
-      build_chat_model(), agent_id, registry, db_path, args.repository, args.commit,
+      build_chat_model(profile), agent_id, registry, db_path, args.repository, args.commit,
       create_pod_prompt=create_prompt,
       connect_with_ssh=provider != "modal",
       attempt_cap=attempt_cap,

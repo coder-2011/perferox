@@ -17,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import OAUTH_MODELS, active_model, cloud_provider, login_provider, modal_cloud_key
+from perferox.auth import active_model_profile, cloud_provider, login_model, modal_cloud_key
 
 CONSOLE = Console()
 ERROR_CONSOLE = Console(stderr=True)
@@ -47,8 +47,9 @@ def main(argv: list[str] | None = None) -> int:
   run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
   run_parser.add_argument("--max-agents", type=_positive_int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
-  login_parser = subparsers.add_parser("login", help="authenticate an LLM provider through OAuth")
-  login_parser.add_argument("provider", nargs="?", choices=tuple(OAUTH_MODELS), help="OAuth provider; prompts when omitted")
+  login_parser = subparsers.add_parser("login", help="configure and authenticate any LiteLLM model")
+  login_parser.add_argument("model", nargs="?", help="LiteLLM model name, including its provider prefix")
+  login_parser.add_argument("--reasoning-effort", help="optional reasoning effort passed to LiteLLM")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
   logs_parser.add_argument("-n", "--limit", type=int, default=30, help="maximum activity lines (default: 30)")
   subparsers.add_parser("doctor", help="check local requirements without cloud calls")
@@ -65,8 +66,8 @@ def main(argv: list[str] | None = None) -> int:
   db_path = (cwd / args.db_path).resolve()
   trace_dir = (cwd / args.trace_dir).resolve()
 
-  if args.command in (None, "run") and active_model() is None:
-    return _error("LLM OAuth is missing; run `perferox login` first")
+  if args.command in (None, "run") and active_model_profile() is None:
+    return _error("LLM model is not configured; run `perferox login MODEL` first")
   if args.command is None:
     from perferox.tui import PerferoxTUI
 
@@ -97,13 +98,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _login(args: argparse.Namespace) -> int:
-  """Choose an OAuth provider and validate it through the production model path."""
-  provider = args.provider or Prompt.ask("LLM provider", choices=tuple(OAUTH_MODELS), console=CONSOLE)
+  """Configure and validate one arbitrary LiteLLM model profile."""
+  active = active_model_profile()
+  default_model = active.model if active else "chatgpt/gpt-5.4"
+  model = args.model or Prompt.ask("LiteLLM model", default=default_model, console=CONSOLE)
+  reasoning_effort = args.reasoning_effort
+  if args.model is None and reasoning_effort is None and active:
+    reasoning_effort = active.reasoning_effort
   try:
-    model = login_provider(provider)
+    profile = login_model(model, reasoning_effort)
   except Exception as exc:  # noqa: BLE001
     return _error(f"login failed: {type(exc).__name__}: {exc}")
-  CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {provider} · {model}", title="[bold]Login[/]", border_style="green"))
+  CONSOLE.print(Panel.fit(f"[green]authenticated[/] · {profile.label()}", title="[bold]Login[/]", border_style="green"))
   return 0
 
 
@@ -153,20 +159,24 @@ def _status(db_path: Path) -> int:
   summary.add_row(Text.assemble(("database  ", DIM), str(db_path)))
   CONSOLE.print(Panel(summary, title=f"[bold {BRAND}]perferox[/] status", border_style=BRAND))
 
-  sessions = Table("State", "Role", "Agent", "Runs", "OK", "Failed", "Trace", title="Sessions", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
+  sessions = Table("State", "Role", "Agent", "Model", "Runs", "OK", "Failed", "Trace", title="Sessions", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
   for session in snapshot.sessions:
     state = str(session["status"])
+    model = str(session["llm_model"] or "—")
+    if session["reasoning_effort"]:
+      model += f" · {session['reasoning_effort']}"
     sessions.add_row(
       Text(state, style=STATUS_STYLES.get(state, "white")),
       str(session["role"]),
       "—" if session["agent_id"] is None else str(session["agent_id"]),
+      model,
       str(session["run_count"] or 0),
       str(session["succeeded_runs"] or 0),
       str(session["failed_runs"] or 0),
       Path(str(session["trace_ref"])).name if session.get("trace_ref") else "—",
     )
   if not snapshot.sessions:
-    sessions.add_row(Text("idle", style=DIM), "—", "—", "0", "0", "0", "—")
+    sessions.add_row(Text("idle", style=DIM), "—", "—", "—", "0", "0", "0", "—")
   CONSOLE.print(sessions)
 
   runs = Table("Run", "State", "Started", "Intent / command", title="Recent runs", box=box.SIMPLE_HEAVY, header_style=f"bold {BRAND}")
@@ -208,12 +218,12 @@ def _doctor(cwd: Path, db_path: Path) -> int:
   """Check local launch requirements without model or cloud API calls."""
   uv = shutil.which("uv")
   tmux = shutil.which("tmux")
-  model = active_model()
+  profile = active_model_profile()
   checks = [
     ("workspace", "ok" if cwd.is_dir() else "fail", str(cwd)),
     ("uv", "ok" if uv else "fail", uv or "not found"),
     ("tmux", "ok" if tmux else "fail", tmux or "not found"),
-    ("LLM OAuth", "ok" if model else "fail", model or "run `perferox login`"),
+    ("LLM model", "ok" if profile else "fail", profile.label() if profile else "run `perferox login MODEL`"),
   ]
   try:
     with closing(db.connect(db_path)) as conn:

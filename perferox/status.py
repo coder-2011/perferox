@@ -12,6 +12,8 @@ from pathlib import Path
 
 from perferox import db
 
+TMUX_SOCKET = "perferox"
+
 
 @dataclass(slots=True)
 class DashboardSnapshot:
@@ -38,13 +40,13 @@ def refresh_sessions(conn) -> list[str]:
   tmux = shutil.which("tmux")
   if tmux is None:
     return []
-  result = subprocess.run([tmux, "list-sessions", "-F", "#S"], text=True, capture_output=True, check=False)
+  result = subprocess.run([tmux, "-L", TMUX_SOCKET, "list-sessions", "-F", "#S"], text=True, capture_output=True, check=False)
   if result.returncode and not any(text in (result.stderr or "").lower() for text in ("no server running", "no such file or directory")):
     return []
   alive = set((result.stdout or "").splitlines())
   missing = []
   for row in rows:
-    if row["session_name"] in alive or subprocess.run([tmux, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
+    if row["session_name"] in alive or subprocess.run([tmux, "-L", TMUX_SOCKET, "has-session", "-t", row["session_name"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0:
       continue
     if not db.finish_agent_session(conn, session_name=row["session_name"], status="missing", trace_ref=row["trace_ref"]):
       continue

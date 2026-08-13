@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS explorer_state_lines (
 CREATE TABLE IF NOT EXISTS agent_sessions (
   session_name TEXT PRIMARY KEY, role TEXT NOT NULL, agent_id INTEGER,
   status TEXT NOT NULL, trace_ref TEXT NOT NULL DEFAULT '',
+  llm_model TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL DEFAULT '', resource_id TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT ''
 );
