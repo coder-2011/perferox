@@ -7,9 +7,21 @@ from math import ceil
 from typing import Any
 
 import paramiko
+from modal.stream_type import StreamType
 
 READ_CHUNK_BYTES = 32768
 MAX_DRAIN_READS = 16
+MAX_CAPTURE_BYTES = 20000
+_OUTPUT_GAP = b"\n... output elided ...\n"
+
+
+def _append_bounded(buffer: bytearray, chunk: bytes) -> None:
+    """Retain a fixed-size head and tail from streamed command output."""
+    buffer.extend(chunk)
+    if len(buffer) <= MAX_CAPTURE_BYTES:
+        return
+    keep = (MAX_CAPTURE_BYTES - len(_OUTPUT_GAP)) // 2
+    buffer[keep:-keep] = _OUTPUT_GAP
 
 
 @dataclass(slots=True)
@@ -43,8 +55,10 @@ class RemoteSession:
         session._client = client
         return session
 
-    def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
+    def run(self, command: str, *, timeout_s: float = 30.0) -> RemoteResult:
         """Run a command, returning partial output and no status on timeout."""
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
         client = self._client
         transport = None if client is None else client.get_transport()
         if transport is None or not transport.is_active():
@@ -52,7 +66,7 @@ class RemoteSession:
 
         stdout, stderr = bytearray(), bytearray()
         monotonic = time.monotonic
-        deadline = None if timeout_s is None else monotonic() + timeout_s
+        deadline = monotonic() + timeout_s
         channel = transport.open_session(timeout=timeout_s)
 
         def drain() -> bool:
@@ -65,9 +79,9 @@ class RemoteSession:
                     break
                 drained = True
                 if stdout_ready:
-                    stdout.extend(channel.recv(READ_CHUNK_BYTES))
+                    _append_bounded(stdout, channel.recv(READ_CHUNK_BYTES))
                 if stderr_ready:
-                    stderr.extend(channel.recv_stderr(READ_CHUNK_BYTES))
+                    _append_bounded(stderr, channel.recv_stderr(READ_CHUNK_BYTES))
             return drained
 
         def result(exit_status: int | None) -> RemoteResult:
@@ -80,7 +94,7 @@ class RemoteSession:
             channel.shutdown_write()
             while not channel.exit_status_ready():
                 drained = drain()
-                if deadline is not None and monotonic() >= deadline:
+                if monotonic() >= deadline:
                     return result(None)
                 if not drained:
                     time.sleep(0.05)
@@ -105,20 +119,20 @@ class ModalSession:
     session_id: str
     _sandbox: Any | None = field(repr=False)
 
-    def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
+    def run(self, command: str, *, timeout_s: float = 30.0) -> RemoteResult:
         """Execute one command through Modal's native Sandbox process API."""
         sandbox = self._sandbox
         if sandbox is None:
             raise RuntimeError(f"remote session is not connected: {self.session_id}")
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
         argv = shlex.split(command)
-        if timeout_s is None:
-            process = sandbox.exec(*argv)
-        else:
-            process = sandbox.exec(*argv, timeout=max(1, ceil(timeout_s)))
-        stdout = process.stdout.read()
-        stderr = process.stderr.read()
+        process = sandbox.exec(*argv, timeout=max(1, ceil(timeout_s)), stderr=StreamType.STDOUT)
+        stdout = bytearray()
+        for chunk in process.stdout:
+            _append_bounded(stdout, chunk.encode() if isinstance(chunk, str) else chunk)
         exit_status = process.wait()
-        return RemoteResult(exit_status, stdout, stderr)
+        return RemoteResult(exit_status, stdout.decode(errors="replace"), "")
 
     def close(self) -> None:
         """Detach the client while host-owned cleanup terminates the Sandbox."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from contextlib import closing
 from pathlib import Path
 
@@ -12,6 +13,7 @@ os.environ.pop("NO_COLOR", None)
 os.environ.setdefault("TEXTUAL_COLOR_SYSTEM", "truecolor")
 
 from rich.markup import escape
+from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
@@ -40,9 +42,7 @@ def launch_main(
 ) -> subprocess.CompletedProcess[str]:
   """Start the tmux-wrapped main graph through the existing runner CLI."""
   command = [
-    "uv",
-    "run",
-    "python",
+    sys.executable,
     "-m",
     "perferox.process_host",
     "launch-main",
@@ -57,7 +57,7 @@ def launch_main(
     "--max-agents",
     str(max_agents),
   ]
-  return subprocess.run(command, cwd=Path(cwd), input=cloud_api_key, text=True, capture_output=True, check=False)
+  return subprocess.run(command, cwd=Path(cwd), input=cloud_api_key, text=True, capture_output=True, check=False, timeout=60)
 
 
 class PerferoxTUI(App[None]):
@@ -97,6 +97,7 @@ class PerferoxTUI(App[None]):
     self.cwd = Path(cwd).resolve()
     self.db_path = Path(db_path).resolve()
     self.trace_dir = Path(trace_dir).resolve()
+    self._launching = False
 
   def compose(self) -> ComposeResult:
     """Build the live dashboard layout."""
@@ -161,9 +162,15 @@ class PerferoxTUI(App[None]):
     trace_text = "\n\n".join(escape(line) for line in snapshot.trace_lines) if snapshot.trace_lines else "no trace records yet"
     self.query_one("#trace-text", Static).update(trace_text)
     self.query_one("#anomalies-text", Static).update(_anomaly_text(snapshot.anomalies))
-    footer = {"running": "main graph running", "ending": "soft stop requested; waiting for current work to finish", "exited": "main graph exited"}.get(snapshot.main_status, "idle")
+    footer = "starting main graph..." if self._launching else {
+      "running": "main graph running",
+      "ending": "soft stop requested; waiting for current work to finish",
+      "exited": "main graph exited",
+      "failed": "main graph failed",
+      "missing": "main tmux missing",
+    }.get(snapshot.main_status, "idle")
     self.query_one("#footer", Static).update(footer)
-    self.query_one("#start", Button).disabled = snapshot.main_status in {"running", "ending"}
+    self.query_one("#start", Button).disabled = self._launching or snapshot.main_status in {"running", "ending"}
     self.query_one("#end", Button).disabled = snapshot.main_status not in {"running", "ending"}
 
   def _start_main(self) -> None:
@@ -185,10 +192,28 @@ class PerferoxTUI(App[None]):
       self.query_one("#footer", Static).update("enter an objective before starting")
       return
     correction = f"using {provider} based on key; " if selected is not Select.BLANK and selected != provider else ""
-    result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key, max_agents)
     self.query_one("#cloud-key", Input).value = ""
+    self._launching = True
+    self.query_one("#start", Button).disabled = True
+    self.query_one("#footer", Static).update("starting main graph...")
+    self._launch_main(objective, api_key, max_agents, correction)
+
+  @work(exclusive=True, thread=True)
+  def _launch_main(self, objective: str, api_key: str, max_agents: int, correction: str) -> None:
+    """Launch outside Textual's event loop and report back on the UI thread."""
+    try:
+      result = launch_main(self.cwd, self.db_path, self.trace_dir, objective, api_key, max_agents)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+      self.call_from_thread(self._finish_launch, correction + f"launch failed: {type(exc).__name__}: {exc}")
+      return
     output = (result.stdout or result.stderr).strip()
-    self.query_one("#footer", Static).update(correction + (output or f"launch exited {result.returncode}"))
+    message = correction + (output or f"launch exited {result.returncode}")
+    self.call_from_thread(self._finish_launch, message)
+
+  def _finish_launch(self, message: str) -> None:
+    """Restore controls after one background launch attempt."""
+    self._launching = False
+    self.query_one("#footer", Static).update(message)
     self.refresh_dashboard()
 
   def _end_main(self) -> None:
@@ -218,7 +243,8 @@ def _session_text(sessions: list[dict[str, object]]) -> str:
     agent = "" if session["agent_id"] is None else f" agent-{session['agent_id']}"
     trace = Path(str(session["trace_ref"])).name if session.get("trace_ref") else "no-trace"
     counts = f"{session['run_count']} runs, {session['succeeded_runs']} ok, {session['failed_runs']} failed"
-    lines.append(f"{session['status']} {session['role']}{agent}\n  {session['session_name']}\n  {counts}\n  {trace}")
+    error = f"\n  {escape(str(session['error']))}" if session.get("error") else ""
+    lines.append(f"{session['status']} {session['role']}{agent}\n  {session['session_name']}\n  {counts}\n  {trace}{error}")
   return "\n\n".join(lines)
 
 

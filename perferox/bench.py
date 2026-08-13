@@ -1,6 +1,7 @@
 """SGLang benchmark command builders and parsers."""
 
 import json
+import math
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -26,6 +27,7 @@ BenchBackend = Literal[
   "sglang-embedding",
   "vllm",
   "vllm-chat",
+  "vllm-embedding",
   "lmdeploy",
   "lmdeploy-chat",
   "trt",
@@ -34,7 +36,6 @@ BenchBackend = Literal[
 ]
 BenchDataset = Literal[
   "agentic-trace",
-  "autobench",
   "sharegpt",
   "custom",
   "openai",
@@ -148,7 +149,7 @@ class BenchServingArgs(BaseModel):
   fake_prefill: bool = Field(False, description="Use fake prefill mode for decode-only benchmarking.")
   tag: str | None = Field(None, description="Tag written to benchmark output.")
   header: dict[str, str] | None = Field(None, description="Custom HTTP headers as key/value pairs.")
-  timeout_s: float | None = Field(BENCH_TIMEOUT_S, gt=0, description="Host-side remote command timeout; not a bench_serving flag.")
+  timeout_s: float = Field(BENCH_TIMEOUT_S, gt=0, le=BENCH_TIMEOUT_S, description="Host-side remote command timeout; not a bench_serving flag.")
 
   @model_validator(mode="after")
   def check_serving_constraints(self) -> Self:
@@ -178,8 +179,8 @@ class BenchServingArgs(BaseModel):
 def bench_serving_argv(args: BenchServingArgs) -> list[str]:
   """Build the SGLang serving benchmark argv from typed fields."""
   data = args.model_dump(exclude={"gpu", "server_command", "model_state", "timeout_s", "extra_request_body", "header"}, exclude_none=True)
-  data["extra_request_body"] = json.dumps(args.extra_request_body, separators=(",", ":")) if args.extra_request_body else None
-  data["header"] = [f"{key}={value}" for key, value in (args.header or {}).items()]
+  data["extra_request_body"] = json.dumps(args.extra_request_body, sort_keys=True, separators=(",", ":")) if args.extra_request_body else None
+  data["header"] = [f"{key}={value}" for key, value in sorted((args.header or {}).items())]
   argv = ["python", "-m", "sglang.benchmark.serving"]
   for name, value in data.items():
     if value is False or value is None or value == []:
@@ -209,6 +210,10 @@ def parse_bench_serving_metrics(output: str, expected_requests: int | None = Non
     try:
       value = float(raw_number)
     except ValueError:
+      continue
+    if not math.isfinite(value) or value < 0:
+      continue
+    if metric_name == "cache_hit_rate" and value > 100:
       continue
     if metric_name is None:
       metrics["error_rate"] = max(expected_requests - value, 0.0) / expected_requests

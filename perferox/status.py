@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +46,8 @@ def refresh_sessions(conn) -> list[str]:
       continue
     if not db.finish_agent_session(conn, session_name=row["session_name"], status="missing", trace_ref=row["trace_ref"]):
       continue
+    if row["agent_id"] is not None:
+      db.fail_unfinished_runs(conn, agent_id=row["agent_id"], error="worker tmux session disappeared")
     line = f"{row['label']} tmux missing; trace {Path(row['trace_ref']).name}"
     db.append_explorer_state(conn, agent_id=row["agent_id"], line=line)
     missing.append(line)
@@ -57,6 +58,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
   """Read comprehensive status without consuming main-agent notifications."""
   with closing(db.connect(db_path)) as conn:
     db.init_db(conn)
+    refresh_sessions(conn)
     sessions = [dict(row) for row in conn.execute(
         """
         SELECT s.*,
@@ -73,7 +75,7 @@ def read_dashboard(db_path: str | Path, *, trace_limit: int = 80) -> DashboardSn
         """
         SELECT r.agent_id, r.run_id, r.started_at,
           CASE WHEN r.error != '' THEN 'failed' WHEN r.finished_at IS NOT NULL THEN 'ok' ELSE 'running' END AS status,
-          COALESCE(e.intent_key, r.command, '') AS label
+          COALESCE(NULLIF(e.intent_key, ''), r.command, '') AS label
         FROM runs r
         LEFT JOIN experiments e ON e.agent_id = r.agent_id AND e.run_id = r.run_id
         ORDER BY r.started_at DESC, r.agent_id DESC, r.run_id DESC
@@ -118,6 +120,8 @@ def read_activity(db_path: str | Path, limit: int) -> list[str]:
 
 def _read_activity(conn, limit: int) -> list[str]:
   """Merge recent SQLite events with bounded JSONL trace tails."""
+  if limit <= 0:
+    return []
   rows = conn.execute(
     """
     SELECT created_at, kind, payload FROM (
@@ -137,26 +141,31 @@ def _read_activity(conn, limit: int) -> list[str]:
   events.reverse()
   trace_refs = list(dict.fromkeys(
     row["trace_ref"]
-    for row in conn.execute("SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY role, agent_id")
+    for row in conn.execute(
+      "SELECT trace_ref FROM agent_sessions WHERE trace_ref != '' ORDER BY status IN ('running', 'ending') DESC, rowid DESC LIMIT 8"
+    )
   ))
   traces = read_trace_tail(trace_refs, limit)
-  if not events:
-    return traces
-  event_slots = min(len(events), max(1, limit // 4))
-  trace_slots = limit - event_slots
-  return [*events[-event_slots:], *(traces[-trace_slots:] if trace_slots else [])]
+  return sorted([*events, *traces])[-limit:]
 
 
 def read_trace_tail(paths: list[str], limit: int) -> list[str]:
   """Return compact trace lines without scanning whole JSONL files."""
-  lines: deque[str] = deque(maxlen=limit)
+  if limit <= 0:
+    return []
+  lines = []
   for raw_path in paths:
     path = Path(raw_path)
     if not path.exists():
       continue
     for raw_line in _tail_lines(path, limit):
-      lines.append(format_trace_line(path, raw_line))
-  return list(lines)
+      try:
+        timestamp = str(json.loads(raw_line).get("ts", ""))
+      except json.JSONDecodeError:
+        timestamp = ""
+      lines.append((timestamp, format_trace_line(path, raw_line)))
+  lines.sort(key=lambda item: item[0])
+  return [line for _, line in lines[-limit:]]
 
 
 def _tail_lines(path: Path, limit: int) -> list[str]:

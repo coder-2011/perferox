@@ -31,6 +31,14 @@ ERROR_CONSOLE = Console(stderr=True)
 CLOUD_CREDENTIAL_NAMES = ("LAMBDA_API_KEY", "RUNPOD_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
 
 
+def _positive_int(value: str) -> int:
+  """Parse one strictly positive command-line integer."""
+  parsed = int(value)
+  if parsed < 1:
+    raise argparse.ArgumentTypeError("must be at least 1")
+  return parsed
+
+
 def _select_cloud_environment(api_key: str) -> None:
   """Expose only the selected provider credentials in this agent process."""
   selected_environment = cloud_environment(api_key)
@@ -49,12 +57,13 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     subparser.add_argument("--trace-dir", default="traces")
     subparser.add_argument("--objective", required=True)
     subparser.add_argument("--cwd", default=".")
-    subparser.add_argument("--max-agents", type=int, default=3)
+    subparser.add_argument("--max-agents", type=_positive_int, default=3)
   subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
-  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "attempt-cap", "cloud-key-file"):
+  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "cloud-key-file"):
     subagent.add_argument(f"--{name}", required=True)
+  subagent.add_argument("--attempt-cap", type=_positive_int, required=True)
   args = parser.parse_args(argv)
 
   if args.command in ("launch-main", "main"):
@@ -114,6 +123,8 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"{MAIN_SESSION}-{int(time.time())}.jsonl"
     workspace = cwd / "sglang"
+    session_status = "exited"
+    session_error = ""
     try:
       with closing(db.connect(db_path)) as conn, conn:
         db.init_db(conn)
@@ -132,16 +143,26 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
         cwd=workspace, runtime_cwd=cwd, trace_dir=trace_dir, max_agents=args.max_agents,
       )
       state = {"objective": args.objective, "messages": []}
+      pending_notifications = []
       while True:
         for event in stream_with_trace(graph, state, trace_path):
           _collect_update(state, event)
+        if pending_notifications:
+          with closing(db.connect(db_path)) as conn:
+            db.acknowledge_main_notifications(conn, pending_notifications)
+          pending_notifications = []
         update = _wait_for_main_event(db_path, args.poll_s, api_key)
         if update is None:
           return 0
-        state.setdefault("messages", []).append(HumanMessage(content=update))
+        message, pending_notifications = update
+        state.setdefault("messages", []).append(HumanMessage(content=message))
+    except Exception as exc:
+      session_status = "failed"
+      session_error = f"{type(exc).__name__}: {exc}"
+      raise
     finally:
       with closing(db.connect(db_path)) as conn:
-        db.finish_agent_session(conn, session_name=MAIN_SESSION, status="exited")
+        db.finish_agent_session(conn, session_name=MAIN_SESSION, status=session_status, error=session_error)
 
   agent_id = int(args.agent_id)
   db_path = Path(args.db_path).resolve()
@@ -151,13 +172,15 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   api_key = read_cloud_key(args.cloud_key_file)
   provider = cloud_provider(api_key)
   _select_cloud_environment(api_key)
+  session_status = "exited"
+  session_error = ""
   try:
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       db.record_agent_session(conn, session_name=session_name, role="subagent", agent_id=agent_id, trace_ref=str(trace_path))
       if conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (session_name,)).fetchone()["status"] == "ending":
         return 0
-    attempt_cap = int(args.attempt_cap)
+    attempt_cap = args.attempt_cap
     if provider == "modal":
       create_prompt = MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
       create_tools = (create_modal_sandbox(registry, f"agent-{agent_id}", db_path, agent_id),)
@@ -176,14 +199,23 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     for _ in stream_with_trace(graph, state, trace_path):
       pass
     return 0
+  except Exception as exc:
+    session_status = "failed"
+    session_error = f"{type(exc).__name__}: {exc}"
+    raise
   finally:
     try:
       registry.close(f"agent-{agent_id}")
     finally:
-      cleanup_cloud_resource(db_path, agent_id)
+      cleanup_error = cleanup_cloud_resource(db_path, agent_id)
+      if cleanup_error:
+        session_status = "failed"
+        session_error = cleanup_error
       with closing(db.connect(db_path)) as conn:
-        if db.finish_agent_session(conn, session_name=session_name, status="exited"):
-          db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux exited; trace {trace_path.name}")
+        abandoned_error = session_error or "worker exited before benchmark completion"
+        db.fail_unfinished_runs(conn, agent_id=agent_id, error=abandoned_error)
+        if db.finish_agent_session(conn, session_name=session_name, status=session_status, error=session_error):
+          db.append_explorer_state(conn, agent_id=agent_id, line=f"agent-{agent_id} tmux {session_status}; trace {trace_path.name}")
 
 
 def _collect_update(state: dict, event: object) -> None:
@@ -196,13 +228,13 @@ def _collect_update(state: dict, event: object) -> None:
     state.update((key, value) for key, value in update.items() if key != "messages")
 
 
-def _wait_for_main_event(db_path: Path, poll_s: float, cloud_api_key: str | None = None) -> str | None:
+def _wait_for_main_event(db_path: Path, poll_s: float, cloud_api_key: str | None = None) -> tuple[str, list[int]] | None:
   """Wait for a main-agent wakeup or a human End request."""
   previous_running = None
   while True:
     with closing(db.connect(db_path)) as conn:
       main_row = conn.execute("SELECT status FROM agent_sessions WHERE session_name = ?", (MAIN_SESSION,)).fetchone()
-      notifications = db.take_main_notifications(conn)
+      notifications = db.read_main_notifications(conn)
       missing = refresh_sessions(conn)
       active_rows = conn.execute("SELECT session_name, agent_id, trace_ref FROM agent_sessions WHERE status IN ('running', 'ending') AND role = 'subagent'").fetchall()
       ending = main_row is not None and main_row["status"] == "ending"
@@ -223,22 +255,24 @@ def _wait_for_main_event(db_path: Path, poll_s: float, cloud_api_key: str | None
         continue
       return None
     if notifications and not ending:
-      return "Subagent SQLite write notifications:\n" + "\n".join(
+      message = "Subagent SQLite write notifications:\n" + "\n".join(
         f"{'ANOMALY ' if row['kind'] == 'anomaly_logged' else ''}notification_id={row['notification_id']} "
         f"kind={row['kind']} agent_id={row['agent_id']} run_id={row['run_id']} table={row['table_name']}\n{row['row_json']}"
         for row in notifications
       )
+      return message, [row["notification_id"] for row in notifications]
     if missing:
-      return "Tmux session update:\n" + "\n".join(missing)
+      return "Tmux session update:\n" + "\n".join(missing), []
     if ending:
       time.sleep(poll_s)
       continue
     running = {row["session_name"] for row in active_rows}
     if previous_running is not None and running != previous_running:
-      return "Tmux session update:\nsubagent tmux sessions changed" if running else "Tmux session update:\nall subagent tmux sessions completed"
+      message = "Tmux session update:\nsubagent tmux sessions changed" if running else "Tmux session update:\nall subagent tmux sessions completed"
+      return message, []
     if not running:
       time.sleep(poll_s)
-      return "No active subagents are running. Continue exploration from the objective and ExplorerState."
+      return "No active subagents are running. Continue exploration from the objective and ExplorerState.", []
     previous_running = running
     time.sleep(poll_s)
 

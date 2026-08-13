@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -15,10 +16,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from lambda_labs import main as lambda_main
 from lambda_labs import request as lambda_request
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
+from modal.stream_type import StreamType
 from pydantic import ValidationError
 
 from perferox import db
@@ -37,7 +40,7 @@ from perferox.tools import (
   provider_cli,
   sglang_bench_serving,
 )
-from perferox.tui import request_end
+from perferox.tui import launch_main, request_end
 
 
 @dataclass(slots=True)
@@ -48,7 +51,7 @@ class FakeRemoteSession:
   result: RemoteResult
   commands: list[str] = field(default_factory=list)
 
-  def run(self, command: str, *, timeout_s: float | None = None) -> RemoteResult:
+  def run(self, command: str, *, timeout_s: float = 30.0) -> RemoteResult:
     """Return the configured remote result."""
     self.commands.append(command)
     return self.result
@@ -128,7 +131,7 @@ class BenchmarkContractTests(unittest.TestCase):
       num_prompts=8,
       request_rate=2.5,
       extra_request_body={"mode": "stress", "seed": 7},
-      header={"x-trace": "perferox"},
+      header={"x-trace": "perferox", "accept": "json"},
       timeout_s=12.0,
     )
     argv = bench_serving_argv(args)
@@ -138,9 +141,12 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertIn("--cache-report", argv)
     self.assertEqual(argv[argv.index("--num-prompts") + 1], "8")
     self.assertEqual(argv[argv.index("--extra-request-body") + 1], '{"mode":"stress","seed":7}')
-    self.assertEqual(argv[argv.index("--header") + 1], "x-trace=perferox")
+    header_index = argv.index("--header")
+    self.assertEqual(argv[header_index + 1:header_index + 3], ["accept=json", "x-trace=perferox"])
     self.assertNotIn("--timeout-s", argv)
     self.assertNotIn("--server-command", argv)
+    equivalent = args.model_copy(update={"extra_request_body": {"seed": 7, "mode": "stress"}, "header": {"accept": "json", "x-trace": "perferox"}})
+    self.assertEqual(bench_serving_argv(equivalent), argv)
 
     with self.assertRaises(ValidationError):
       BenchServingArgs(
@@ -186,6 +192,11 @@ class LambdaLabsTests(unittest.TestCase):
     self.assertEqual(request.get_header("Accept"), "application/json")
     self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
     self.assertEqual(request.data, b'{"quantity":1}')
+
+  def test_termination_requires_provider_confirmation(self) -> None:
+    """Do not report success when Lambda leaves the requested instance live."""
+    with patch.dict(os.environ, {"LAMBDA_API_KEY": "test-key"}), patch("lambda_labs.request", return_value={"terminated_instances": []}):
+      self.assertEqual(lambda_main(["rm", "instance-1"]), 1)
 
 
 class HostStateTests(DatabaseTestCase):
@@ -266,18 +277,18 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', succeeded)
 
   def test_experiment_logging_similarity_and_anomalies(self) -> None:
-    """Check metric validation, normalization, similarity order, and anomalies."""
-    with self.assertRaisesRegex(ValueError, "no unfinished successful benchmark run"):
-      db.log_experiment(self.conn, agent_id=3, intent_key="no run")
+    """Bind intent to explicit successful runs and their host-owned metrics."""
+    with self.assertRaisesRegex(ValueError, "unknown, unsuccessful, or annotated run"):
+      db.log_experiment(self.conn, agent_id=3, run_id=0, intent_key="no run")
 
-    db.start_benchmark_run(self.conn, agent_id=3, command="valid benchmark")
-    with self.assertRaisesRegex(ValueError, "unknown metric columns"):
-      db.log_experiment(self.conn, agent_id=3, intent_key="bad metric", metrics={"made_up_metric": 1.0})
+    first_run = db.start_benchmark_run(self.conn, agent_id=3, command="valid benchmark")
+    db.mark_run_succeeded(self.conn, agent_id=3, run_id=first_run, metrics={"cache_hit_rate": 0.75, "error_rate": 0.25})
+    second_run = db.start_benchmark_run(self.conn, agent_id=3, command="scheduler benchmark")
+    db.mark_run_succeeded(self.conn, agent_id=3, run_id=second_run, metrics={})
 
     with patch.object(db, "embed_intent", side_effect=([1.0, 0.0], [0.0, 1.0], [0.9, 0.1])):
-      db.log_experiment(self.conn, agent_id=3, intent_key="CUDA cache throughput", metrics={"cache_hit_rate": 75, "error_rate": 25})
-      db.start_benchmark_run(self.conn, agent_id=3, command="scheduler benchmark")
-      db.log_experiment(self.conn, agent_id=3, intent_key="scheduler tail latency")
+      db.log_experiment(self.conn, agent_id=3, run_id=first_run, intent_key="CUDA cache throughput")
+      db.log_experiment(self.conn, agent_id=3, run_id=second_run, intent_key="scheduler tail latency")
       matches = db.find_similar_experiments(self.conn, "cache-ish intent", limit=2)
 
     anomaly_id = db.log_anomaly(self.conn, agent_id=3, run_id=0, summary="cache-hit collapse on MI250")
@@ -319,6 +330,12 @@ class ToolAndExperimentTests(DatabaseTestCase):
     registry.add(FakeRemoteSession("agent-10", RemoteResult(exit_status=0, stdout="Request throughput (req/s): 12.0", stderr="")))
     model = ToolBindingFakeModel(responses=[
       AIMessage(content="pod ready"),
+      AIMessage(content="", tool_calls=[{
+        "name": "remote_terminal",
+        "args": {"command": "python -m sglang.benchmark.serving --num-prompts 999"},
+        "id": "raw-benchmark-call",
+        "type": "tool_call",
+      }]),
       AIMessage(content="setup_ready: commit"),
       AIMessage(content="", tool_calls=[{
         "name": "sglang_bench_serving",
@@ -327,14 +344,8 @@ class ToolAndExperimentTests(DatabaseTestCase):
         "type": "tool_call",
       }]),
       AIMessage(content="", tool_calls=[{
-        "name": "remote_terminal",
-        "args": {"command": "echo should-not-run"},
-        "id": "remote-call",
-        "type": "tool_call",
-      }]),
-      AIMessage(content="", tool_calls=[{
         "name": "log_experiment",
-        "args": {"intent_key": "single capped run", "metrics": {"request_rps": 12.0}},
+        "args": {"run_id": 0, "intent_key": "single capped run"},
         "id": "log-call",
         "type": "tool_call",
       }]),
@@ -367,6 +378,9 @@ class ToolAndExperimentTests(DatabaseTestCase):
 
     tool = provider_cli("runpod", self.db_path, 11)
     refused = tool.invoke({"arguments": ["template", "delete", "shared-template"]})
+    null_id = subprocess.CompletedProcess([], 0, stdout='{"id":null}\n', stderr="")
+    with patch("perferox.tools.subprocess.run", return_value=null_id):
+      unidentified = tool.invoke({"arguments": ["pod", "create", "--image", "image", "--gpu-id", "H100"]})
     with patch("perferox.tools.subprocess.run", side_effect=[created, failed_cleanup]) as run:
       output = tool.invoke({"arguments": ["pod", "create", "--image", "image", "--gpu-id", "H100"]})
       cleanup = cleanup_cloud_resource(self.db_path, 11, "secret")
@@ -374,6 +388,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     resource = self.conn.execute("SELECT * FROM agent_sessions WHERE agent_id = 11").fetchone()
     self.assertIn("resource_id=pod-123", output)
     self.assertIn("refused", refused)
+    self.assertIn("could not identify", unidentified)
     self.assertIn("temporary provider error", cleanup)
     self.assertEqual(resource["resource_id"], "pod-123")
     self.assertEqual(run.call_args_list[1].args[0], ["runpodctl", "pod", "delete", "pod-123"])
@@ -391,8 +406,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertEqual(cloud_environment(cloud_key), {"MODAL_TOKEN_ID": "ak-test", "MODAL_TOKEN_SECRET": "as-test"})
 
     process = MagicMock()
-    process.stdout.read.return_value = "gpu ready\n"
-    process.stderr.read.return_value = ""
+    process.stdout = ["gpu ready\n"]
     process.wait.return_value = 0
     sandbox = MagicMock(object_id="sb-123")
     sandbox.exec.return_value = process
@@ -439,7 +453,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
       readiness_probe=readiness_probe,
     )
     sandbox.wait_until_ready.assert_called_once_with(timeout=MODAL_READY_TIMEOUT_S)
-    sandbox.exec.assert_called_once_with("bash", "-lc", "nvidia-smi", timeout=7)
+    sandbox.exec.assert_called_once_with("bash", "-lc", "nvidia-smi", timeout=7, stderr=StreamType.STDOUT)
     load_sandbox.assert_called_once_with("sb-123")
     sandbox.detach.assert_called_once_with()
     recovered_sandbox.terminate.assert_called_once_with(wait=True)
@@ -486,12 +500,23 @@ class TUIWiringTests(DatabaseTestCase):
     db.start_benchmark_run(self.conn, agent_id=0, command="bench cache")
     db.log_anomaly(self.conn, agent_id=0, run_id=0, summary="cache pressure anomaly")
 
-    snapshot = read_dashboard(self.db_path, trace_limit=10)
+    with patch("perferox.status.shutil.which", return_value=None):
+      snapshot = read_dashboard(self.db_path, trace_limit=10)
     delivered = self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"]
-    db.take_main_notifications(self.conn)
+    alive = subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\nperferox-agent-0\n", stderr="")
+    with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", return_value=alive):
+      notification_update = _wait_for_main_event(self.db_path, poll_s=0)
+    message, notification_ids = notification_update
+    self.assertIn("run_started", message)
+    self.assertIsNone(self.conn.execute("SELECT delivered_at FROM main_notifications ORDER BY notification_id LIMIT 1").fetchone()["delivered_at"])
+    db.acknowledge_main_notifications(self.conn, notification_ids)
     with patch("perferox.status.shutil.which", return_value="tmux"), patch("perferox.status.subprocess.run", side_effect=[subprocess.CompletedProcess([], 0, stdout=f"{MAIN_SESSION}\n", stderr=""), subprocess.CompletedProcess([], 1)]):
       stopped = request_end(self.db_path)
       update = _wait_for_main_event(self.db_path, poll_s=0)
+
+    launched = subprocess.CompletedProcess([], 0, stdout="started", stderr="")
+    with patch("perferox.tui.subprocess.run", return_value=launched) as run:
+      launch_main(self.tempdir.name, self.db_path, Path(self.tempdir.name) / "traces", "objective", "secret")
 
     trace_text = "\n".join(snapshot.trace_lines)
     tail_lines = read_trace_tail([str(trace_path)], 5)
@@ -504,12 +529,13 @@ class TUIWiringTests(DatabaseTestCase):
     self.assertEqual(subagent["run_count"], 1)
     self.assertEqual(snapshot.anomalies[0]["summary"], "cache pressure anomaly")
     self.assertIn("cache pressure 29", trace_text)
-    self.assertIn("explorer saw cache pressure", trace_text)
     self.assertIsNone(delivered)
     self.assertIn("cache pressure 25", tail_lines[0])
     self.assertIn("cache pressure 29", tail_lines[-1])
     self.assertEqual(stopped, 2)
     self.assertIsNone(update)
+    self.assertIn("worker tmux session disappeared", self.run_row(agent_id=0)["error"])
+    self.assertEqual(run.call_args.args[0][0], sys.executable)
 
 
 if __name__ == "__main__":

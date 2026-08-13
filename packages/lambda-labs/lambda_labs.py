@@ -14,6 +14,14 @@ from rich.table import Table
 API_URL = "https://cloud.lambda.ai/api/v1"
 
 
+def positive_int(value: str) -> int:
+  """Parse one strictly positive command-line integer."""
+  parsed = int(value)
+  if parsed < 1:
+    raise argparse.ArgumentTypeError("must be at least 1")
+  return parsed
+
+
 def request(method: str, path: str, body: dict | None = None):
   """Send one authenticated Lambda Cloud request."""
   data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
@@ -44,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
   up.add_argument("instance_type")
   up.add_argument("--region", required=True)
   up.add_argument("--key", required=True, help="registered SSH key name")
-  up.add_argument("--count", type=int, default=1)
+  up.add_argument("--count", type=positive_int, default=1)
   rm = commands.add_parser("rm", help="terminate instances")
   rm.add_argument("instance_ids", nargs="+")
   commands.add_parser("ls", help="list running instances")
@@ -68,7 +76,12 @@ def main(argv: list[str] | None = None) -> int:
       ids = request("POST", "instance-operations/launch", body)["instance_ids"]
       console.print(f"[green]launched[/] {', '.join(ids)}")
     elif args.command == "rm":
-      request("POST", "instance-operations/terminate", {"instance_ids": args.instance_ids})
+      result = request("POST", "instance-operations/terminate", {"instance_ids": args.instance_ids})
+      terminated = result.get("terminated_instances", [])
+      terminated_ids = {item.get("id") if isinstance(item, dict) else item for item in terminated}
+      missing = [instance_id for instance_id in args.instance_ids if instance_id not in terminated_ids]
+      if missing:
+        raise RuntimeError(f"Lambda did not confirm termination: {', '.join(missing)}")
       console.print(f"[green]terminated[/] {', '.join(args.instance_ids)}")
     elif args.command == "ls":
       instances = request("GET", "instances")

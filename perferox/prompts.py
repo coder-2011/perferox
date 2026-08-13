@@ -81,7 +81,7 @@ BENCHMARK_SYSTEM_PROMPT = SUBAGENT_SYSTEM_PROMPT + """\
 Current phase: run useful benchmark experiments against the exact target commit
 within the given goal.
 Real benchmark runs must go through the benchmark tool, not raw shell. Use raw
-commands only for inspection or harmless setup checks.
+commands only during the earlier setup phase.
 
 Log every useful completed run through the experiment logging tool. Log weird,
 surprising, or human-interesting behavior through the anomaly logging tool. You

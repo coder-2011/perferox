@@ -27,6 +27,14 @@ DIM = "#928374"
 STATUS_STYLES = {"running": "green", "ok": "green", "ending": "yellow", "warn": "yellow", "failed": "red", "fail": "red", "exited": DIM, "missing": "red", "idle": DIM}
 
 
+def _positive_int(value: str) -> int:
+  """Parse one strictly positive command-line integer."""
+  parsed = int(value)
+  if parsed < 1:
+    raise argparse.ArgumentTypeError("must be at least 1")
+  return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
   """Route the TUI, agent lifecycle, status, logs, login, and diagnostics."""
   parser = argparse.ArgumentParser(prog="perferox", description="Agentic benchmark explorer for SGLang")
@@ -38,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
   run_parser = subparsers.add_parser("run", help="start the main graph without opening the TUI")
   run_parser.add_argument("objective", nargs="+", help="objective for the main agent")
   run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
-  run_parser.add_argument("--max-agents", type=int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
+  run_parser.add_argument("--max-agents", type=_positive_int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
   login_parser = subparsers.add_parser("login", help="authenticate an LLM provider through OAuth")
   login_parser.add_argument("provider", nargs="?", choices=tuple(OAUTH_MODELS), help="OAuth provider; prompts when omitted")
@@ -100,7 +108,6 @@ def _login(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace, cwd: Path, db_path: Path, trace_dir: Path) -> int:
   """Validate credentials and launch the tmux-wrapped main agent."""
-  assert args.max_agents >= 1
   from perferox.process_host import main as run_agent
 
   objective = " ".join(args.objective)

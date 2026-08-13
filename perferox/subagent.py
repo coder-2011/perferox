@@ -123,22 +123,21 @@ def build_subagent_graph(
       attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     return stopped, int(attempts)
 
-  def benchmark_command_guard() -> str | None:
-    """Refuse arbitrary remote work after stop or the final benchmark attempt."""
-    stopped, attempts = runtime_status()
+  def setup_command_guard(command: str) -> str | None:
+    """Keep setup shell access from bypassing the structured benchmark path."""
+    stopped, _ = runtime_status()
     if stopped:
-      return "stop requested; log pending results or wrap up"
-    if attempts >= attempt_cap:
-      return f"attempt cap reached ({attempts}/{attempt_cap}); log pending results or wrap up"
+      return "stop requested; wrap up"
+    if "sglang.benchmark.serving" in command or "sglang.bench_serving" in command:
+      return "benchmarks must use sglang_bench_serving"
     return None
 
   create_pod_tools = list(create_pod_tools)
   if connect_with_ssh:
     create_pod_tools.append(connect_remote_session(session_registry, session_id))
-  setup_tools = [*setup_tools, remote_terminal(session_registry, session_id)]
+  setup_tools = [*setup_tools, remote_terminal(session_registry, session_id, setup_command_guard)]
   benchmark_tools = [
     *benchmark_tools,
-    remote_terminal(session_registry, session_id, benchmark_command_guard),
     sglang_bench_serving(
       session_registry,
       session_id,
@@ -188,11 +187,16 @@ def build_subagent_graph(
     return "basic_setup"
 
   def route_after_benchmark(state: SubagentState) -> Literal["benchmark_tools", "wrap_up"]:
-    """Keep benchmarking until the started-attempt cap is reached."""
+    """Allow only result logging after stop or the final started attempt."""
     last_message = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
-      return "benchmark_tools"
-    return "wrap_up"
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if not tool_calls:
+      return "wrap_up"
+    stopped, attempts = runtime_status()
+    logging_tools = {"log_experiment", "log_anomaly"}
+    if (stopped or attempts >= attempt_cap) and any(call.get("name") not in logging_tools for call in tool_calls):
+      return "wrap_up"
+    return "benchmark_tools"
 
   def wrap_up(state: SubagentState) -> dict[str, Any]:
     """Generate and notify the main agent with a final worker summary."""

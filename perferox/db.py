@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -17,21 +16,28 @@ _METRIC_COLUMN_SET = set(METRIC_COLUMNS)
 _METRIC_COLUMNS_SQL = ", ".join(METRIC_COLUMNS)
 _METRIC_PLACEHOLDERS_SQL = ", ".join("?" for _ in METRIC_COLUMNS)
 _METRIC_SELECT_SQL = ", ".join(f"e.{column}" for column in METRIC_COLUMNS)
-_RATE_COLUMNS = {"error_rate", "cache_hit_rate"}
-
-
-def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
+def connect(path: str | Path, *, readonly: bool = False, immutable: bool = False) -> sqlite3.Connection:
   """Open one SQLite connection for a worker or tool call."""
+  if immutable and not readonly:
+    raise ValueError("immutable connections must be read-only")
   if readonly:
-    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    immutable_param = "&immutable=1" if immutable else ""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + f"?mode=ro{immutable_param}", uri=True)
   else:
     conn = sqlite3.connect(path)
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys = ON")
   conn.execute("PRAGMA busy_timeout = 5000")
-  mode_pragma = "PRAGMA query_only = ON" if readonly else "PRAGMA journal_mode = WAL"
+  mode_pragma = "PRAGMA query_only = ON" if readonly else f"PRAGMA journal_mode = {'WAL' if _wal_is_safe() else 'DELETE'}"
   conn.execute(mode_pragma)
   return conn
+
+
+def _wal_is_safe() -> bool:
+  """Return whether the linked SQLite contains the WAL-reset corruption fix."""
+  version = sqlite3.sqlite_version_info
+  backport = (3, 44, 6) <= version < (3, 45, 0) or (3, 50, 7) <= version < (3, 51, 0)
+  return backport or version >= (3, 51, 3)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -41,7 +47,7 @@ def init_db(conn: sqlite3.Connection) -> None:
   # Existing pre-beta databases need the new text fields added in place.
   for table, names in (
     ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
-    ("agent_sessions", ("provider", "resource_id")),
+    ("agent_sessions", ("provider", "resource_id", "error")),
   ):
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name in names:
@@ -58,9 +64,10 @@ def embed_intent(intent_key: str) -> list[float]:
   return list(map(float, _EMBEDDER.encode(intent_key, normalize_embeddings=True)))
 
 
-def read_explorer_state(conn: sqlite3.Connection) -> list[str]:
-  """Return compact ExplorerState lines in insertion order."""
-  return [row["line"] for row in conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id")]
+def read_explorer_state(conn: sqlite3.Connection, limit: int = 200) -> list[str]:
+  """Return the latest compact ExplorerState lines in insertion order."""
+  rows = conn.execute("SELECT line FROM explorer_state_lines ORDER BY line_id DESC LIMIT ?", (limit,)).fetchall()
+  return [row["line"] for row in reversed(rows)]
 
 
 def append_explorer_state(conn: sqlite3.Connection, *, agent_id: int | None, line: str) -> int:
@@ -82,16 +89,22 @@ def record_agent_session(conn: sqlite3.Connection, *, session_name: str, role: s
         role = excluded.role,
         agent_id = excluded.agent_id,
         status = CASE WHEN agent_sessions.status = 'ending' OR (agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed')) THEN agent_sessions.status ELSE 'running' END,
-        trace_ref = excluded.trace_ref
+        trace_ref = excluded.trace_ref,
+        error = CASE WHEN agent_sessions.role = 'subagent' AND agent_sessions.status IN ('exited', 'failed') THEN agent_sessions.error ELSE '' END
       """,
       (session_name, role, agent_id, trace_ref),
     )
 
 
-def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str, trace_ref: str | None = None) -> bool:
-  """Mark a tmux-wrapped agent process as exited or missing."""
+def finish_agent_session(conn: sqlite3.Connection, *, session_name: str, status: str, trace_ref: str | None = None, error: str = "") -> bool:
+  """Mark a tmux-wrapped agent process terminal with a bounded diagnosis."""
+  if status not in {"exited", "failed", "missing"}:
+    raise ValueError(f"invalid terminal agent status: {status}")
   with conn:
-    return conn.execute("UPDATE agent_sessions SET status = ? WHERE session_name = ? AND status IN ('running', 'ending') AND (? IS NULL OR trace_ref = ?)", (status, session_name, trace_ref, trace_ref)).rowcount == 1
+    return conn.execute(
+      "UPDATE agent_sessions SET status = ?, error = ? WHERE session_name = ? AND status IN ('running', 'ending') AND (? IS NULL OR trace_ref = ?)",
+      (status, error[:2000], session_name, trace_ref, trace_ref),
+    ).rowcount == 1
 
 
 def request_agent_end(conn: sqlite3.Connection, *, session_name: str) -> bool:
@@ -138,16 +151,25 @@ def reserve_subagent(conn: sqlite3.Connection, *, active_cap: int, minimum_id: i
   return agent_id
 
 
-def take_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
-  """Return unread write notifications and mark them delivered."""
+def read_main_notifications(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+  """Return unread write notifications without acknowledging them."""
+  return conn.execute(
+    "SELECT * FROM main_notifications WHERE delivered_at IS NULL ORDER BY notification_id LIMIT ?",
+    (limit,),
+  ).fetchall()
+
+
+def acknowledge_main_notifications(conn: sqlite3.Connection, notification_ids: list[int]) -> None:
+  """Acknowledge notifications only after the coordinator processes them."""
+  if not notification_ids:
+    return
   delivered_at = datetime.now(UTC).isoformat(timespec="seconds")
+  placeholders = ",".join("?" for _ in notification_ids)
   with conn:
-    rows = conn.execute(
-      "UPDATE main_notifications SET delivered_at = ? WHERE notification_id IN "
-      "(SELECT notification_id FROM main_notifications WHERE delivered_at IS NULL ORDER BY notification_id LIMIT ?) RETURNING *",
-      (delivered_at, limit),
-    ).fetchall()
-  return sorted(rows, key=lambda row: row["notification_id"])
+    conn.execute(
+      f"UPDATE main_notifications SET delivered_at = ? WHERE delivered_at IS NULL AND notification_id IN ({placeholders})",
+      (delivered_at, *notification_ids),
+    )
 
 
 def notify_main(
@@ -248,76 +270,71 @@ def mark_run_failed(conn: sqlite3.Connection, *, agent_id: int, run_id: int, err
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
   with conn:
     row = conn.execute(
-      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ? RETURNING *",
+      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL RETURNING *",
       (finished_at, error[:2000], agent_id, run_id),
     ).fetchone()
+    if row is None:
+      raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_failed", table_name="runs", row=row)
 
 
-def log_experiment(
-  conn: sqlite3.Connection,
-  *,
-  agent_id: int,
-  intent_key: str,
-  metrics: Mapping[str, float | int | None] | None = None,
-) -> int:
-  """Atomically save benchmark metrics and mark the run successful."""
-  metrics = metrics or {}
+def mark_run_succeeded(conn: sqlite3.Connection, *, agent_id: int, run_id: int, metrics: Mapping[str, float]) -> None:
+  """Finish one successful run with canonical host-parsed metrics."""
   unknown = sorted(set(metrics) - _METRIC_COLUMN_SET)
   if unknown:
-    raise ValueError(f"unknown metric columns: {', '.join(unknown)}")
-  normalized_metrics = {}
-  for name, value in metrics.items():
-    if value is None:
-      continue
-    if isinstance(value, bool):
-      raise TypeError(f"{name} must be a finite number or null")
-    try:
-      normalized = float(value)
-    except (TypeError, ValueError):
-      raise TypeError(f"{name} must be a finite number or null") from None
-    if name in _RATE_COLUMNS and normalized > 1.0:
-      normalized /= 100.0
-    if not math.isfinite(normalized) or normalized < 0.0:
-      raise ValueError(f"{name} must be finite and >= 0")
-    if name in _RATE_COLUMNS and normalized > 1.0:
-      raise ValueError(f"{name} must normalize to a 0..1 rate")
-    normalized_metrics[name] = normalized
-
-  row = conn.execute(
-    """
-    SELECT run_id FROM runs
-    WHERE agent_id = ? AND finished_at IS NULL AND error = ''
-    ORDER BY run_id DESC
-    LIMIT 1
-    """,
-    (agent_id,),
-  ).fetchone()
-  if row is None:
-    raise ValueError(f"no unfinished successful benchmark run for agent_id={agent_id}")
-  run_id = int(row["run_id"])
-
-  values = [normalized_metrics.get(column) for column in METRIC_COLUMNS]
-  intent_embedding = embed_intent(intent_key)
+    raise ValueError(f"unknown host metric columns: {', '.join(unknown)}")
   finished_at = datetime.now(UTC).isoformat(timespec="seconds")
-
+  values = [metrics.get(column) for column in METRIC_COLUMNS]
   with conn:
-    # Claim the unfinished run and persist its experiment as one transaction.
     row = conn.execute(
       "UPDATE runs SET finished_at = ? WHERE agent_id = ? AND run_id = ? AND finished_at IS NULL RETURNING *",
       (finished_at, agent_id, run_id),
     ).fetchone()
     if row is None:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
-    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="runs", row=row)
-    row = conn.execute(
-      f"""
-      INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL})
-      VALUES (?, ?, ?, ?, {_METRIC_PLACEHOLDERS_SQL})
-      RETURNING *
-      """,
-      (agent_id, run_id, intent_key, json.dumps(intent_embedding, separators=(",", ":")), *values),
+    experiment = conn.execute(
+      f"INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL}) VALUES (?, ?, '', '', {_METRIC_PLACEHOLDERS_SQL}) RETURNING *",
+      (agent_id, run_id, *values),
     ).fetchone()
+    notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="experiments", row=experiment)
+
+
+def fail_unfinished_runs(conn: sqlite3.Connection, *, agent_id: int, error: str) -> int:
+  """Close every run abandoned by a terminal worker process."""
+  finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+  with conn:
+    rows = conn.execute(
+      "UPDATE runs SET finished_at = ?, error = ? WHERE agent_id = ? AND finished_at IS NULL RETURNING *",
+      (finished_at, error[:2000], agent_id),
+    ).fetchall()
+    for row in rows:
+      notify_main(conn, agent_id=agent_id, run_id=row["run_id"], kind="run_failed", table_name="runs", row=row)
+  return len(rows)
+
+
+def log_experiment(
+  conn: sqlite3.Connection,
+  *,
+  agent_id: int,
+  run_id: int,
+  intent_key: str,
+) -> int:
+  """Annotate one explicit successful run using its host-owned metrics."""
+  row = conn.execute(
+    "SELECT 1 FROM experiments WHERE agent_id = ? AND run_id = ? AND intent_key = ''",
+    (agent_id, run_id),
+  ).fetchone()
+  if row is None:
+    raise ValueError(f"unknown, unsuccessful, or annotated run: agent_id={agent_id} run_id={run_id}")
+  intent_embedding = embed_intent(intent_key)
+
+  with conn:
+    row = conn.execute(
+      "UPDATE experiments SET intent_key = ?, intent_embedding = ? WHERE agent_id = ? AND run_id = ? AND intent_key = '' RETURNING *",
+      (intent_key, json.dumps(intent_embedding, separators=(",", ":")), agent_id, run_id),
+    ).fetchone()
+    if row is None:
+      raise ValueError(f"unknown, unsuccessful, or annotated run: agent_id={agent_id} run_id={run_id}")
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="experiment_logged", table_name="experiments", row=row)
   return run_id
 
@@ -331,6 +348,7 @@ def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int =
       r.trace_ref, r.command, r.started_at, r.finished_at, r.error
     FROM experiments e
     JOIN runs r ON r.agent_id = e.agent_id AND r.run_id = e.run_id
+    WHERE e.intent_embedding != ''
     """
   ).fetchall()
   scored = []

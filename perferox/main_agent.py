@@ -17,7 +17,7 @@ from typing import Annotated, Literal, TypedDict
 
 import numpy as np
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -27,10 +27,12 @@ from langgraph.prebuilt import ToolNode
 from perferox import db
 from perferox.auth import write_cloud_key
 from perferox.status import refresh_sessions
-from perferox.tools import WEB_SEARCH_TOOL, run_local_command, search_files_tool
+from perferox.tools import WEB_SEARCH_TOOL, search_files_tool
 
 MAX_EXPLORER_LINE_CHARS = 120
 MAX_FILE_LINES = 240
+MAX_MODEL_TOKENS = 50000
+MAX_SEARCH_CHARS = 10000
 SQL_ROW_LIMIT = 100
 SUBAGENT_SESSION_PREFIX = "perferox-agent-"
 
@@ -42,7 +44,7 @@ read code, search docs, inspect SQLite, form hypotheses, and delegate bounded
 benchmark workers.
 
 Your repository root is a persistent full clone of upstream SGLang. Preserve
-existing edits and use normal Git operations when you need another branch.
+existing edits.
 
 ExplorerState is injected into your context every turn. Treat it as the compact
 map of explored territory. Add one short line when you learn something that
@@ -93,11 +95,6 @@ def build_main_agent_graph(
     conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND status = 'running' AND trace_ref = ''")
   document_index = None
 
-  @tool("bash", description="Run one local bash command from the repository root.")
-  def bash(command: str, timeout_s: float = 30.0) -> str:
-    """Run one shell command and return bounded output."""
-    return run_local_command(command, timeout_s, cwd=root)
-
   @tool("read_file", description="Read a repository file with optional 1-based line range.")
   def read_file(path: str, start_line: int = 1, line_count: int = MAX_FILE_LINES) -> str:
     """Read a bounded slice of one repository file."""
@@ -117,6 +114,34 @@ def build_main_agent_graph(
         return "\n".join(f"{line_number}: {line}" for line_number, line in enumerate(lines, start_line))
     except OSError as exc:
       return f"read_file failed: {type(exc).__name__}: {exc}"
+
+  @tool("search_text", description="Search for fixed text inside repository files.")
+  def search_text(query: str, path: str = ".") -> str:
+    """Run a bounded fixed-string ripgrep search inside the repository."""
+    if not query:
+      return "query must not be empty"
+    try:
+      search_root = (root / path).resolve()
+      search_root.relative_to(root)
+    except ValueError:
+      return f"path escapes repository root: {path}"
+    try:
+      result = subprocess.run(
+        ["rg", "--line-number", "--fixed-strings", "--", query, str(search_root)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+      )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+      return f"search_text failed: {type(exc).__name__}: {exc}"
+    if result.returncode == 1:
+      return "no matches"
+    if result.returncode != 0:
+      return f"search_text failed: {(result.stderr or result.stdout).strip()}"
+    if len(result.stdout) <= MAX_SEARCH_CHARS:
+      return result.stdout
+    return result.stdout[:MAX_SEARCH_CHARS] + "\n... search output elided ..."
 
   @tool("query_sql", description="Run read-only SQLite against the Perferox database and return rows when available.")
   def query_sql(query: str, row_limit: int = SQL_ROW_LIMIT) -> str:
@@ -143,7 +168,7 @@ def build_main_agent_graph(
       return "limit must be between 1 and 10"
     try:
       if document_index is None:
-        with closing(db.connect(Path(__file__).with_name("sglang_docs") / "perferox-docs.sqlite", readonly=True)) as conn:
+        with closing(db.connect(Path(__file__).with_name("sglang_docs") / "perferox-docs.sqlite", readonly=True, immutable=True)) as conn:
           rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
         documents = tuple((row["source"], row["title"], row["url"], row["text"]) for row in rows)
         document_index = documents, np.stack([np.asarray(json.loads(row["embedding"]), dtype=np.float32) for row in rows]) if rows else np.empty((0, 0), dtype=np.float32)
@@ -258,8 +283,8 @@ def build_main_agent_graph(
     return f"started agent_id={agent_id} repository={repository} commit={commit} attempt_cap={attempt_cap} session={session_name} trace={trace_path} attach='tmux attach -t {session_name}'"
 
   tools = [
-    bash,
     search_files_tool(root),
+    search_text,
     read_file,
     query_sql,
     query_sglang_docs,
@@ -270,7 +295,7 @@ def build_main_agent_graph(
     *extra_tools,
   ]
   # Native web search executes server-side and never enters the local ToolNode.
-  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=True)
+  bound_model = model.bind_tools([*tools, WEB_SEARCH_TOOL], parallel_tool_calls=False)
 
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""
@@ -281,7 +306,14 @@ def build_main_agent_graph(
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
     system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\nMax active subagents: {max_agents}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "") or "(none)"), *state.get("messages", [])]
+    messages = trim_messages(
+      [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "") or "(none)"), *state.get("messages", [])],
+      max_tokens=MAX_MODEL_TOKENS,
+      token_counter="approximate",
+      strategy="last",
+      start_on="human",
+      include_system=True,
+    )
     return {"messages": [bound_model.invoke(messages)]}
 
   def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
@@ -294,7 +326,7 @@ def build_main_agent_graph(
 
   graph = StateGraph(MainAgentState)
   graph.add_node("main", call_model)
-  graph.add_node("tools", ToolNode(tools, name="main_tools"))
+  graph.add_node("tools", ToolNode(tools, name="main_tools").with_config({"max_concurrency": 1}))
   graph.add_edge(START, "main")
   graph.add_conditional_edges("main", route_after_main)
   graph.add_edge("tools", "main")

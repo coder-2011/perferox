@@ -65,11 +65,11 @@ Before each model call, the coordinator receives:
 - the user objective
 - compact ExplorerState lines
 - recent tmux session rows
-- accumulated LangGraph messages
+- a bounded tail of LangGraph messages
 
 Its tools are:
 
-- `bash`, `read_file`, and `search_files` against the SGLang source root
+- `read_file`, `search_files`, and fixed-string `search_text` against the SGLang source root
 - read-only SQLite queries
 - semantic lookup over SGLang `doc_chunks`
 - semantic lookup over prior experiment intents
@@ -111,7 +111,7 @@ Worker tools are deliberately phase-scoped:
 | --- | --- |
 | create instance | provider discovery when available, one host-tracked resource, one registered remote session |
 | setup / intervention | remote shell over SSH or Modal Sandbox exec |
-| benchmark | remote shell, structured SGLang benchmark, log experiment, log anomaly |
+| benchmark | structured SGLang benchmark, log experiment intent, log anomaly |
 | wrap-up | write one summary notification to SQLite |
 
 The worker stores only its objective, messages, `agent_id`, and final summary in LangGraph state. Live SSH and Modal Sandbox handles stay in a host `SessionRegistry`, never in graph state or traces.
@@ -130,7 +130,8 @@ flowchart LR
   row --> remote["Execute remotely"]
   remote -->|"failed"| failed["Mark run failed"]
   remote -->|"succeeded"| parse["Parse benchmark metrics"]
-  parse --> experiment["Log experiment + intent embedding"]
+  parse --> finish["Finish run + save canonical metrics"]
+  finish --> experiment["Add intent embedding"]
   experiment --> anomaly["Optionally log anomaly"]
   failed --> notify["Notify main"]
   experiment --> notify
@@ -146,7 +147,7 @@ SQLite is the source of truth; prompts and message history are not bookkeeping s
 | Table | Purpose |
 | --- | --- |
 | `runs` | every started benchmark, full target/environment identity, timing, trace, and failure state |
-| `experiments` | successful normalized metrics plus human-readable intent and embedding |
+| `experiments` | host-parsed metrics plus a later human-readable intent and embedding |
 | `anomalies` | human-readable surprising behavior tied to a run |
 | `agent_sessions` | main/subagent process lifecycle plus its single active provider resource |
 | `main_notifications` | durable wakeups for run, experiment, anomaly, and summary events |
