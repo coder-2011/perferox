@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _EMBEDDER = None
+_SCHEMA_VERSION = 1
 
 METRIC_COLUMNS = ["request_rps", "input_tps", "output_tps", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "error_rate", "cache_hit_rate", "peak_gpu_mem_gb", "startup_s", "warmup_s", "accept_length", "correctness_score"]
 _METRIC_COLUMN_SET = set(METRIC_COLUMNS)
@@ -42,7 +43,10 @@ def _wal_is_safe() -> bool:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-  """Create every table and index declared by the schema."""
+  """Migrate the database to the current schema once per version."""
+  # Dashboard polls call this every second, so skip idempotent DDL after migration.
+  if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
+    return
   schema_path = Path(__file__).with_name("init-db.sql")
   conn.executescript(schema_path.read_text(encoding="utf-8"))
   # Existing pre-beta databases need the new text fields added in place.
@@ -54,6 +58,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     for name in names:
       if name not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+  conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
 def embed_intent(intent_key: str) -> list[float]:

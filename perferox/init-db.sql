@@ -57,4 +57,5 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_date ON anomalies(date);
 CREATE INDEX IF NOT EXISTS idx_explorer_state_lines_created_at ON explorer_state_lines(created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_main_notifications_delivered ON main_notifications(delivered_at, notification_id);
+CREATE INDEX IF NOT EXISTS idx_main_notifications_created_at ON main_notifications(created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_recent ON runs(started_at DESC, agent_id DESC, run_id DESC);
