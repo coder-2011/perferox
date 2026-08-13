@@ -5,6 +5,8 @@
 *.sqlite-*
 *.sqlite3-*
 *.egg-info/
+/build/
+/packages/lambda-labs/build/
 perferox-tui-demo.mp4
 PYPI.md
 /traces/
