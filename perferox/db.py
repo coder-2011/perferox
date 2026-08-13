@@ -48,17 +48,22 @@ def init_db(conn: sqlite3.Connection) -> None:
   if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
     return
   schema_path = Path(__file__).with_name("init-db.sql")
-  conn.executescript(schema_path.read_text(encoding="utf-8"))
-  # Existing pre-beta databases need the new text fields added in place.
-  for table, names in (
-    ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
-    ("agent_sessions", ("provider", "resource_id", "error")),
-  ):
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    for name in names:
-      if name not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
-  conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+  schema = schema_path.read_text(encoding="utf-8")
+  with conn:
+    # Start inside executescript so its implicit commit cannot release the migration lock.
+    conn.executescript(f"BEGIN IMMEDIATE;\n{schema}")
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
+      return
+    # Existing pre-beta databases need the new text fields added in place.
+    for table, names in (
+      ("runs", ("repository", "commit_hash", "provider", "server_command", "model_state")),
+      ("agent_sessions", ("provider", "resource_id", "error")),
+    ):
+      columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+      for name in names:
+        if name not in columns:
+          conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
 def embed_intent(intent_key: str) -> list[float]:

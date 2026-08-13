@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -201,6 +202,47 @@ class LambdaLabsTests(unittest.TestCase):
 
 class HostStateTests(DatabaseTestCase):
   """Protect deterministic SQLite-owned state transitions."""
+
+  def test_schema_migration_is_serialized(self) -> None:
+    """Keep concurrent legacy upgrades from adding the same column twice."""
+    legacy_path = Path(self.tempdir.name) / "legacy.sqlite"
+    with closing(sqlite3.connect(legacy_path)) as conn:
+      conn.executescript(
+        "CREATE TABLE runs(agent_id INTEGER, run_id INTEGER, started_at TEXT, PRIMARY KEY(agent_id, run_id));"
+        "CREATE TABLE agent_sessions(session_name TEXT PRIMARY KEY, status TEXT);"
+      )
+    first_paused = threading.Event()
+    second_alter = threading.Event()
+    release_first = threading.Event()
+
+    def migrate(worker: int) -> None:
+      """Pause the first legacy ALTER while another connection attempts migration."""
+      with closing(db.connect(legacy_path)) as conn:
+        def trace(sql: str) -> None:
+          """Expose whether both connections enter the same legacy ALTER."""
+          if not sql.startswith("ALTER TABLE runs ADD COLUMN repository"):
+            return
+          if worker == 0:
+            first_paused.set()
+            release_first.wait(2)
+          else:
+            second_alter.set()
+
+        conn.set_trace_callback(trace)
+        db.init_db(conn)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      first = pool.submit(migrate, 0)
+      self.assertTrue(first_paused.wait(2))
+      second = pool.submit(migrate, 1)
+      self.assertFalse(second_alter.wait(0.2))
+      release_first.set()
+      first.result()
+      second.result()
+
+    with closing(db.connect(legacy_path)) as conn:
+      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+      self.assertIn("repository", {row["name"] for row in conn.execute("PRAGMA table_info(runs)")})
 
   def test_run_ids_hash_caps_and_stop_are_host_owned(self) -> None:
     """Exercise run assignment, duplicate rejection, cap counting, and stop."""
