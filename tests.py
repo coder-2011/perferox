@@ -42,7 +42,7 @@ from perferox.tools import (
   search_files_tool,
   sglang_bench_serving,
 )
-from perferox.tui import launch_main, request_end
+from perferox.tui import launch_main, request_end, shutdown_perferox
 
 
 @dataclass(slots=True)
@@ -549,6 +549,13 @@ class ToolAndExperimentTests(DatabaseTestCase):
       registry.get("agent-13")
     sandbox.terminate.assert_called_once_with(wait=True)
     sandbox.detach.assert_called_once_with()
+
+  def test_modal_shutdown_stops_agents_and_sandboxes(self) -> None:
+    """Run both host-owned shutdown actions when Perferox closes."""
+    with patch("perferox.tui.request_end") as stop, patch("perferox.tools.cleanup_modal_sandboxes") as cleanup:
+      shutdown_perferox(self.db_path)
+    stop.assert_called_once_with(self.db_path)
+    cleanup.assert_called_once_with(self.db_path)
 
 
 class TUIWiringTests(DatabaseTestCase):

@@ -180,6 +180,9 @@ The End action changes running `agent_sessions` rows to `ending`. After that:
 - paid resources are terminated by the host on success, stop, or failure
 - the main process exits after no worker sessions remain
 
+Closing the TUI requests a stop and immediately terminates every Modal Sandbox
+still tracked in SQLite. Failed termination leaves the resource ID intact for retry.
+
 The host does not rely on a model voluntarily honoring the stop request, but we do encourage the agent to stop after we hit the cap
 
 ## Modules

@@ -32,6 +32,14 @@ def request_end(db_path: str | Path) -> int:
   return stopped
 
 
+def shutdown_perferox(db_path: str | Path) -> None:
+  """Stop active agents and terminate every tracked Modal Sandbox."""
+  request_end(db_path)
+  from perferox.tools import cleanup_modal_sandboxes
+
+  cleanup_modal_sandboxes(db_path)
+
+
 def launch_main(
   cwd: str | Path,
   db_path: str | Path,
@@ -139,6 +147,10 @@ class PerferoxTUI(App[None]):
     self.trace_dir.mkdir(parents=True, exist_ok=True)
     self.refresh_dashboard()
     self.set_interval(1.0, self.refresh_dashboard)
+
+  def on_unmount(self) -> None:
+    """Terminate tracked Modal Sandboxes when the dashboard closes."""
+    shutdown_perferox(self.db_path)
 
   def on_button_pressed(self, event: Button.Pressed) -> None:
     """Route button presses to launch or soft-stop actions."""

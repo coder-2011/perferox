@@ -346,6 +346,16 @@ def cleanup_cloud_resource(db_path: str | Path, agent_id: int, api_key: str | No
   return f"{provider} {resource_id}: {error}" if error else ""
 
 
+def cleanup_modal_sandboxes(db_path: str | Path) -> None:
+  """Terminate every Modal Sandbox still tracked by this Perferox database."""
+  with closing(db.connect(db_path, readonly=True)) as conn:
+    agent_ids = conn.execute(
+      "SELECT agent_id FROM agent_sessions WHERE provider = 'modal' AND resource_id != ''"
+    ).fetchall()
+  for row in agent_ids:
+    cleanup_cloud_resource(db_path, row["agent_id"])
+
+
 def _run_argv(argv: list[str], env: Mapping[str, str] | None = None) -> str:
   """Run one argv command without shell interpretation."""
   try:
