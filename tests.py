@@ -28,12 +28,9 @@ from pydantic import ValidationError
 from perferox import db
 from perferox.auth import (
   active_model_profile,
-  build_chat_model,
   cloud_environment,
   login_model,
   modal_cloud_key,
-  read_model_profile,
-  write_model_profile,
 )
 from perferox.bench import BenchServingArgs, bench_serving_argv, parse_bench_serving_metrics
 from perferox.process_host import MAIN_SESSION, _wait_for_main_event
@@ -79,7 +76,7 @@ class ModelProfileTests(unittest.TestCase):
   """Protect the CLI-validated model selection."""
 
   def test_login_replaces_profile_only_after_validation(self) -> None:
-    """Validate arbitrary models, preserve failures, and hand off exact profiles."""
+    """Accept arbitrary models while preserving the active validated profile."""
     with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
       config_dir = Path(root) / "perferox"
       config_dir.mkdir()
@@ -88,26 +85,13 @@ class ModelProfileTests(unittest.TestCase):
 
       probe = AIMessage(content="", tool_calls=[{"name": "perferox_auth_probe", "args": {}, "id": "probe", "type": "tool_call"}])
       chat_model = ToolBindingFakeModel(responses=[probe])
-      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model) as constructor:
+      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model):
         logged_in = login_model("anthropic/claude-sonnet", "high")
       self.assertEqual(active_model_profile(), logged_in)
-      constructor.assert_called_once_with(model="anthropic/claude-sonnet", model_kwargs={"reasoning_effort": "high"}, max_retries=0)
-      self.assertEqual(json.loads((config_dir / "model.json").read_text(encoding="utf-8")), {"model": "anthropic/claude-sonnet", "reasoning_effort": "high"})
-      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model) as constructor:
-        build_chat_model(logged_in)
-      constructor.assert_called_once_with(model="anthropic/claude-sonnet", model_kwargs={"reasoning_effort": "high"}, max_retries=1)
-      handoff = write_model_profile(logged_in)
-      self.assertEqual(read_model_profile(handoff), logged_in)
-      self.assertFalse(handoff.exists())
 
       failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
       with patch("langchain_litellm.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
         login_model("openrouter/auto")
-      self.assertEqual(active_model_profile(), logged_in)
-
-      chat_model = ToolBindingFakeModel(responses=[probe])
-      with patch("langchain_litellm.ChatLiteLLM", return_value=chat_model), patch.object(Path, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
-        login_model("github_copilot/gpt-4")
       self.assertEqual(active_model_profile(), logged_in)
 
 

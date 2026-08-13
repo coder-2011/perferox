@@ -18,14 +18,13 @@ from rich.text import Text
 
 from perferox import db
 from perferox.auth import (
+  ModelProfile,
   active_model_profile,
   build_chat_model,
   cloud_environment,
   cloud_provider,
   read_cloud_key,
-  read_model_profile,
   write_cloud_key,
-  write_model_profile,
 )
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT, MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
@@ -68,11 +67,13 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     subparser.add_argument("--cwd", default=".")
     subparser.add_argument("--max-agents", type=_positive_int, default=3)
   subparsers.choices["main"].add_argument("--cloud-key-file", required=True)
-  subparsers.choices["main"].add_argument("--model-profile-file", required=True)
+  subparsers.choices["main"].add_argument("--model", required=True)
+  subparsers.choices["main"].add_argument("--reasoning-effort", default="")
   subparsers.choices["main"].add_argument("--poll-s", type=float, default=5.0)
   subagent = subparsers.add_parser("subagent")
-  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "cloud-key-file", "model-profile-file"):
+  for name in ("agent-id", "db-path", "trace-path", "goal-file", "repository", "commit", "cloud-key-file", "model"):
     subagent.add_argument(f"--{name}", required=True)
+  subagent.add_argument("--reasoning-effort", default="")
   subagent.add_argument("--attempt-cap", type=_positive_int, required=True)
   args = parser.parse_args(argv)
 
@@ -97,11 +98,6 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     api_key = cloud_api_key or sys.stdin.read().strip()
     cloud_provider(api_key)
     key_path = write_cloud_key(api_key)
-    try:
-      profile_path = write_model_profile(profile)
-    except OSError:
-      key_path.unlink(missing_ok=True)
-      raise
     with closing(db.connect(db_path)) as conn:
       db.init_db(conn)
       # Register before tmux starts so an immediate End request cannot be lost.
@@ -113,20 +109,19 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
       "--objective", args.objective, "--cwd", str(cwd),
       "--max-agents", str(args.max_agents),
       "--cloud-key-file", str(key_path),
-      "--model-profile-file", str(profile_path),
+      "--model", profile.model,
+      "--reasoning-effort", profile.reasoning_effort or "",
     ])
     try:
       result = subprocess.run([tmux, "-L", TMUX_SOCKET, "new-session", "-d", "-s", MAIN_SESSION, "-c", str(cwd), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
     except OSError:
       # Delete a secret handoff that tmux never delivered.
       key_path.unlink(missing_ok=True)
-      profile_path.unlink(missing_ok=True)
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
       raise
     if result.returncode != 0:
       key_path.unlink(missing_ok=True)
-      profile_path.unlink(missing_ok=True)
       with closing(db.connect(db_path)) as conn:
         db.finish_agent_session(conn, session_name=MAIN_SESSION, status="missing")
     if result.returncode == 0:
@@ -137,7 +132,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
 
   if args.command == "main":
     api_key = read_cloud_key(args.cloud_key_file)
-    profile = read_model_profile(args.model_profile_file)
+    profile = ModelProfile(args.model, args.reasoning_effort)
     provider = cloud_provider(api_key)
     _select_cloud_environment(api_key)
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +186,7 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
   session_name = f"perferox-agent-{agent_id}"
   registry = SessionRegistry()
   api_key = read_cloud_key(args.cloud_key_file)
-  profile = read_model_profile(args.model_profile_file)
+  profile = ModelProfile(args.model, args.reasoning_effort)
   provider = cloud_provider(api_key)
   _select_cloud_environment(api_key)
   session_status = "exited"

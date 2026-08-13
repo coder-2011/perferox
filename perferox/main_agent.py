@@ -25,7 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from perferox import db
-from perferox.auth import ModelProfile, write_cloud_key, write_model_profile
+from perferox.auth import ModelProfile, write_cloud_key
 from perferox.status import TMUX_SOCKET, refresh_sessions
 from perferox.tools import WEB_SEARCH_TOOL, search_files_tool
 
@@ -243,18 +243,11 @@ def build_main_agent_graph(
     trace_path = traces / f"agent-{agent_id}.jsonl"
     goal_path = traces / f"agent-{agent_id}.goal.txt"
     session_name = f"{SUBAGENT_SESSION_PREFIX}{agent_id}"
-    key_path = None
-    profile_path = None
     try:
       trace_path.touch(exist_ok=False)
       goal_path.write_text(goal, encoding="utf-8")
       key_path = write_cloud_key(cloud_api_key)
-      profile_path = write_model_profile(model_profile)
     except OSError:
-      if key_path:
-        key_path.unlink(missing_ok=True)
-      if profile_path:
-        profile_path.unlink(missing_ok=True)
       with closing(db.connect(database)) as conn:
         db.finish_agent_session(conn, session_name=session_name, status="missing")
       raise
@@ -264,7 +257,8 @@ def build_main_agent_graph(
       "--trace-path", str(trace_path), "--goal-file", str(goal_path),
       "--repository", repository, "--commit", commit,
       "--cloud-key-file", str(key_path),
-      "--model-profile-file", str(profile_path),
+      "--model", model_profile.model,
+      "--reasoning-effort", model_profile.reasoning_effort or "",
       "--attempt-cap", str(attempt_cap),
     ])
     with closing(db.connect(database)) as conn, conn:
@@ -272,20 +266,17 @@ def build_main_agent_graph(
       conn.execute("BEGIN IMMEDIATE")
       if db.stop_requested(conn, agent_id=agent_id):
         key_path.unlink(missing_ok=True)
-        profile_path.unlink(missing_ok=True)
         conn.execute("UPDATE agent_sessions SET status = 'exited' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
         return "stop requested; subagent not launched"
       try:
         result = subprocess.run([tmux, "-L", TMUX_SOCKET, "new-session", "-d", "-s", session_name, "-c", str(runtime_root), "--", "bash", "-lc", command], text=True, capture_output=True, check=False)
       except OSError:
         key_path.unlink(missing_ok=True)
-        profile_path.unlink(missing_ok=True)
         conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
         conn.commit()
         raise
       if result.returncode != 0:
         key_path.unlink(missing_ok=True)
-        profile_path.unlink(missing_ok=True)
         conn.execute("UPDATE agent_sessions SET status = 'missing' WHERE role = 'subagent' AND agent_id = ?", (agent_id,))
         return f"subagent tmux launch failed: {(result.stderr or result.stdout).strip()}"
       conn.execute(

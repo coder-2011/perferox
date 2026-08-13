@@ -25,10 +25,8 @@ class ModelProfile:
     """Normalize and validate values before they reach LiteLLM."""
     model = self.model.strip()
     effort = self.reasoning_effort.strip() if self.reasoning_effort else None
-    if not model or any(character in model for character in "\r\n"):
-      raise ValueError("model must be one non-empty LiteLLM model name")
-    if effort and any(character in effort for character in "\r\n"):
-      raise ValueError("reasoning effort must be one non-empty value")
+    if not model:
+      raise ValueError("model must be a non-empty LiteLLM model name")
     object.__setattr__(self, "model", model)
     object.__setattr__(self, "reasoning_effort", effort)
 
@@ -124,19 +122,10 @@ def active_model_profile() -> ModelProfile | None:
   return ModelProfile(model) if model else None
 
 
-def active_model() -> str | None:
-  """Return the selected LiteLLM model name when configured."""
-  profile = active_model_profile()
-  return profile.model if profile else None
-
-
 def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile:
   """Validate and atomically save any LiteLLM-backed model profile."""
-  from langchain_litellm import ChatLiteLLM
-
   profile = ModelProfile(model, reasoning_effort)
-  model_kwargs = {"reasoning_effort": profile.reasoning_effort} if profile.reasoning_effort else {}
-  chat_model = ChatLiteLLM(model=profile.model, model_kwargs=model_kwargs, max_retries=0)
+  chat_model = build_chat_model(profile, max_retries=0)
   probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
   response = probe_model.invoke(f"Call {perferox_auth_probe.__name__} once with no arguments.")
   if not response.tool_calls:
@@ -149,29 +138,9 @@ def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile
   return profile
 
 
-def build_chat_model(profile: ModelProfile | None = None):
+def build_chat_model(profile: ModelProfile, *, max_retries: int = 1):
   """Build the selected LiteLLM model without starting authentication."""
-  profile = profile or active_model_profile()
-  if profile is None:
-    raise RuntimeError("LLM model is not configured; run `perferox login MODEL` first")
   from langchain_litellm import ChatLiteLLM
 
   model_kwargs = {"reasoning_effort": profile.reasoning_effort} if profile.reasoning_effort else {}
-  return ChatLiteLLM(model=profile.model, model_kwargs=model_kwargs, max_retries=1)
-
-
-def write_model_profile(profile: ModelProfile) -> Path:
-  """Write one mode-0600 model profile handoff for a detached process."""
-  with tempfile.NamedTemporaryFile("w", prefix="perferox-model-", delete=False) as file:
-    json.dump({"model": profile.model, "reasoning_effort": profile.reasoning_effort}, file, separators=(",", ":"))
-    return Path(file.name)
-
-
-def read_model_profile(path: str | Path) -> ModelProfile:
-  """Read and delete a one-use model profile handoff."""
-  profile_path = Path(path)
-  try:
-    data = json.loads(profile_path.read_text(encoding="utf-8"))
-    return ModelProfile(model=data["model"], reasoning_effort=data.get("reasoning_effort"))
-  finally:
-    profile_path.unlink(missing_ok=True)
+  return ChatLiteLLM(model=profile.model, model_kwargs=model_kwargs, max_retries=max_retries)
