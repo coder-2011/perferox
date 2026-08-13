@@ -126,11 +126,11 @@ def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile
   """Validate and atomically save one supported model profile."""
   profile = ModelProfile(model, reasoning_effort)
   if profile.model.startswith("chatgpt/"):
-    from langchain_openai.chatgpt_oauth import _ChatGPTOAuthRefreshError, _FileChatGPTOAuthTokenProvider, login_chatgpt
+    from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider, login_chatgpt
 
     try:
       _FileChatGPTOAuthTokenProvider.from_default_store().get_token()
-    except (FileNotFoundError, _ChatGPTOAuthRefreshError):
+    except (FileNotFoundError, RuntimeError):
       login_chatgpt()
   chat_model = build_chat_model(profile, max_retries=0)
   probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
