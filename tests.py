@@ -241,7 +241,7 @@ class HostStateTests(DatabaseTestCase):
       second.result()
 
     with closing(db.connect(legacy_path)) as conn:
-      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
       self.assertIn("repository", {row["name"] for row in conn.execute("PRAGMA table_info(runs)")})
 
   def test_run_ids_hash_caps_and_stop_are_host_owned(self) -> None:
@@ -319,7 +319,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', succeeded)
 
   def test_experiment_logging_similarity_and_anomalies(self) -> None:
-    """Bind intent to explicit successful runs and their host-owned metrics."""
+    """Batch pending intents after restart and search their packed vectors."""
     with self.assertRaisesRegex(ValueError, "unknown, unsuccessful, or annotated run"):
       db.log_experiment(self.conn, agent_id=3, run_id=0, intent_key="no run")
 
@@ -328,15 +328,23 @@ class ToolAndExperimentTests(DatabaseTestCase):
     second_run = db.start_benchmark_run(self.conn, agent_id=3, command="scheduler benchmark")
     db.mark_run_succeeded(self.conn, agent_id=3, run_id=second_run, metrics={})
 
-    with patch.object(db, "embed_intent", side_effect=([1.0, 0.0], [0.0, 1.0], [0.9, 0.1])):
-      db.log_experiment(self.conn, agent_id=3, run_id=first_run, intent_key="CUDA cache throughput")
-      db.log_experiment(self.conn, agent_id=3, run_id=second_run, intent_key="scheduler tail latency")
+    db.log_experiment(self.conn, agent_id=3, run_id=first_run, intent_key="CUDA cache throughput")
+    db.log_experiment(self.conn, agent_id=3, run_id=second_run, intent_key="scheduler tail latency")
+    pending = self.conn.execute("SELECT intent_embedding FROM experiments WHERE agent_id = 3 ORDER BY run_id").fetchall()
+    self.assertEqual([row["intent_embedding"] for row in pending], [b"", b""])
+
+    with patch.object(db, "_embed_intents", return_value=([1.0, 0.0], [0.0, 1.0])) as embed, closing(db.connect(self.db_path)) as coordinator_conn:
+      self.assertEqual(db.embed_pending_intents(coordinator_conn), 2)
+      self.assertEqual(db.embed_pending_intents(coordinator_conn), 0)
+    embed.assert_called_once_with(("CUDA cache throughput", "scheduler tail latency"))
+    with patch.object(db, "embed_intent", return_value=[0.9, 0.1]):
       matches = db.find_similar_experiments(self.conn, "cache-ish intent", limit=2)
 
     anomaly_id = db.log_anomaly(self.conn, agent_id=3, run_id=0, summary="cache-hit collapse on MI250")
     experiment = self.conn.execute("SELECT * FROM experiments WHERE agent_id = 3 AND run_id = 0").fetchone()
     anomaly = self.conn.execute("SELECT * FROM anomalies WHERE anomaly_id = ?", (anomaly_id,)).fetchone()
-    self.assertEqual(experiment["intent_embedding"], "[1.0,0.0]")
+    self.assertEqual(experiment["intent_embedding"], db._pack_embedding([1.0, 0.0]))
+    self.assertEqual(self.conn.execute("SELECT typeof(intent_embedding) FROM experiments WHERE agent_id = 3 AND run_id = 0").fetchone()[0], "blob")
     self.assertEqual(experiment["cache_hit_rate"], 0.75)
     self.assertEqual(experiment["error_rate"], 0.25)
     self.assertEqual([match["intent_key"] for match in matches], ["CUDA cache throughput", "scheduler tail latency"])
@@ -396,8 +404,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     ])
     graph = build_subagent_graph(model, 10, registry, self.db_path, "repo", "commit", attempt_cap=1)
 
-    with patch.object(db, "embed_intent", return_value=[1.0, 0.0]):
-      result = graph.invoke({"agent_id": 10, "objective": "benchmark goal", "messages": []})
+    result = graph.invoke({"agent_id": 10, "objective": "benchmark goal", "messages": []})
 
     run = self.run_row(agent_id=10)
     experiments = self.conn.execute("SELECT COUNT(*) FROM experiments WHERE agent_id = 10").fetchone()[0]

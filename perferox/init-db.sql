@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE TABLE IF NOT EXISTS experiments (
   agent_id INTEGER NOT NULL, run_id INTEGER NOT NULL,
-  intent_key TEXT NOT NULL, intent_embedding TEXT NOT NULL,
+  intent_key TEXT NOT NULL, intent_embedding BLOB NOT NULL,
   request_rps REAL, input_tps REAL, output_tps REAL,
   ttft_p50_ms REAL, ttft_p99_ms REAL, tpot_p50_ms REAL, tpot_p99_ms REAL,
   error_rate REAL, cache_hit_rate REAL, peak_gpu_mem_gb REAL,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS main_notifications (
 CREATE TABLE IF NOT EXISTS doc_chunks (
   doc_chunk_id INTEGER PRIMARY KEY, source TEXT NOT NULL, chunk_id TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
-  text TEXT NOT NULL, embedding TEXT NOT NULL, updated_at TEXT NOT NULL,
+  text TEXT NOT NULL, embedding BLOB NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(source, chunk_id)
 );
 

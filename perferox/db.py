@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import operator
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 _EMBEDDER = None
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 METRIC_COLUMNS = ["request_rps", "input_tps", "output_tps", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p99_ms", "error_rate", "cache_hit_rate", "peak_gpu_mem_gb", "startup_s", "warmup_s", "accept_length", "correctness_score"]
 _METRIC_COLUMN_SET = set(METRIC_COLUMNS)
@@ -63,16 +62,51 @@ def init_db(conn: sqlite3.Connection) -> None:
       for name in names:
         if name not in columns:
           conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+    # Pack legacy JSON vectors once so every similarity search can use one matrix.
+    for table, column in (("experiments", "intent_embedding"), ("doc_chunks", "embedding")):
+      rows = conn.execute(f"SELECT rowid, {column} FROM {table} WHERE typeof({column}) = 'text' AND {column} != ''").fetchall()
+      conn.executemany(
+        f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+        ((_pack_embedding(json.loads(row[column])), row["rowid"]) for row in rows),
+      )
+      conn.execute(f"UPDATE {table} SET {column} = X'' WHERE typeof({column}) = 'text' AND {column} = ''")
     conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
 def embed_intent(intent_key: str) -> list[float]:
   """Encode one intent with the process-wide normalized embedding model."""
+  return list(map(float, _embed_intents((intent_key,))[0]))
+
+
+def _embed_intents(intent_keys: Sequence[str]):
+  """Encode a batch through one process-wide normalized embedding model."""
   global _EMBEDDER
   if _EMBEDDER is None:
     from sentence_transformers import SentenceTransformer
     _EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-  return list(map(float, _EMBEDDER.encode(intent_key, normalize_embeddings=True)))
+  return _EMBEDDER.encode(intent_keys, normalize_embeddings=True)
+
+
+def _pack_embedding(embedding: object) -> bytes:
+  """Pack one embedding as portable little-endian float32 bytes."""
+  import numpy as np
+
+  vector = np.asarray(embedding, dtype="<f4")
+  if vector.ndim != 1:
+    raise ValueError("embedding must be one-dimensional")
+  return vector.tobytes()
+
+
+def embedding_matrix(embeddings: Sequence[bytes]):
+  """View equally sized packed embeddings as one float32 matrix."""
+  import numpy as np
+
+  if not embeddings:
+    return np.empty((0, 0), dtype=np.float32)
+  row_bytes = len(embeddings[0])
+  if not row_bytes or row_bytes % 4 or any(len(embedding) != row_bytes for embedding in embeddings):
+    raise ValueError("embeddings must be non-empty fixed-width float32 blobs")
+  return np.frombuffer(b"".join(embeddings), dtype="<f4").reshape(len(embeddings), row_bytes // 4)
 
 
 def read_explorer_state(conn: sqlite3.Connection, limit: int = 200) -> list[str]:
@@ -304,7 +338,7 @@ def mark_run_succeeded(conn: sqlite3.Connection, *, agent_id: int, run_id: int, 
     if row is None:
       raise ValueError(f"unknown or finished run: agent_id={agent_id} run_id={run_id}")
     experiment = conn.execute(
-      f"INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL}) VALUES (?, ?, '', '', {_METRIC_PLACEHOLDERS_SQL}) RETURNING *",
+      f"INSERT INTO experiments(agent_id, run_id, intent_key, intent_embedding, {_METRIC_COLUMNS_SQL}) VALUES (?, ?, '', X'', {_METRIC_PLACEHOLDERS_SQL}) RETURNING *",
       (agent_id, run_id, *values),
     ).fetchone()
     notify_main(conn, agent_id=agent_id, run_id=run_id, kind="run_succeeded", table_name="experiments", row=experiment)
@@ -330,19 +364,11 @@ def log_experiment(
   run_id: int,
   intent_key: str,
 ) -> int:
-  """Annotate one explicit successful run using its host-owned metrics."""
-  row = conn.execute(
-    "SELECT 1 FROM experiments WHERE agent_id = ? AND run_id = ? AND intent_key = ''",
-    (agent_id, run_id),
-  ).fetchone()
-  if row is None:
-    raise ValueError(f"unknown, unsuccessful, or annotated run: agent_id={agent_id} run_id={run_id}")
-  intent_embedding = embed_intent(intent_key)
-
+  """Save an intent for the coordinator's next embedding batch."""
   with conn:
     row = conn.execute(
-      "UPDATE experiments SET intent_key = ?, intent_embedding = ? WHERE agent_id = ? AND run_id = ? AND intent_key = '' RETURNING *",
-      (intent_key, json.dumps(intent_embedding, separators=(",", ":")), agent_id, run_id),
+      "UPDATE experiments SET intent_key = ? WHERE agent_id = ? AND run_id = ? AND intent_key = '' RETURNING *",
+      (intent_key, agent_id, run_id),
     ).fetchone()
     if row is None:
       raise ValueError(f"unknown, unsuccessful, or annotated run: agent_id={agent_id} run_id={run_id}")
@@ -350,28 +376,54 @@ def log_experiment(
   return run_id
 
 
+def embed_pending_intents(conn: sqlite3.Connection) -> int:
+  """Batch and persist every intent left pending by benchmark workers."""
+  rows = conn.execute(
+    "SELECT agent_id, run_id, intent_key FROM experiments WHERE intent_key != '' AND length(intent_embedding) = 0 ORDER BY agent_id, run_id"
+  ).fetchall()
+  if not rows:
+    return 0
+  vectors = _embed_intents(tuple(row["intent_key"] for row in rows))
+  if len(vectors) != len(rows):
+    raise ValueError("embedding model returned the wrong batch size")
+  with conn:
+    conn.executemany(
+      "UPDATE experiments SET intent_embedding = ? WHERE agent_id = ? AND run_id = ? AND intent_key = ? AND length(intent_embedding) = 0",
+      ((_pack_embedding(vector), row["agent_id"], row["run_id"], row["intent_key"]) for row, vector in zip(rows, vectors)),
+    )
+  return len(rows)
+
+
 def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int = 5) -> list[dict[str, object]]:
   """Return logged experiments closest to an intent embedding."""
-  query_embedding = embed_intent(intent)
   rows = conn.execute(
     f"""
     SELECT e.agent_id, e.run_id, e.intent_key, e.intent_embedding, {_METRIC_SELECT_SQL},
       r.trace_ref, r.command, r.started_at, r.finished_at, r.error
     FROM experiments e
     JOIN runs r ON r.agent_id = e.agent_id AND r.run_id = e.run_id
-    WHERE e.intent_embedding != ''
+    WHERE length(e.intent_embedding) > 0
     """
   ).fetchall()
-  scored = []
-  for row in rows:
-    entry = dict(row)
-    embedding = json.loads(entry.pop("intent_embedding"))
+  if not rows:
+    return []
+  import numpy as np
+
+  vectors = embedding_matrix(tuple(row["intent_embedding"] for row in rows))
+  query_embedding = np.asarray(embed_intent(intent), dtype=np.float32)
+  if vectors.shape[1] != query_embedding.size:
+    raise ValueError("stored and query embedding widths differ")
+  scores = vectors @ query_embedding
+  indices = np.argsort(-scores, kind="stable")[:limit]
+  matches = []
+  for index in indices:
+    entry = dict(rows[index])
+    entry.pop("intent_embedding")
     entry = {key: value for key, value in entry.items() if value is not None and value != ""}
-    score = sum(map(operator.mul, query_embedding, embedding))
+    score = float(scores[index])
     entry["score"] = round(score, 3)
-    scored.append((score, entry))
-  scored.sort(key=lambda item: item[0], reverse=True)
-  return [entry for _, entry in scored[:limit]]
+    matches.append(entry)
+  return matches
 
 
 def log_anomaly(

@@ -131,7 +131,7 @@ flowchart LR
   remote -->|"failed"| failed["Mark run failed"]
   remote -->|"succeeded"| parse["Parse benchmark metrics"]
   parse --> finish["Finish run + save canonical metrics"]
-  finish --> experiment["Add intent embedding"]
+  finish --> experiment["Save pending intent"]
   experiment --> anomaly["Optionally log anomaly"]
   failed --> notify["Notify main"]
   experiment --> notify
@@ -139,6 +139,8 @@ flowchart LR
 ```
 
 Started failures count against the cap. Invalid arguments do not, because no run row is created. SQLite serializes run-number assignment and enforces the cap in the same transaction.
+
+Workers persist only experiment intent text. Before the next main-model turn, the coordinator batches pending intents through its single embedding model and stores fixed-width float32 BLOBs. Pending rows survive coordinator restarts.
 
 ## Durable state
 
