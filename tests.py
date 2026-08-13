@@ -39,6 +39,7 @@ from perferox.tools import (
   cleanup_cloud_resource,
   create_modal_sandbox,
   provider_cli,
+  search_files_tool,
   sglang_bench_serving,
 )
 from perferox.tui import launch_main, request_end
@@ -291,6 +292,21 @@ class HostStateTests(DatabaseTestCase):
 
 class ToolAndExperimentTests(DatabaseTestCase):
   """Exercise benchmark tools through fake SSH and real SQLite writes."""
+
+  def test_search_files_reuses_one_scoped_repository_snapshot(self) -> None:
+    """Keep scoped results stable after the read-only source index is built."""
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      source = root / "src"
+      source.mkdir()
+      (source / "attention_kernel.py").touch()
+      search = search_files_tool(root)
+      (source / "late_attention.py").touch()
+
+      directory_result = search.invoke({"query": "attention", "path": "src"})
+      file_result = search.invoke({"query": "kernel", "path": "src/attention_kernel.py"})
+      self.assertEqual(directory_result, "score=997 src/attention_kernel.py")
+      self.assertEqual(file_result, "score=988 src/attention_kernel.py")
 
   def test_benchmark_tool_marks_failure_and_returns_success_metrics(self) -> None:
     """Check started remote failure accounting and success metric output."""
