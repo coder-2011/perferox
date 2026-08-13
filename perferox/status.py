@@ -33,6 +33,8 @@ class DashboardSnapshot:
 def refresh_sessions(conn) -> list[str]:
   """Mark and return traced agent sessions that disappeared from tmux."""
   rows = conn.execute("SELECT session_name, agent_id, trace_ref, COALESCE('agent-' || agent_id, session_name) AS label FROM agent_sessions WHERE status IN ('running', 'ending') AND trace_ref != ''").fetchall()
+  if not rows:
+    return []
   tmux = shutil.which("tmux")
   if tmux is None:
     return []
