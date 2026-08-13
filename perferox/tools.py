@@ -41,6 +41,18 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
   """Create a fuzzy repository path search tool."""
   root = Path(cwd).resolve()
   root_path = os.fspath(root)
+  root_prefix = root_path if root_path.endswith(os.sep) else root_path + os.sep
+  paths = []
+  # Main-agent source tools are read-only, so normalize repository paths once per graph run.
+  for dirpath, dirnames, filenames in os.walk(root_path):
+    dirnames[:] = [name for name in dirnames if name not in SKIP_SEARCH_DIRS]
+    for filename in filenames:
+      rel_path = os.path.join(dirpath, filename)[len(root_prefix):]
+      if os.sep != "/":
+        rel_path = rel_path.replace(os.sep, "/")
+      path_key = "".join(filter(str.isalnum, rel_path.casefold()))
+      paths.append((rel_path, path_key))
+  path_index = tuple(paths)
 
   @tool("search_files", description="Fuzzy-search repository file paths by name or path, not file contents.")
   def search_files(query: str, path: str = ".", limit: int = MAX_SEARCH_RESULTS) -> str:
@@ -52,34 +64,34 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
       return f"limit must be between 1 and {MAX_SEARCH_RESULTS}"
     try:
       search_root = (root / path).resolve()
-      search_root.relative_to(root)
+      search_relative = search_root.relative_to(root).as_posix()
     except ValueError:
       return f"path escapes repository root: {path}"
+    if search_root.is_file():
+      candidates = (item for item in path_index if item[0] == search_relative)
+    elif search_root == root:
+      candidates = iter(path_index)
+    else:
+      search_prefix = f"{search_relative}/"
+      candidates = (item for item in path_index if item[0].startswith(search_prefix))
     matches = []
-    paths = [(os.fspath(search_root.parent), [], [search_root.name])] if search_root.is_file() else os.walk(os.fspath(search_root))
-    for dirpath, dirnames, filenames in paths:
-      dirnames[:] = [name for name in dirnames if name not in SKIP_SEARCH_DIRS]
-      for filename in filenames:
-        rel_path = os.path.relpath(os.path.join(dirpath, filename), root_path)
-        if os.sep != "/":
-          rel_path = rel_path.replace(os.sep, "/")
-        path_key = "".join(filter(str.isalnum, rel_path.casefold()))
-        index = path_key.find(query_key)
-        if index >= 0:
-          matches.append((rel_path, 1000 - index))
-          continue
-        if len(query_key) > len(path_key):
-          continue
-        last = -1
-        score = 0
-        for char in query_key:
-          index = path_key.find(char, last + 1)
-          if index < 0:
-            break
-          score += 15 if index == last + 1 else 10
-          last = index
-        else:
-          matches.append((rel_path, score))
+    for rel_path, path_key in candidates:
+      index = path_key.find(query_key)
+      if index >= 0:
+        matches.append((rel_path, 1000 - index))
+        continue
+      if len(query_key) > len(path_key):
+        continue
+      last = -1
+      score = 0
+      for char in query_key:
+        index = path_key.find(char, last + 1)
+        if index < 0:
+          break
+        score += 15 if index == last + 1 else 10
+        last = index
+      else:
+        matches.append((rel_path, score))
     matches = nsmallest(limit, matches, key=lambda item: (-item[1], len(item[0]), item[0]))
     return "\n".join(f"score={score} {rel_path}" for rel_path, score in matches) or "no matches"
 

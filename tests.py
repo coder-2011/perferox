@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -38,6 +39,7 @@ from perferox.tools import (
   cleanup_cloud_resource,
   create_modal_sandbox,
   provider_cli,
+  search_files_tool,
   sglang_bench_serving,
 )
 from perferox.tui import launch_main, request_end
@@ -202,6 +204,47 @@ class LambdaLabsTests(unittest.TestCase):
 class HostStateTests(DatabaseTestCase):
   """Protect deterministic SQLite-owned state transitions."""
 
+  def test_schema_migration_is_serialized(self) -> None:
+    """Keep concurrent legacy upgrades from adding the same column twice."""
+    legacy_path = Path(self.tempdir.name) / "legacy.sqlite"
+    with closing(sqlite3.connect(legacy_path)) as conn:
+      conn.executescript(
+        "CREATE TABLE runs(agent_id INTEGER, run_id INTEGER, started_at TEXT, PRIMARY KEY(agent_id, run_id));"
+        "CREATE TABLE agent_sessions(session_name TEXT PRIMARY KEY, status TEXT);"
+      )
+    first_paused = threading.Event()
+    second_alter = threading.Event()
+    release_first = threading.Event()
+
+    def migrate(worker: int) -> None:
+      """Pause the first legacy ALTER while another connection attempts migration."""
+      with closing(db.connect(legacy_path)) as conn:
+        def trace(sql: str) -> None:
+          """Expose whether both connections enter the same legacy ALTER."""
+          if not sql.startswith("ALTER TABLE runs ADD COLUMN repository"):
+            return
+          if worker == 0:
+            first_paused.set()
+            release_first.wait(2)
+          else:
+            second_alter.set()
+
+        conn.set_trace_callback(trace)
+        db.init_db(conn)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      first = pool.submit(migrate, 0)
+      self.assertTrue(first_paused.wait(2))
+      second = pool.submit(migrate, 1)
+      self.assertFalse(second_alter.wait(0.2))
+      release_first.set()
+      first.result()
+      second.result()
+
+    with closing(db.connect(legacy_path)) as conn:
+      self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+      self.assertIn("repository", {row["name"] for row in conn.execute("PRAGMA table_info(runs)")})
+
   def test_run_ids_hash_caps_and_stop_are_host_owned(self) -> None:
     """Exercise run assignment, duplicate rejection, cap counting, and stop."""
     self.assertEqual(db.start_benchmark_run(self.conn, agent_id=0, command="bench a"), 0)
@@ -250,6 +293,21 @@ class HostStateTests(DatabaseTestCase):
 class ToolAndExperimentTests(DatabaseTestCase):
   """Exercise benchmark tools through fake SSH and real SQLite writes."""
 
+  def test_search_files_reuses_one_scoped_repository_snapshot(self) -> None:
+    """Keep scoped results stable after the read-only source index is built."""
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      source = root / "src"
+      source.mkdir()
+      (source / "attention_kernel.py").touch()
+      search = search_files_tool(root)
+      (source / "late_attention.py").touch()
+
+      directory_result = search.invoke({"query": "attention", "path": "src"})
+      file_result = search.invoke({"query": "kernel", "path": "src/attention_kernel.py"})
+      self.assertEqual(directory_result, "score=997 src/attention_kernel.py")
+      self.assertEqual(file_result, "score=988 src/attention_kernel.py")
+
   def test_benchmark_tool_marks_failure_and_returns_success_metrics(self) -> None:
     """Check started remote failure accounting and success metric output."""
     registry = SessionRegistry()
@@ -277,7 +335,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', succeeded)
 
   def test_experiment_logging_similarity_and_anomalies(self) -> None:
-    """Bind intent to explicit successful runs and their host-owned metrics."""
+    """Batch pending intents after restart and search their packed vectors."""
     with self.assertRaisesRegex(ValueError, "unknown, unsuccessful, or annotated run"):
       db.log_experiment(self.conn, agent_id=3, run_id=0, intent_key="no run")
 
@@ -286,15 +344,23 @@ class ToolAndExperimentTests(DatabaseTestCase):
     second_run = db.start_benchmark_run(self.conn, agent_id=3, command="scheduler benchmark")
     db.mark_run_succeeded(self.conn, agent_id=3, run_id=second_run, metrics={})
 
-    with patch.object(db, "embed_intent", side_effect=([1.0, 0.0], [0.0, 1.0], [0.9, 0.1])):
-      db.log_experiment(self.conn, agent_id=3, run_id=first_run, intent_key="CUDA cache throughput")
-      db.log_experiment(self.conn, agent_id=3, run_id=second_run, intent_key="scheduler tail latency")
+    db.log_experiment(self.conn, agent_id=3, run_id=first_run, intent_key="CUDA cache throughput")
+    db.log_experiment(self.conn, agent_id=3, run_id=second_run, intent_key="scheduler tail latency")
+    pending = self.conn.execute("SELECT intent_embedding FROM experiments WHERE agent_id = 3 ORDER BY run_id").fetchall()
+    self.assertEqual([row["intent_embedding"] for row in pending], [b"", b""])
+
+    with patch.object(db, "_embed_intents", return_value=([1.0, 0.0], [0.0, 1.0])) as embed, closing(db.connect(self.db_path)) as coordinator_conn:
+      self.assertEqual(db.embed_pending_intents(coordinator_conn), 2)
+      self.assertEqual(db.embed_pending_intents(coordinator_conn), 0)
+    embed.assert_called_once_with(("CUDA cache throughput", "scheduler tail latency"))
+    with patch.object(db, "embed_intent", return_value=[0.9, 0.1]):
       matches = db.find_similar_experiments(self.conn, "cache-ish intent", limit=2)
 
     anomaly_id = db.log_anomaly(self.conn, agent_id=3, run_id=0, summary="cache-hit collapse on MI250")
     experiment = self.conn.execute("SELECT * FROM experiments WHERE agent_id = 3 AND run_id = 0").fetchone()
     anomaly = self.conn.execute("SELECT * FROM anomalies WHERE anomaly_id = ?", (anomaly_id,)).fetchone()
-    self.assertEqual(experiment["intent_embedding"], "[1.0,0.0]")
+    self.assertEqual(experiment["intent_embedding"], db._pack_embedding([1.0, 0.0]))
+    self.assertEqual(self.conn.execute("SELECT typeof(intent_embedding) FROM experiments WHERE agent_id = 3 AND run_id = 0").fetchone()[0], "blob")
     self.assertEqual(experiment["cache_hit_rate"], 0.75)
     self.assertEqual(experiment["error_rate"], 0.25)
     self.assertEqual([match["intent_key"] for match in matches], ["CUDA cache throughput", "scheduler tail latency"])
@@ -354,8 +420,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     ])
     graph = build_subagent_graph(model, 10, registry, self.db_path, "repo", "commit", attempt_cap=1)
 
-    with patch.object(db, "embed_intent", return_value=[1.0, 0.0]):
-      result = graph.invoke({"agent_id": 10, "objective": "benchmark goal", "messages": []})
+    result = graph.invoke({"agent_id": 10, "objective": "benchmark goal", "messages": []})
 
     run = self.run_row(agent_id=10)
     experiments = self.conn.execute("SELECT COUNT(*) FROM experiments WHERE agent_id = 10").fetchone()[0]

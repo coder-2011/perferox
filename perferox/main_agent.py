@@ -171,7 +171,7 @@ def build_main_agent_graph(
         with closing(db.connect(Path(__file__).with_name("sglang_docs") / "perferox-docs.sqlite", readonly=True, immutable=True)) as conn:
           rows = conn.execute("SELECT source, title, url, text, embedding FROM doc_chunks").fetchall()
         documents = tuple((row["source"], row["title"], row["url"], row["text"]) for row in rows)
-        document_index = documents, np.stack([np.asarray(json.loads(row["embedding"]), dtype=np.float32) for row in rows]) if rows else np.empty((0, 0), dtype=np.float32)
+        document_index = documents, db.embedding_matrix(tuple(row["embedding"] for row in rows))
       documents, vectors = document_index
       if not documents:
         return "no SGLang doc chunks ingested"
@@ -300,6 +300,8 @@ def build_main_agent_graph(
   def call_model(state: MainAgentState) -> dict[str, list[BaseMessage]]:
     """Invoke the main model with fresh ExplorerState in context."""
     with closing(db.connect(database)) as conn:
+      # Workers save intent text; the coordinator owns the shared embedding model.
+      db.embed_pending_intents(conn)
       refresh_sessions(conn)
       lines = db.read_explorer_state(conn)
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()

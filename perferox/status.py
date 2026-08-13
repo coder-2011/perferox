@@ -33,6 +33,8 @@ class DashboardSnapshot:
 def refresh_sessions(conn) -> list[str]:
   """Mark and return traced agent sessions that disappeared from tmux."""
   rows = conn.execute("SELECT session_name, agent_id, trace_ref, COALESCE('agent-' || agent_id, session_name) AS label FROM agent_sessions WHERE status IN ('running', 'ending') AND trace_ref != ''").fetchall()
+  if not rows:
+    return []
   tmux = shutil.which("tmux")
   if tmux is None:
     return []
@@ -160,12 +162,23 @@ def read_trace_tail(paths: list[str], limit: int) -> list[str]:
       continue
     for raw_line in _tail_lines(path, limit):
       try:
-        timestamp = str(json.loads(raw_line).get("ts", ""))
+        record = json.loads(raw_line)
       except json.JSONDecodeError:
-        timestamp = ""
-      lines.append((timestamp, format_trace_line(path, raw_line)))
+        lines.append(("", None, f"{path.name}: {_short(raw_line.strip(), 300)}"))
+        continue
+      lines.append((str(record.get("ts", "")), record, ""))
   lines.sort(key=lambda item: item[0])
-  return [line for _, line in lines[-limit:]]
+  formatted = []
+  # Format only records that survive the global tail truncation.
+  for _, record, fallback in lines[-limit:]:
+    if record is None:
+      formatted.append(fallback)
+      continue
+    agent = record.get("agent_id")
+    who = "main" if agent is None else f"agent-{agent}"
+    text = trace_payload_text(record.get("payload"))
+    formatted.append(_short(f"{record.get('ts', '')} {who}: {text}", 500))
+  return formatted
 
 
 def _tail_lines(path: Path, limit: int) -> list[str]:
@@ -186,19 +199,6 @@ def _tail_lines(path: Path, limit: int) -> list[str]:
       newlines += chunk.count(b"\n")
   data = b"".join(reversed(chunks))
   return [line.decode("utf-8", "replace") for line in data.splitlines()[-limit:]]
-
-
-def format_trace_line(path: Path, raw_line: str) -> str:
-  """Convert one graph JSONL record into a compact human-readable line."""
-  try:
-    record = json.loads(raw_line)
-  except json.JSONDecodeError:
-    return f"{path.name}: {_short(raw_line.strip(), 300)}"
-  ts = str(record.get("ts", ""))
-  agent = record.get("agent_id")
-  who = "main" if agent is None else f"agent-{agent}"
-  text = trace_payload_text(record.get("payload"))
-  return _short(f"{ts} {who}: {text}", 500)
 
 
 def trace_payload_text(payload: object) -> str:

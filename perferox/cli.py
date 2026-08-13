@@ -7,7 +7,6 @@ import os
 import shutil
 import sqlite3
 from contextlib import closing
-from importlib.metadata import version
 from pathlib import Path
 
 from rich import box
@@ -57,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
   args = parser.parse_args(argv)
 
   if args.version:
+    from importlib.metadata import version
+
     CONSOLE.print(Text.assemble(("perferox", f"bold {BRAND}"), (f" {version('perferox')}", "bold white")))
     return 0
 
