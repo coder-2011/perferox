@@ -25,6 +25,7 @@ dependencies = [
   "langchain",
   "langgraph",
   "langchain-litellm",
+  "langchain-openai>=1.5.0",
   "rich",
   "textual",
   "paramiko",

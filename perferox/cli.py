@@ -47,9 +47,9 @@ def main(argv: list[str] | None = None) -> int:
   run_parser.add_argument("--provider", choices=("runpod", "lambda", "modal"), help="cloud provider; select Modal explicitly because it has no single-key prefix")
   run_parser.add_argument("--max-agents", type=_positive_int, default=3, help="maximum concurrent benchmark subagents (default: 3)")
   subparsers.add_parser("status", help="show comprehensive persisted run status")
-  login_parser = subparsers.add_parser("login", help="configure and authenticate any LiteLLM model")
-  login_parser.add_argument("model", nargs="?", help="LiteLLM model name, including its provider prefix")
-  login_parser.add_argument("--reasoning-effort", help="optional reasoning effort passed to LiteLLM")
+  login_parser = subparsers.add_parser("login", help="configure and authenticate any supported model")
+  login_parser.add_argument("model", nargs="?", help="provider/model name; chatgpt/* uses LangChain OpenAI OAuth")
+  login_parser.add_argument("--reasoning-effort", help="optional model reasoning effort")
   logs_parser = subparsers.add_parser("logs", help="show recent SQLite and trace activity")
   logs_parser.add_argument("-n", "--limit", type=int, default=30, help="maximum activity lines (default: 30)")
   subparsers.add_parser("doctor", help="check local requirements without cloud calls")
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _login(args: argparse.Namespace) -> int:
-  """Configure and validate one arbitrary LiteLLM model profile."""
+  """Configure and validate one supported model profile."""
   active = active_model_profile()
   default_model = active.model if active else "chatgpt/gpt-5.4"
   model = args.model or Prompt.ask("LiteLLM model", default=default_model, console=CONSOLE)

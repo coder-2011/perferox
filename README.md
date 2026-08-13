@@ -31,7 +31,7 @@ I am building this in a way such that the abstractions allow easy extensibility 
 
 RunPod and Lambda use `runpodctl` and `lambda-labs`; Modal uses its native Sandbox API and command execution instead of SSH. All three backends share the same host-owned lifecycle: one tracked resource per subagent, persisted resource IDs, bounded benchmark runs, soft-stop handling, and automatic teardown. Authenticate Modal once with `modal setup`, or set both `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
 
-Run `perferox login <provider/model>` before opening the TUI, for example `perferox login chatgpt/gpt-5.6-terra --reasoning-effort high`. Any LiteLLM model is accepted after a real tool-call probe. LiteLLM and the provider own authentication through OAuth, API-key environment variables, or native cloud credentials; Perferox stores only the selected model and optional reasoning effort.
+Run `perferox login <provider/model>` before opening the TUI, for example `perferox login chatgpt/gpt-5.6-terra --reasoning-effort high`. `chatgpt/*` uses LangChain OpenAI's ChatGPT OAuth path; other provider/model names use LiteLLM. Perferox accepts a model only after a real tool-call probe, then stores only the selected model and optional reasoning effort.
 
 I plan on adding support for other major projects (vLLM, DeepSpeed, flashinfer, etc.) and other neoclouds with a CLI or MCP.
 

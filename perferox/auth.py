@@ -16,17 +16,17 @@ LEGACY_MODELS = {
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
-  """Store one non-secret LiteLLM model selection."""
+  """Store one non-secret model selection."""
 
   model: str
   reasoning_effort: str | None = None
 
   def __post_init__(self) -> None:
-    """Normalize and validate values before they reach LiteLLM."""
+    """Normalize and validate values before they reach a provider."""
     model = self.model.strip()
     effort = self.reasoning_effort.strip() if self.reasoning_effort else None
     if not model:
-      raise ValueError("model must be a non-empty LiteLLM model name")
+      raise ValueError("model must be a non-empty model name")
     object.__setattr__(self, "model", model)
     object.__setattr__(self, "reasoning_effort", effort)
 
@@ -123,8 +123,15 @@ def active_model_profile() -> ModelProfile | None:
 
 
 def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile:
-  """Validate and atomically save any LiteLLM-backed model profile."""
+  """Validate and atomically save one supported model profile."""
   profile = ModelProfile(model, reasoning_effort)
+  if profile.model.startswith("chatgpt/"):
+    from langchain_openai.chatgpt_oauth import _ChatGPTOAuthRefreshError, _FileChatGPTOAuthTokenProvider, login_chatgpt
+
+    try:
+      _FileChatGPTOAuthTokenProvider.from_default_store().get_token()
+    except (FileNotFoundError, _ChatGPTOAuthRefreshError):
+      login_chatgpt()
   chat_model = build_chat_model(profile, max_retries=0)
   probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
   response = probe_model.invoke(f"Call {perferox_auth_probe.__name__} once with no arguments.")
@@ -139,7 +146,18 @@ def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile
 
 
 def build_chat_model(profile: ModelProfile, *, max_retries: int = 1):
-  """Build the selected LiteLLM model without starting authentication."""
+  """Build ChatGPT models with LangChain OpenAI and others with LiteLLM."""
+  if profile.model.startswith("chatgpt/"):
+    from langchain_openai.chat_models.codex import _ChatOpenAICodex
+    from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
+
+    return _ChatOpenAICodex(
+      model=profile.model.removeprefix("chatgpt/"),
+      reasoning_effort=profile.reasoning_effort,
+      originator="perferox",
+      token_provider=_FileChatGPTOAuthTokenProvider.from_default_store(),
+      max_retries=max_retries,
+    )
   from langchain_litellm import ChatLiteLLM
 
   model_kwargs = {"reasoning_effort": profile.reasoning_effort} if profile.reasoning_effort else {}

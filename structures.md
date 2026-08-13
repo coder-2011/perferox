@@ -31,14 +31,14 @@ Agents receive goals and immutable constraints, then choose the simplest useful 
 `perferox` exposes five user paths:
 
 - no command opens the Textual dashboard after local LLM auth passes
-- `perferox login <provider/model> [--reasoning-effort EFFORT]` validates and selects any LiteLLM model
+- `perferox login <provider/model> [--reasoning-effort EFFORT]` validates and selects any supported model
 - `perferox run <objective>` launches the main agent
 - `perferox status` prints persisted state
 - `perferox end` requests a soft stop
 
 The TUI and CLI both launch `perferox.process_host`. API-key prefixes select RunPod or Lambda; Modal is selected explicitly and uses its standard local profile or paired token environment variables. The host passes one cloud credential handoff to detached tmux processes through a one-use file, and workers expose only the selected cloud provider's credentials. Perferox uses its own tmux server so detached model processes inherit the authentication environment from launch rather than an unrelated older tmux server.
 
-LLM login is separate from cloud auth. `perferox login` makes a real LiteLLM tool call, then stores only the non-secret model name and optional reasoning effort. LiteLLM and provider tooling own OAuth tokens, API keys, and cloud credentials. The CLI blocks the TUI, direct runs, and tmux launch until a model profile exists. Launch passes that profile to the coordinator and every subagent so they keep the exact model selected at start.
+LLM login is separate from cloud auth. `perferox login` makes a real tool call, then stores only the non-secret model name and optional reasoning effort. `chatgpt/*` uses LangChain OpenAI's ChatGPT OAuth store; other models use LiteLLM and provider-native credentials. The CLI blocks the TUI, direct runs, and tmux launch until a model profile exists. Launch passes that profile to the coordinator and every subagent so they keep the exact model selected at start.
 
 The main process uses two roots:
 
