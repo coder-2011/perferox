@@ -1,11 +1,19 @@
-"""ChatGPT OAuth auth and model construction for Perferox."""
+"""LLM OAuth, model selection, and cloud credentials."""
 
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 from pathlib import Path
+
+OAUTH_MODELS = {
+  "chatgpt": "chatgpt/gpt-5.4",
+  "github-copilot": "github_copilot/gpt-4",
+}
+
+
+def perferox_auth_probe() -> None:
+  """Confirm that the selected model can call Perferox tools."""
 
 
 def cloud_provider(api_key: str) -> str:
@@ -62,45 +70,46 @@ def read_cloud_key(path: str | Path) -> str:
     key_path.unlink(missing_ok=True)
 
 
-def _chatgpt_provider():
-  """Open the persisted provider and require a usable ChatGPT token."""
-  from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
-
-  provider = _FileChatGPTOAuthTokenProvider.from_default_store()
-  provider.get_token()
-  return provider
+def _provider_path() -> Path:
+  """Return the XDG-style path for Perferox's selected provider."""
+  config_root = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+  return config_root / "perferox" / "provider"
 
 
-def chatgpt_auth_ready() -> bool:
-  """Return whether a refreshable ChatGPT OAuth token is available."""
+def active_model() -> str | None:
+  """Load the default model for the selected OAuth provider."""
   try:
-    _chatgpt_provider()
-  except Exception:  # noqa: BLE001
-    return False
-  return True
+    provider = _provider_path().read_text(encoding="utf-8").strip()
+  except (OSError, UnicodeError):
+    return None
+  return OAUTH_MODELS.get(provider)
 
 
-def ensure_chatgpt_auth(timeout_s: float = 300.0) -> bool:
-  """Ensure persisted ChatGPT OAuth, returning whether login was needed."""
-  if chatgpt_auth_ready():
-    return False
-  from langchain_openai.chatgpt_oauth import login_chatgpt, login_chatgpt_device
+def login_provider(provider: str) -> str:
+  """Run CLI-owned OAuth and save the provider after a real tool call."""
+  model = OAUTH_MODELS.get(provider)
+  if model is None:
+    raise ValueError(f"unsupported OAuth provider: {provider}")
+  from langchain_litellm import ChatLiteLLM
 
-  # SSH and non-interactive sessions cannot reliably receive a loopback callback.
-  headless = os.environ.get("SSH_CONNECTION") or not sys.stdout.isatty()
-  login = login_chatgpt_device if headless else login_chatgpt
-  provider = login(timeout=timeout_s)
-  provider.get_token()
-  return True
+  chat_model = ChatLiteLLM(model=model, max_retries=0)
+  probe_model = chat_model.bind_tools([perferox_auth_probe], tool_choice="required")
+  response = probe_model.invoke(f"Call {perferox_auth_probe.__name__} once with no arguments.")
+  if not response.tool_calls:
+    raise RuntimeError(f"{model} authenticated but did not complete the tool-call probe")
+  provider_path = _provider_path()
+  provider_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  temporary_path = provider_path.with_suffix(".tmp")
+  temporary_path.write_text(provider, encoding="utf-8")
+  temporary_path.replace(provider_path)
+  return model
 
 
-def build_chat_model(model: str | None = None):
-  """Build Perferox's OAuth-backed LangChain chat model."""
-  from langchain_openai.chat_models.codex import _ChatOpenAICodex
-  provider = _chatgpt_provider()
-  model_name = model or os.environ.get("PERFEROX_CHAT_MODEL", "gpt-5.5")
-  return _ChatOpenAICodex(
-    model=model_name,
-    originator="perferox",
-    token_provider=provider,
-  )
+def build_chat_model():
+  """Build the active OAuth-backed LangChain model without starting login."""
+  model = active_model()
+  if model is None:
+    raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
+  from langchain_litellm import ChatLiteLLM
+
+  return ChatLiteLLM(model=model, max_retries=1)

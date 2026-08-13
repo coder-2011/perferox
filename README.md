@@ -31,6 +31,8 @@ I am building this in a way such that the abstractions allow easy extensibility 
 
 RunPod and Lambda use `runpodctl` and `lambda-labs`; Modal uses its native Sandbox API and command execution instead of SSH. All three backends share the same host-owned lifecycle: one tracked resource per subagent, persisted resource IDs, bounded benchmark runs, soft-stop handling, and automatic teardown. Authenticate Modal once with `modal setup`, or set both `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
 
+Run `perferox login` before opening the TUI. ChatGPT subscription and GitHub Copilot OAuth are supported through LiteLLM. Login stays in the CLI.
+
 I plan on adding support for other major projects (vLLM, DeepSpeed, flashinfer, etc.) and other neoclouds with a CLI or MCP.
 
 

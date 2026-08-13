@@ -1,12 +1,9 @@
 """Live Textual dashboard for Perferox runs."""
 
-# ruff: noqa: BLE001
-
 from __future__ import annotations
 
 import os
 import subprocess
-import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -20,7 +17,7 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Button, Input, Select, Static
 
 from perferox import db
-from perferox.auth import chatgpt_auth_ready, cloud_provider, ensure_chatgpt_auth, modal_cloud_key
+from perferox.auth import cloud_provider, modal_cloud_key
 from perferox.status import DashboardSnapshot, read_dashboard
 
 
@@ -69,8 +66,6 @@ class PerferoxTUI(App[None]):
   CSS = """
   Screen { background: #1d2021; color: #d5c4a1; }
   #root { height: 100%; width: 100%; background: #1d2021; }
-  #login-screen { height: 1fr; width: 100%; align: center middle; }
-  #login-box { width: 44; height: 8; align: center middle; }
   #body { height: 1fr; }
   #left { width: 31; border-right: solid #504945; }
   #main { width: 1fr; min-width: 64; }
@@ -96,20 +91,16 @@ class PerferoxTUI(App[None]):
     cwd: str | Path = ".",
     db_path: str | Path = "perferox.sqlite",
     trace_dir: str | Path = "traces",
-    logged_in: bool | None = None,
   ) -> None:
-    """Store paths and initial auth state for the live dashboard."""
+    """Store paths for the already-authenticated live dashboard."""
     super().__init__()
     self.cwd = Path(cwd).resolve()
     self.db_path = Path(db_path).resolve()
     self.trace_dir = Path(trace_dir).resolve()
-    self.logged_in = chatgpt_auth_ready() if logged_in is None else logged_in
-    self.login_thread: threading.Thread | None = None
 
   def compose(self) -> ComposeResult:
     """Build the live dashboard layout."""
     with Vertical(id="root"):
-      yield Vertical(Vertical(Button("LOGIN", id="login"), Static("", id="login-status"), id="login-box"), id="login-screen")
       with Horizontal(id="body"):
         yield Vertical(
           Static("STATUS", classes="section-title"),
@@ -145,16 +136,13 @@ class PerferoxTUI(App[None]):
   def on_mount(self) -> None:
     """Initialize SQLite-backed widgets and start polling."""
     self.trace_dir.mkdir(parents=True, exist_ok=True)
-    self._sync_auth_gate()
     self.refresh_dashboard()
     self.set_interval(1.0, self.refresh_dashboard)
 
   def on_button_pressed(self, event: Button.Pressed) -> None:
-    """Route button presses to auth, launch, or soft-stop actions."""
+    """Route button presses to launch or soft-stop actions."""
     button_id = event.button.id
-    if button_id == "login":
-      self._start_login()
-    elif button_id == "start":
+    if button_id == "start":
       self._start_main()
     elif button_id == "end":
       self._end_main()
@@ -167,8 +155,6 @@ class PerferoxTUI(App[None]):
 
   def refresh_dashboard(self) -> None:
     """Re-read SQLite and traces, then update visible state."""
-    if not self.logged_in:
-      return
     snapshot = read_dashboard(self.db_path)
     self.query_one("#counters", Static).update(_counter_text(snapshot))
     self.query_one("#sessions", Static).update(_session_text(snapshot.sessions))
@@ -182,8 +168,6 @@ class PerferoxTUI(App[None]):
 
   def _start_main(self) -> None:
     """Launch the tmux-backed main graph for the entered objective."""
-    if not self.logged_in:
-      return
     max_agents = int(self.query_one("#max-agents", Input).value or 3)
     api_key = self.query_one("#cloud-key", Input).value.strip()
     selected = self.query_one("#cloud-provider", Select).value
@@ -212,41 +196,6 @@ class PerferoxTUI(App[None]):
     stopped = request_end(self.db_path)
     self.query_one("#footer", Static).update(f"soft stop requested for {stopped} running session(s)")
     self.refresh_dashboard()
-
-  def _sync_auth_gate(self) -> None:
-    """Hide the working UI until ChatGPT OAuth is available."""
-    self.query_one("#login-screen", Vertical).display = not self.logged_in
-    self.query_one("#body", Horizontal).display = self.logged_in
-    self.query_one("#footer", Static).display = self.logged_in
-
-  def _start_login(self) -> None:
-    """Run the blocking OAuth flow in a background thread."""
-    if self.login_thread and self.login_thread.is_alive():
-      return
-    self.query_one("#login", Button).disabled = True
-    self.query_one("#login-status", Static).update("opening browser")
-    self.login_thread = threading.Thread(target=self._login_worker, daemon=True)
-    self.login_thread.start()
-
-  def _login_worker(self) -> None:
-    """Complete OAuth and return the result to Textual's thread."""
-    try:
-      ensure_chatgpt_auth()
-    except Exception as exc:
-      self.call_from_thread(self._finish_login, False, f"{type(exc).__name__}: {exc}")
-      return
-    self.call_from_thread(self._finish_login, True, "")
-
-  def _finish_login(self, logged_in: bool, error: str) -> None:
-    """Apply the completed login result to the dashboard."""
-    self.logged_in = logged_in
-    if self.logged_in:
-      self._sync_auth_gate()
-      self.refresh_dashboard()
-      return
-    self.query_one("#login", Button).disabled = False
-    self.query_one("#login-status", Static).update(escape(error) if error else "login failed")
-
 
 def _counter_text(snapshot: DashboardSnapshot) -> str:
   """Render compact live counters."""

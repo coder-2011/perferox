@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.text import Text
 
 from perferox import db
-from perferox.auth import build_chat_model, cloud_environment, cloud_provider, read_cloud_key, write_cloud_key
+from perferox.auth import active_model, build_chat_model, cloud_environment, cloud_provider, read_cloud_key, write_cloud_key
 from perferox.main_agent import build_main_agent_graph
 from perferox.prompts import CREATE_POD_SYSTEM_PROMPT, LAMBDA_CREATE_POD_SYSTEM_PROMPT, MODAL_CREATE_SANDBOX_SYSTEM_PROMPT
 from perferox.remote import SessionRegistry
@@ -63,6 +63,9 @@ def main(argv: list[str] | None = None, *, cloud_api_key: str | None = None) -> 
     trace_dir = (cwd / args.trace_dir).resolve()
 
   if args.command == "launch-main":
+    if active_model() is None:
+      ERROR_CONSOLE.print("[bold red]error:[/] LLM OAuth is missing; run `perferox login` first")
+      return 1
     tmux = shutil.which("tmux")
     if tmux is None:
       ERROR_CONSOLE.print("[bold red]error:[/] tmux is not installed or not on PATH")
