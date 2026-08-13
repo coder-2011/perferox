@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import operator
 import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -356,7 +357,7 @@ def find_similar_experiments(conn: sqlite3.Connection, intent: str, limit: int =
     entry = dict(row)
     embedding = json.loads(entry.pop("intent_embedding"))
     entry = {key: value for key, value in entry.items() if value is not None and value != ""}
-    score = sum(a * b for a, b in zip(query_embedding, embedding))
+    score = sum(map(operator.mul, query_embedding, embedding))
     entry["score"] = round(score, 3)
     scored.append((score, entry))
   scored.sort(key=lambda item: item[0], reverse=True)

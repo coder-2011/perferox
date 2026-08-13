@@ -160,12 +160,13 @@ def read_trace_tail(paths: list[str], limit: int) -> list[str]:
       continue
     for raw_line in _tail_lines(path, limit):
       try:
-        timestamp = str(json.loads(raw_line).get("ts", ""))
+        record = json.loads(raw_line)
       except json.JSONDecodeError:
-        timestamp = ""
-      lines.append((timestamp, format_trace_line(path, raw_line)))
+        lines.append(("", None, f"{path.name}: {_short(raw_line.strip(), 300)}"))
+        continue
+      lines.append((str(record.get("ts", "")), record, ""))
   lines.sort(key=lambda item: item[0])
-  return [line for _, line in lines[-limit:]]
+  return [fallback if record is None else _format_trace_record(record) for _, record, fallback in lines[-limit:]]
 
 
 def _tail_lines(path: Path, limit: int) -> list[str]:
@@ -194,6 +195,11 @@ def format_trace_line(path: Path, raw_line: str) -> str:
     record = json.loads(raw_line)
   except json.JSONDecodeError:
     return f"{path.name}: {_short(raw_line.strip(), 300)}"
+  return _format_trace_record(record)
+
+
+def _format_trace_record(record: dict[str, object]) -> str:
+  """Format one decoded trace record without parsing it again."""
   ts = str(record.get("ts", ""))
   agent = record.get("agent_id")
   who = "main" if agent is None else f"agent-{agent}"

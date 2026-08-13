@@ -41,6 +41,7 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
   """Create a fuzzy repository path search tool."""
   root = Path(cwd).resolve()
   root_path = os.fspath(root)
+  root_prefix = root_path if root_path.endswith(os.sep) else root_path + os.sep
 
   @tool("search_files", description="Fuzzy-search repository file paths by name or path, not file contents.")
   def search_files(query: str, path: str = ".", limit: int = MAX_SEARCH_RESULTS) -> str:
@@ -60,7 +61,8 @@ def search_files_tool(cwd: str | Path) -> BaseTool:
     for dirpath, dirnames, filenames in paths:
       dirnames[:] = [name for name in dirnames if name not in SKIP_SEARCH_DIRS]
       for filename in filenames:
-        rel_path = os.path.relpath(os.path.join(dirpath, filename), root_path)
+        # Every walked path is already below root, so slicing avoids renormalizing it.
+        rel_path = os.path.join(dirpath, filename)[len(root_prefix):]
         if os.sep != "/":
           rel_path = rel_path.replace(os.sep, "/")
         path_key = "".join(filter(str.isalnum, rel_path.casefold()))
