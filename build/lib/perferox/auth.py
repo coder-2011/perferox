@@ -99,7 +99,10 @@ def login_provider(provider: str) -> str:
     raise RuntimeError(f"{model} authenticated but did not complete the tool-call probe")
   provider_path = _provider_path()
   provider_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-  provider_path.write_text(provider, encoding="utf-8")
+  # Same-directory replacement keeps the active profile intact after write failures.
+  temporary_path = provider_path.with_suffix(".tmp")
+  temporary_path.write_text(provider, encoding="utf-8")
+  temporary_path.replace(provider_path)
   return model
 
 
@@ -109,4 +112,4 @@ def build_chat_model():
   if model is None:
     raise RuntimeError("LLM OAuth is missing; run `perferox login` first")
 
-  return ChatLiteLLM(model=model, max_retries=0)
+  return ChatLiteLLM(model=model, max_retries=1)

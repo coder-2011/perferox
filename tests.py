@@ -65,8 +65,8 @@ class ToolBindingFakeModel(FakeMessagesListChatModel):
 class OAuthProfileTests(unittest.TestCase):
   """Protect the CLI-validated model selection."""
 
-  def test_login_replaces_profile_only_after_tool_probe(self) -> None:
-    """Reject unsupported profiles and preserve a selection when a new probe fails."""
+  def test_login_replaces_profile_only_after_validation(self) -> None:
+    """Preserve the active selection until the probe and file replacement succeed."""
     with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
       profile_path = Path(root) / "perferox" / "provider"
       profile_path.parent.mkdir()
@@ -82,6 +82,11 @@ class OAuthProfileTests(unittest.TestCase):
 
       failed_model = ToolBindingFakeModel(responses=[AIMessage(content="no tool call")])
       with patch("perferox.auth.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
+        login_provider("github-copilot")
+      self.assertEqual(active_model(), logged_in)
+
+      chat_model = ToolBindingFakeModel(responses=[probe])
+      with patch("perferox.auth.ChatLiteLLM", return_value=chat_model), patch.object(Path, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
         login_provider("github-copilot")
       self.assertEqual(active_model(), logged_in)
 
