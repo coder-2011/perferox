@@ -60,8 +60,9 @@ class BenchServingArgs(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   gpu: str = Field(..., min_length=1, description="Exact GPU model and count used by the server; stored as experiment identity metadata.")
-  server_command: str = Field(..., min_length=1, description="Exact server launch command and configuration; stored as experiment identity metadata.")
+  server_command: str = Field(..., min_length=1, description="Exact server command launched for this attempt and stored as experiment identity metadata.")
   model_state: str = Field(..., min_length=1, description="Model weights, revision, and relevant runtime state; stored as experiment identity metadata.")
+  python_executable: str = Field("python", min_length=1, description="Remote Python executable containing the installed SGLang benchmark module.")
   backend: BenchBackend = Field("sglang", description="Serving backend/API shape to benchmark.")
   base_url: str | None = Field(None, description="Full server base URL; use instead of host/port when needed.")
   host: str | None = Field(None, description="Server host when base_url is not provided.")
@@ -178,10 +179,10 @@ class BenchServingArgs(BaseModel):
 
 def bench_serving_argv(args: BenchServingArgs) -> list[str]:
   """Build the SGLang serving benchmark argv from typed fields."""
-  data = args.model_dump(exclude={"gpu", "server_command", "model_state", "timeout_s", "extra_request_body", "header"}, exclude_none=True)
+  data = args.model_dump(exclude={"gpu", "server_command", "model_state", "python_executable", "timeout_s", "extra_request_body", "header"}, exclude_none=True)
   data["extra_request_body"] = json.dumps(args.extra_request_body, sort_keys=True, separators=(",", ":")) if args.extra_request_body else None
   data["header"] = [f"{key}={value}" for key, value in sorted((args.header or {}).items())]
-  argv = ["python", "-m", "sglang.benchmark.serving"]
+  argv = [args.python_executable, "-m", "sglang.benchmark.serving"]
   for name, value in data.items():
     if value is False or value is None or value == []:
       continue

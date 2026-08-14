@@ -146,6 +146,7 @@ class BenchmarkContractTests(unittest.TestCase):
       gpu="H100 SXM 80GB x1",
       server_command="python -m sglang.launch_server --model model-a",
       model_state="model-a@revision-1",
+      python_executable="/workspace/venv/bin/python",
       num_prompts=8,
       request_rate=2.5,
       extra_request_body={"mode": "stress", "seed": 7},
@@ -154,7 +155,7 @@ class BenchmarkContractTests(unittest.TestCase):
     )
     argv = bench_serving_argv(args)
 
-    self.assertEqual(argv[:3], ["python", "-m", "sglang.benchmark.serving"])
+    self.assertEqual(argv[:3], ["/workspace/venv/bin/python", "-m", "sglang.benchmark.serving"])
     self.assertIn("--output-details", argv)
     self.assertIn("--cache-report", argv)
     self.assertEqual(argv[argv.index("--num-prompts") + 1], "8")
@@ -163,6 +164,7 @@ class BenchmarkContractTests(unittest.TestCase):
     self.assertEqual(argv[header_index + 1:header_index + 3], ["accept=json", "x-trace=perferox"])
     self.assertNotIn("--timeout-s", argv)
     self.assertNotIn("--server-command", argv)
+    self.assertNotIn("--python-executable", argv)
     equivalent = args.model_copy(update={"extra_request_body": {"seed": 7, "mode": "stress"}, "header": {"accept": "json", "x-trace": "perferox"}})
     self.assertEqual(bench_serving_argv(equivalent), argv)
 
@@ -348,6 +350,7 @@ class ToolAndExperimentTests(DatabaseTestCase):
     self.assertIn("run_id=0", failed)
     self.assertIn("exit_code=2", failed)
     self.assertIn("benchmark exploded", self.run_row(agent_id=7)["error"])
+    self.assertIn("serve model-a", registry.get("fail").commands[0])
     self.assertIn('parsed_metrics={"cache_hit_rate":0.75,"error_rate":0.1,"request_rps":12.34}', succeeded)
 
   def test_experiment_logging_similarity_and_anomalies(self) -> None:

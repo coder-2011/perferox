@@ -177,7 +177,19 @@ def sglang_bench_serving(
         )
     except Exception as exc:
       return f"benchmark not started: {type(exc).__name__}: {exc}"
-    output = _run_remote(session, command, args.timeout_s)
+    # Run each server in its own process group so the attempt owns its cleanup.
+    server = f"setsid bash -lc {shlex.quote(args.server_command)}"
+    remote_command = "\n".join((
+      "server_log=$(mktemp)",
+      f'{server} >"$server_log" 2>&1 &',
+      "server_pid=$!",
+      "trap 'kill -- -\"$server_pid\" 2>/dev/null || true; wait \"$server_pid\" 2>/dev/null || true; rm -f \"$server_log\"' EXIT",
+      command,
+      "status=$?",
+      "if [ \"$status\" -ne 0 ]; then echo 'SGLang server log:'; tail -n 200 \"$server_log\"; fi",
+      "exit \"$status\"",
+    ))
+    output = _run_remote(session, remote_command, args.timeout_s)
     if not output.startswith("exit_code=0\n"):
       # Failed started runs still count, so mark them in SQLite.
       with closing(db.connect(db_path)) as conn:
