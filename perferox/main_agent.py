@@ -18,6 +18,7 @@ from typing import Annotated, Literal, TypedDict
 import numpy as np
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -313,16 +314,19 @@ def build_main_agent_graph(
       session_rows = conn.execute("SELECT * FROM agent_sessions ORDER BY rowid DESC LIMIT 8").fetchall()
     explorer_state = "\n".join(lines) if lines else "(empty)"
     sessions = json.dumps([dict(row) for row in session_rows], default=str) if session_rows else "(none)"
+    objective = state.get("objective", "") or "(none)"
     system_prompt = f"{MAIN_AGENT_PROMPT}\n\nCloud provider: {cloud_provider}\nMax active subagents: {max_agents}\n\nExplorerState:\n{explorer_state}\n\nTmuxSessions:\n{sessions}"
-    messages = trim_messages(
-      [SystemMessage(content=system_prompt), HumanMessage(content=state.get("objective", "") or "(none)"), *state.get("messages", [])],
-      max_tokens=MAX_MODEL_TOKENS,
+    prefix = [SystemMessage(content=system_prompt), HumanMessage(content=objective)]
+    # Reserve the immutable prompt prefix before trimming the working history.
+    history = trim_messages(
+      state.get("messages", []),
+      max_tokens=MAX_MODEL_TOKENS - count_tokens_approximately(prefix),
       token_counter="approximate",
       strategy="last",
-      start_on="human",
-      include_system=True,
+      # Tool-heavy tails may have no recent human message, but still begin on a paired AI call.
+      start_on=("human", "ai"),
     )
-    return {"messages": [bound_model.invoke(messages)]}
+    return {"messages": [bound_model.invoke([*prefix, *history])]}
 
   def route_after_main(state: MainAgentState) -> Literal["tools", "__end__"]:
     """Stop before another tool call once the host accepted End."""
