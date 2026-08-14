@@ -8,6 +8,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from langchain_openai.chat_models.codex import _ChatOpenAICodex
+
 LEGACY_MODELS = {
   "chatgpt": "chatgpt/gpt-5.4",
   "github-copilot": "github_copilot/gpt-4",
@@ -145,13 +147,23 @@ def login_model(model: str, reasoning_effort: str | None = None) -> ModelProfile
   return profile
 
 
+class _StatelessChatOpenAICodex(_ChatOpenAICodex):
+  """Remove unpersisted reasoning references from later Codex requests."""
+
+  def _get_request_payload(self, input_, *, stop=None, **kwargs):
+    """Build a Codex payload containing only replayable reasoning."""
+    payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+    # Empty encrypted content leaves only an rs_* ID, which store=False cannot resolve.
+    payload["input"] = [item for item in payload["input"] if item.get("type") != "reasoning" or item.get("encrypted_content")]
+    return payload
+
+
 def build_chat_model(profile: ModelProfile, *, max_retries: int = 1):
   """Build ChatGPT models with LangChain OpenAI and others with LiteLLM."""
   if profile.model.startswith("chatgpt/"):
-    from langchain_openai.chat_models.codex import _ChatOpenAICodex
     from langchain_openai.chatgpt_oauth import _FileChatGPTOAuthTokenProvider
 
-    return _ChatOpenAICodex(
+    return _StatelessChatOpenAICodex(
       model=profile.model.removeprefix("chatgpt/"),
       reasoning_effort=profile.reasoning_effort,
       originator="perferox",

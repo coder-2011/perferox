@@ -27,7 +27,9 @@ from pydantic import ValidationError
 
 from perferox import db
 from perferox.auth import (
+  ModelProfile,
   active_model_profile,
+  build_chat_model,
   cloud_environment,
   login_model,
   modal_cloud_key,
@@ -93,6 +95,21 @@ class ModelProfileTests(unittest.TestCase):
       with patch("langchain_litellm.ChatLiteLLM", return_value=failed_model), self.assertRaisesRegex(RuntimeError, "did not complete the tool-call probe"):
         login_model("openrouter/auto")
       self.assertEqual(active_model_profile(), logged_in)
+
+  def test_chatgpt_payload_drops_only_unencrypted_reasoning(self) -> None:
+    """Keep tool calls and encrypted reasoning while removing invalid Codex stubs."""
+    message = AIMessage(content=[
+      {"type": "reasoning", "id": "rs_empty", "encrypted_content": ""},
+      {"type": "reasoning", "id": "rs_replayable", "encrypted_content": "ciphertext"},
+      {"type": "function_call", "id": "fc_test"},
+    ])
+    model = build_chat_model(ModelProfile("chatgpt/test"))
+
+    with patch.object(model, "_codex_headers_sync", return_value={}):
+      payload = model._get_request_payload([message])
+
+    self.assertEqual([item["id"] for item in payload["input"]], ["rs_replayable", "fc_test"])
+    self.assertEqual(len(message.content), 3)
 
 
 class DatabaseTestCase(unittest.TestCase):
